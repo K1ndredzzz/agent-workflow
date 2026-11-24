@@ -410,6 +410,21 @@ _PEM_BLOCK = re.compile(_PEM_START.pattern + r".*?(?:" + _PEM_END.pattern + r"|\
 _AUTH_HEADER_VALUE = re.compile(
     r"""(?i)(\bauthorization\b["']?[ \t]*[:=][ \t]*["']?(?:bearer|basic)[ \t]+)([A-Za-z0-9._~+/-]{8,}=*)"""
 )
+_API_KEY_HEADERS = ("x-api-key", "x-goog-api-key")
+_API_KEY_HEADER_VALUE = re.compile(
+    r"""(\b(?:%s)\b["']?[ \t]*[:=][ \t]*)(?:"((?:\\.|[^"\\\r\n])*)"?|'((?:\\.|[^'\\\r\n])*)'?|(\$\{[^}\s]+\}|[^\s"',;})\]]+))"""
+    % "|".join(_API_KEY_HEADERS), re.I,
+)
+_API_KEY_PLACEHOLDER = re.compile(r"^(?:<[^>\s]+>|\$\{[^}\s]+\}|\$[A-Z_][A-Z0-9_]*)$")
+_API_KEY_BENIGN_WORDS = frozenset({
+    "string", "str", "number", "boolean", "bool", "object", "any", "unknown",
+    "null", "none", "nil", "true", "false", "undefined", "required", "optional",
+})
+_API_KEY_CODE_EXPR = re.compile(
+    r"^(?:[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+|"
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*[\[(].*|"
+    r"[a-z]+(?:_[a-z]+)+)$"
+)
 _BEARER_VALUE = re.compile(r"""(?i)\b(bearer)([ \t]+)([A-Za-z0-9._~+/-]{8,}=*)""")
 _BASIC_VALUE = re.compile(r"""(?i)\b(basic)([ \t]+)([A-Za-z0-9+/]{8,}={0,2})(?![A-Za-z0-9._~+/-])""")
 _PLAIN_ALPHA_WORD = re.compile(r"(?:[A-Za-z][a-z]+|[A-Z]+)")
@@ -446,9 +461,25 @@ def _redact_basic(m: re.Match[str]) -> str:
     return m.group(1) + m.group(2) + _REDACTED
 
 
+def _redact_api_key_header(m: re.Match[str]) -> str:
+    quoted = m[2] if m[2] is not None else m[3]
+    val = quoted if quoted is not None else (m[4] or "")
+    stripped = val.strip()
+    if len(stripped) < 8 or stripped.lower() in _API_KEY_BENIGN_WORDS or _API_KEY_PLACEHOLDER.fullmatch(stripped):
+        return m.group(0)
+    if quoted is None and _API_KEY_CODE_EXPR.fullmatch(stripped):
+        return m.group(0)
+    if m[2] is not None:
+        return m[1] + '"' + _REDACTED + '"'
+    if m[3] is not None:
+        return m[1] + "'" + _REDACTED + "'"
+    return m[1] + _REDACTED
+
+
 def redact_secrets(text: str) -> str:
     out = _PEM_BLOCK.sub(_REDACTED, str(text))
     out = _AUTH_HEADER_VALUE.sub(lambda m: m.group(1) + _REDACTED, out)
+    out = _API_KEY_HEADER_VALUE.sub(_redact_api_key_header, out)
     out = _BEARER_VALUE.sub(_redact_bearer, out)
     out = _BASIC_VALUE.sub(_redact_basic, out)
     for pat in SECRET_VALUE_PATTERNS:
@@ -462,7 +493,7 @@ def redact_secrets(text: str) -> str:
 def redact_data(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            redact_secrets(k): _REDACTED if str(k).lower() in {"authorization", "proxy-authorization"} else redact_data(v)
+            redact_secrets(k): _REDACTED if str(k).lower() in ("authorization", "proxy-authorization", *_API_KEY_HEADERS) else redact_data(v)
             for k, v in value.items()
         }
     if isinstance(value, list):
@@ -1651,10 +1682,10 @@ def classify_origin_remote(repo_root: Path) -> tuple[str, str | None, str]:
         raise RuntimeError("Origin fetch and push destinations differ or multiple push destinations are configured.")
     if gh:
         return "github", gh, raw_url
-    if raw_url.startswith("file://") or raw_url.startswith("/") or raw_url.startswith("./") or raw_url.startswith("../"):
+    if raw_url.startswith("file://"):
         return "local_path", None, raw_url
-    if (repo_root / raw_url).exists():
-        return "local_path", None, raw_url
+    if raw_url.startswith(("/", "./", "../")) or (repo_root / raw_url).exists():
+        return "local_path", None, str((repo_root / raw_url).resolve())
     return "unknown_remote", None, raw_url
 
 
@@ -1816,12 +1847,12 @@ def prepare_worktree(
         return wt_dir, branch, base_sha
 
 
-def check_remote_fast_forward_ready(worktree: Path, branch: str) -> None:
+def check_remote_fast_forward_ready(repo_root: Path, worktree: Path, branch: str) -> None:
     """Fail fast BEFORE starting a long worker if origin/<branch> already diverged from local HEAD."""
-    remote_sha = get_remote_branch_sha(worktree, branch)
+    remote_sha = get_remote_branch_sha(repo_root, branch)
     if not remote_sha:
         return
-    run_cmd(git_cmd("fetch", "origin", f"refs/heads/{branch}"), cwd=worktree, env_role="orchestrator")
+    run_cmd(git_cmd("fetch", "origin", f"refs/heads/{branch}"), cwd=repo_root, check=True, env_role="orchestrator")
     local_head = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
     anc = run_cmd(git_cmd("merge-base", "--is-ancestor", remote_sha, local_head), cwd=worktree, env_role="orchestrator")
     if anc.returncode != 0:
@@ -2197,20 +2228,23 @@ def check_base_baseline(
 ) -> dict[str, Any]:
     baselines_file = _cache_root() / "baselines.json"
     baselines_lock = _cache_root() / "locks" / "baselines.lock"
-    cache_key = sha256_text(json.dumps([repo_key, base_sha, verify_cmd, setup_cmd_override]))
-    key_lock = _cache_root() / "locks" / f"baseline-{cache_key[:16]}.lock"
+    lease_key = sha256_text(json.dumps([repo_key, base_sha, verify_cmd, setup_cmd_override]))
+    key_lock = _cache_root() / "locks" / f"baseline-{lease_key[:16]}.lock"
 
-    # Per-cache-key lock covers check -> detached worktree -> verify -> write cache (zero parallel worktree collision or duplicate runs!)
+    def read_cache() -> dict[str, bool]:
+        try:
+            cache = json.loads(baselines_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return cache if isinstance(cache, dict) else {}
+
     with file_lock(key_lock, blocking=True):
-        with file_lock(baselines_lock, blocking=True):
-            cache: dict[str, bool] = {}
-            if baselines_file.is_file():
-                try:
-                    cache = json.loads(baselines_file.read_text(encoding="utf-8"))
-                except Exception:
-                    cache = {}
-            if cache.get(cache_key) is True:
-                return {"checked": True, "cached": True, "passed": True}
+        # The explicit command already identifies the recipe and its existing cache entries.
+        cache_key = lease_key
+        if verify_cmd:
+            with file_lock(baselines_lock, blocking=True):
+                if read_cache().get(cache_key) is True:
+                    return {"checked": True, "cached": True, "passed": True}
 
         head = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
         target_wt = worktree
@@ -2221,7 +2255,7 @@ def check_base_baseline(
                 temp_wt = _cache_root() / "worktrees" / repo_key / f".baseline-{base_sha[:10]}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
                 owner_file = _cache_root() / "baseline-owners" / repo_key / temp_wt.name
                 with file_lock(_cache_root() / "locks" / f"repo-{repo_key}.lock", blocking=True):
-                    atomic_write_text(owner_file, json.dumps({"key": cache_key, "base_sha": base_sha}))
+                    atomic_write_text(owner_file, json.dumps({"key": lease_key, "base_sha": base_sha}))
                     run_cmd(git_cmd("worktree", "add", "--detach", str(temp_wt), base_sha), cwd=repo_root, check=True, env_role="orchestrator")
                 bootstrap_worktree(temp_wt, setup_cmd_override, timeout=setup_timeout)
                 target_wt = temp_wt
@@ -2229,7 +2263,12 @@ def check_base_baseline(
             head_before = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=target_wt, check=True, env_role="orchestrator").stdout.strip()
             if head_before != base_sha:
                 raise RuntimeError("Bootstrap changed the baseline HEAD before verification")
-            verify_cmd = detect_verify_command(target_wt, verify_cmd)
+            if not verify_cmd:
+                verify_cmd = detect_verify_command(target_wt, None)
+                cache_key = sha256_text(json.dumps([lease_key, verify_cmd]))
+                with file_lock(baselines_lock, blocking=True):
+                    if read_cache().get(cache_key) is True:
+                        return {"checked": True, "cached": True, "passed": True}
             log(f"Checking clean base baseline ({base_sha[:8]}): {verify_cmd}")
             res = run_verify_gate(
                 target_wt,
@@ -2250,12 +2289,7 @@ def check_base_baseline(
 
         if res["passed"] and res["ran"]:
             with file_lock(baselines_lock, blocking=True):
-                cache = {}
-                if baselines_file.is_file():
-                    try:
-                        cache = json.loads(baselines_file.read_text(encoding="utf-8"))
-                    except Exception:
-                        cache = {}
+                cache = read_cache()
                 cache[cache_key] = True
                 atomic_write_text(baselines_file, json.dumps(cache, indent=2))
         return {"checked": True, "cached": False, **res}
@@ -2536,47 +2570,35 @@ def orchestrator_commit(worktree: Path, identifier: str, title: str, attempt: in
 # ---------------------------------------------------------------------------
 
 def extract_json_object(text: str) -> dict[str, Any]:
-    """Return the LAST valid JSON object in `text` (by end position), so a trailing bare JSON verdict always beats an earlier fenced block."""
-    text = text.strip()
-    if not text:
-        raise ValueError("Empty output when expecting JSON object.")
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
-    except json.JSONDecodeError:
-        pass
-
-    best_obj: dict[str, Any] | None = None
-    best_end = -1
-
-    for m in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S):
-        try:
-            obj = json.loads(m.group(1))
-            if isinstance(obj, dict) and m.end() >= best_end:
-                best_obj = obj
-                best_end = m.end()
-        except json.JSONDecodeError:
-            continue
-
+    """Select the last JSON object in prose, including fenced output."""
+    start = re.compile(r'\{(?=\s*(?:"|\}|\Z))')
+    tokens = re.compile(r'"(?:[^"\\]|\\.)*"|[{}"]', re.S)
     decoder = json.JSONDecoder()
-    idx = 0
-    n = len(text)
-    while idx < n:
-        brace = text.find("{", idx)
-        if brace == -1:
-            break
+    last = None
+    pos = 0
+    while match := start.search(text, pos):
         try:
-            obj, end = decoder.raw_decode(text, brace)
-            if isinstance(obj, dict) and end >= best_end:
-                best_obj = obj
-                best_end = end
-            idx = end
+            last, pos = decoder.raw_decode(text, match.start())
         except json.JSONDecodeError:
-            idx = brace + 1
-    if best_obj is not None:
-        return best_obj
-    raise ValueError(f"Could not extract JSON object from output:\n{redact_secrets(text)[-1000:]}")
+            # Skip a complete malformed draft as one object. Its children cannot be verdicts.
+            last = None
+            depth = 1
+            for token in tokens.finditer(text, match.end()):
+                value = token.group()
+                if value == "{":
+                    depth += 1
+                elif value == "}":
+                    depth -= 1
+                    if depth == 0:
+                        pos = token.end()
+                        break
+                elif value == '"':
+                    raise ValueError("Incomplete JSON string in final object")
+            else:
+                raise ValueError("Incomplete final JSON object")
+    if last is None:
+        raise ValueError("Missing or invalid final JSON object")
+    return last
 
 
 def validate_schema(obj: Any, schema: dict[str, Any], *, expected_axis: str | None = None) -> dict[str, Any]:
@@ -3517,7 +3539,7 @@ def _require_publish_ownership(issue: dict[str, Any], state: dict[str, Any]) -> 
 def reconcile_publish(
     client: LinearClient,
     issue: dict[str, Any],
-    worktree: Path,
+    repo_root: Path,
     run_dir: Path,
     latest_file: Path,
     state: dict[str, Any],
@@ -3534,11 +3556,16 @@ def reconcile_publish(
     branch = state["branch"]
     base_branch = state["base_branch"]
     candidate_sha = state["candidate_sha"]
-    remote_kind, gh_repo, raw_remote_url = classify_origin_remote(worktree)
+    remote_kind, gh_repo, raw_remote_url = classify_origin_remote(repo_root)
     if remote_kind == "none":
         raise RuntimeError("Publishing requires an origin remote.")
-    if state.get("publish_destination") and sha256_text(gh_repo.lower() if gh_repo else raw_remote_url) != state["publish_destination"]:
-        raise RuntimeError("Origin destination changed since preflight; refusing to publish.")
+    expected_destination = state.get("publish_destination")
+    if expected_destination:
+        if sha256_text(gh_repo.lower() if gh_repo else raw_remote_url) != expected_destination:
+            raise RuntimeError("Origin destination changed since preflight; refusing to publish.")
+    elif not gh_repo or state.get("repo_identity") != canonical_repo_identity(repo_root):
+        # Older checkpoints bound GitHub runs to owner/repo. For other remotes they bound only the local clone.
+        raise RuntimeError("Legacy checkpoint cannot verify the publish destination. Review the configured origin and rerun.")
     force_gh = os.environ.get("AGENT_DISPATCH_FORCE_GH") == "1"
     if remote_kind == "github" or force_gh:
         is_github = True
@@ -3564,7 +3591,7 @@ def reconcile_publish(
     # Recheck PR identity even on a late resume. A different open PR cannot replace the recorded one.
     existing = None
     if is_github:
-        existing = fetch_open_pr_for_branch(worktree, gh_repo, branch)
+        existing = fetch_open_pr_for_branch(repo_root, gh_repo, branch)
         if recorded_pr_num and (not existing or existing["number"] != recorded_pr_num):
             raise RuntimeError(f"Recorded PR #{recorded_pr_num} is no longer the open PR (human action preserved).")
         if existing:
@@ -3573,11 +3600,11 @@ def reconcile_publish(
         elif cur_stage in ("pr_ready", "linear_state_synced"):
             raise RuntimeError("Previously delivered PR is no longer open (human action preserved).")
         elif cur_stage == "pushed" or state.get("pr_create_attempted"):
-            history = fetch_open_prs_for_branch(worktree, gh_repo, branch, state="all")
+            history = fetch_open_prs_for_branch(repo_root, gh_repo, branch, state="all")
             if any(pr.get("headRefOid") == candidate_sha for pr in history):
                 raise RuntimeError("Previously delivered PR is no longer open (human action preserved).")
 
-    remote_sha = get_remote_branch_sha(worktree, branch)
+    remote_sha = get_remote_branch_sha(repo_root, branch)
     already_pushed = cur_stage in ("pushed", "pr_ready", "linear_state_synced") or state.get("pushed")
     if remote_sha != candidate_sha and already_pushed:
         raise RuntimeError(f"Remote origin/{branch} moved or was deleted after push; human action preserved.")
@@ -3585,8 +3612,8 @@ def reconcile_publish(
         if "pre_push_sha" in state and remote_sha != state["pre_push_sha"]:
             raise RuntimeError(f"Remote origin/{branch} changed after review; refusing to push.")
         if remote_sha:
-            run_cmd(git_cmd("fetch", "origin", f"refs/heads/{branch}"), cwd=worktree, check=True, env_role="orchestrator")
-            anc = run_cmd(git_cmd("merge-base", "--is-ancestor", remote_sha, candidate_sha), cwd=worktree, env_role="orchestrator")
+            run_cmd(git_cmd("fetch", "origin", f"refs/heads/{branch}"), cwd=repo_root, check=True, env_role="orchestrator")
+            anc = run_cmd(git_cmd("merge-base", "--is-ancestor", remote_sha, candidate_sha), cwd=repo_root, env_role="orchestrator")
             if anc.returncode != 0:
                 raise RuntimeError(f"Remote origin/{branch} diverged from reviewed SHA; refusing to push.")
         state.update(push_attempted=True, stage="pushing", pre_push_sha=remote_sha)
@@ -3595,8 +3622,8 @@ def reconcile_publish(
         # The lease closes the race with a human resetting/deleting the branch after the ancestry check.
         ref = f"refs/heads/{branch}"
         run_cmd(git_cmd("push", "--no-verify", f"--force-with-lease={ref}:{remote_sha}", "origin", f"{candidate_sha}:{ref}"),
-                cwd=worktree, check=True, env_role="orchestrator")
-        if get_remote_branch_sha(worktree, branch) != candidate_sha:
+                cwd=repo_root, check=True, env_role="orchestrator")
+        if get_remote_branch_sha(repo_root, branch) != candidate_sha:
             raise RuntimeError("Remote SHA mismatch after push.")
 
     if cur_stage not in ("pr_ready", "linear_state_synced"):
@@ -3612,7 +3639,7 @@ def reconcile_publish(
                        "--title", pr_title, "--body-file", str(body_file)]
                 if gh_repo:
                     cmd += ["--repo", gh_repo]
-                created = run_cmd(cmd, cwd=worktree, check=True, env_role="orchestrator")
+                created = run_cmd(cmd, cwd=repo_root, check=True, env_role="orchestrator")
                 number = re.search(r"/pull/(\d+)/?$", created.stdout.strip())
                 if number:
                     state["pr_number"] = int(number.group(1))
@@ -3622,7 +3649,7 @@ def reconcile_publish(
             pause = float(os.environ.get("AGENT_DISPATCH_PR_POLL_SLEEP", "2.0"))
             for attempt_i in range(attempts):
                 _check_shutdown()
-                pr = fetch_open_pr_for_branch(worktree, gh_repo, branch)
+                pr = fetch_open_pr_for_branch(repo_root, gh_repo, branch)
                 if pr and pr.get("headRefOid") == candidate_sha:
                     break
                 if attempt_i + 1 < attempts:
@@ -3683,20 +3710,20 @@ def reconcile_publish(
 def verify_completed_publish_readonly(
     client: LinearClient,
     live_issue: dict[str, Any],
-    worktree: Path,
+    repo_root: Path,
     state: dict[str, Any],
 ) -> dict[str, Any]:
     """Read-only verification for already-completed checkpoints: checks SHA, PR state/draft/base/head, AND Linear state."""
     branch = state["branch"]
     base_branch = state["base_branch"]
     candidate_sha = state["candidate_sha"]
-    _, gh_repo, raw_remote_url = classify_origin_remote(worktree)
+    _, gh_repo, raw_remote_url = classify_origin_remote(repo_root)
     if state.get("publish_destination") and sha256_text(gh_repo.lower() if gh_repo else raw_remote_url) != state["publish_destination"]:
         raise RuntimeError("Origin destination changed since publication.")
     is_github = bool(gh_repo or os.environ.get("AGENT_DISPATCH_FORCE_GH") == "1")
     conflicts: list[str] = []
 
-    remote_sha = get_remote_branch_sha(worktree, branch)
+    remote_sha = get_remote_branch_sha(repo_root, branch)
     if remote_sha != candidate_sha:
         conflicts.append(f"Remote origin/{branch} SHA is '{remote_sha[:8] or 'deleted'}', expected '{candidate_sha[:8]}'.")
 
@@ -3706,7 +3733,7 @@ def verify_completed_publish_readonly(
 
     if is_github and state.get("delivery_mode", "draft_pr") == "draft_pr":
         pr_num = state.get("pr_number")
-        pr_obj = fetch_open_pr_for_branch(worktree, gh_repo, branch)
+        pr_obj = fetch_open_pr_for_branch(repo_root, gh_repo, branch)
         if not pr_obj or (pr_num and pr_obj["number"] != pr_num):
             conflicts.append(f"Delivered PR ({state.get('pr_url') or branch}) is no longer the open PR (human action preserved).")
         else:
@@ -3744,6 +3771,7 @@ def verify_completed_publish_readonly(
 
 def _assert_no_external_tampering(
     client: LinearClient,
+    repo_root: Path,
     worktree: Path,
     branch: str,
     base_branch: str,
@@ -3767,18 +3795,18 @@ def _assert_no_external_tampering(
             raise RuntimeError(f"Unauthorized git config tampering detected during {phase} (.git/config modified).")
         if cur_cfg["gitattributes_sha"] != expected_git_cfg.get("gitattributes_sha"):
             raise RuntimeError(f"Unauthorized .gitattributes tampering detected during {phase}.")
-    cur_branch_sha = get_remote_branch_sha(worktree, branch)
+    cur_branch_sha = get_remote_branch_sha(repo_root, branch)
     if cur_branch_sha != expected_branch_sha:
         raise RuntimeError(
             f"Unauthorized external mutation during {phase}: origin/{branch} changed "
             f"from {expected_branch_sha[:8] or 'none'} to {cur_branch_sha[:8] or 'none'}."
         )
     if expected_base_sha:
-        cur_base_sha = get_remote_branch_sha(worktree, base_branch)
+        cur_base_sha = get_remote_branch_sha(repo_root, base_branch)
         if not cur_base_sha:
             raise RuntimeError(f"Unauthorized external mutation during {phase}: origin/{base_branch} was deleted.")
         if cur_base_sha != expected_base_sha:
-            run_cmd(git_cmd("fetch", "origin", base_branch), cwd=worktree, env_role="orchestrator")
+            run_cmd(git_cmd("fetch", "origin", base_branch), cwd=repo_root, env_role="orchestrator")
             anc = run_cmd(git_cmd("merge-base", "--is-ancestor", expected_base_sha, cur_base_sha), cwd=worktree, env_role="orchestrator")
             if anc.returncode != 0:
                 raise RuntimeError(
@@ -3970,11 +3998,11 @@ def execute_ticket(
         base_sha = run_cmd(git_cmd("merge-base", target_sha, "HEAD"), cwd=worktree,
                            check=True, env_role="orchestrator").stdout.strip()
         preflight_pr = None
-        gh_repo = parse_github_owner_repo(worktree)
+        gh_repo = parse_github_owner_repo(repo_root)
         if not no_push:
-            check_remote_fast_forward_ready(worktree, branch)
+            check_remote_fast_forward_ready(repo_root, worktree, branch)
             if gh_repo or os.environ.get("AGENT_DISPATCH_FORCE_GH") == "1":
-                preflight_pr = fetch_open_pr_for_branch(worktree, gh_repo, branch)
+                preflight_pr = fetch_open_pr_for_branch(repo_root, gh_repo, branch)
                 if preflight_pr:
                     _validate_open_draft_pr(preflight_pr, base_branch=base_branch, context="preflight PR check")
 
@@ -4121,13 +4149,13 @@ def execute_ticket(
             save_checkpoint(run_dir, latest_file, state)
 
             # Capture ticket-scoped remote baselines & local git config ONCE before attempts (NOT reset across retries/timeouts!)
-            pre_branch_sha = get_remote_branch_sha(worktree, branch) if not no_push else ""
-            pre_base_sha = get_remote_branch_sha(worktree, base_branch) if not no_push else ""
+            pre_branch_sha = get_remote_branch_sha(repo_root, branch) if not no_push else ""
+            pre_base_sha = get_remote_branch_sha(repo_root, base_branch) if not no_push else ""
             pre_git_cfg = snapshot_local_git_config(worktree)
 
             pr_feedback = None
             if not no_push and (gh_repo or os.environ.get("AGENT_DISPATCH_FORCE_GH") == "1"):
-                observed_pr = fetch_open_pr_for_branch(worktree, gh_repo, branch)
+                observed_pr = fetch_open_pr_for_branch(repo_root, gh_repo, branch)
                 if preflight_pr and (not observed_pr or observed_pr["number"] != preflight_pr["number"]):
                     raise RuntimeError(
                         f"Open PR #{preflight_pr['number']} changed during preflight (human action preserved)."
@@ -4136,7 +4164,7 @@ def execute_ticket(
                     _validate_open_draft_pr(observed_pr, base_branch=base_branch, context="pre-worker PR check")
                     state["pr_number"] = observed_pr["number"]
                     save_checkpoint(run_dir, latest_file, state)
-                    pr_feedback = fetch_open_pr_feedback(worktree, gh_repo, observed_pr["number"])
+                    pr_feedback = fetch_open_pr_feedback(repo_root, gh_repo, observed_pr["number"])
             feedback: str | None = pr_feedback
             prior_review_findings: dict[str, list[str]] | None = None
             discovered_seen: set[str] = set()
@@ -4179,7 +4207,7 @@ def execute_ticket(
                 except subprocess.TimeoutExpired:
                     if not no_push:
                         _assert_no_external_tampering(
-                            client, worktree, branch, base_branch, issue["id"],
+                            client, repo_root, worktree, branch, base_branch, issue["id"],
                             pre_branch_sha, pre_base_sha, pre_git_cfg, expected_ownership, f"worker timeout attempt {attempt}",
                         )
                     feedback = (
@@ -4191,7 +4219,7 @@ def execute_ticket(
 
                 if not no_push:
                     _assert_no_external_tampering(
-                        client, worktree, branch, base_branch, issue["id"],
+                        client, repo_root, worktree, branch, base_branch, issue["id"],
                         pre_branch_sha, pre_base_sha, pre_git_cfg, expected_ownership, f"worker attempt {attempt}",
                     )
                 else:
@@ -4313,7 +4341,8 @@ def execute_ticket(
                     log(f"{issue['identifier']} deterministic test-integrity gate FAILED on attempt {attempt}.")
                     continue
 
-                # Mandatory verify gate
+                # The candidate can add a suite or change an authorized verification target.
+                verify_cmd = detect_verify_command(worktree, verify_cmd_override)
                 last_verify_res = run_verify_gate(
                     worktree,
                     verify_cmd,
@@ -4333,7 +4362,7 @@ def execute_ticket(
                 # Check ownership BEFORE review as well (so human canceling during verify halts immediately!)
                 if not no_push:
                     _assert_no_external_tampering(
-                        client, worktree, branch, base_branch, issue["id"],
+                        client, repo_root, worktree, branch, base_branch, issue["id"],
                         pre_branch_sha, pre_base_sha, pre_git_cfg, expected_ownership, f"verify attempt {attempt}",
                     )
 
@@ -4357,7 +4386,7 @@ def execute_ticket(
                 )
                 if not no_push:
                     _assert_no_external_tampering(
-                        client, worktree, branch, base_branch, issue["id"],
+                        client, repo_root, worktree, branch, base_branch, issue["id"],
                         pre_branch_sha, pre_base_sha, pre_git_cfg, expected_ownership, f"review attempt {attempt}",
                     )
 
@@ -4421,7 +4450,7 @@ def execute_ticket(
 
                     publish_started = True
                     try:
-                        reconcile_publish(client, issue, worktree, run_dir, latest_file, state, allow_branch_only=allow_branch_only)
+                        reconcile_publish(client, issue, repo_root, run_dir, latest_file, state, allow_branch_only=allow_branch_only)
                     except Exception as pub_exc:
                         failure_reason = (
                             f"Publish interrupted at stage '{state['stage']}' (fix & run `agent-dispatch resume {issue['identifier']}`): {pub_exc}"
@@ -4535,7 +4564,7 @@ def execute_ticket(
                         remote_touched = bool(state.get("pushed"))
                         if not remote_touched and (publish_started or state.get("push_attempted")):
                             try:
-                                if get_remote_branch_sha(worktree, branch, ignore_shutdown=True) == state.get("candidate_sha"):
+                                if get_remote_branch_sha(repo_root, branch, ignore_shutdown=True) == state.get("candidate_sha"):
                                     remote_touched = True
                                     state["pushed"] = True
                             except BaseException:
@@ -4713,14 +4742,14 @@ def cmd_resume(args: argparse.Namespace) -> int:
             raise RuntimeError(f"{live_issue['identifier']} is already {live_issue['state']['name']}; nothing to resume.")
 
         if state.get("stage") in COMPLETED_STAGES:
-            ro_out = verify_completed_publish_readonly(client, live_issue, worktree, state)
+            ro_out = verify_completed_publish_readonly(client, live_issue, repo_root, state)
             print(safe_json(ro_out, indent=2, ensure_ascii=False))
             return 0
 
         reconcile_publish(
             client,
             live_issue,
-            worktree,
+            repo_root,
             run_dir,
             latest_file,
             state,
@@ -5404,13 +5433,26 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                                     is_merged = True
 
                         if is_merged:
+                            current_ref = run_cmd(git_cmd("symbolic-ref", "-q", "HEAD"), cwd=wt, env_role="orchestrator")
+                            current_sha = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=wt, check=True, env_role="orchestrator")
+                            ref = f"refs/heads/{br}"
+                            if current_ref.stdout.strip() != ref or current_sha.stdout.strip() != head_sha:
+                                skipped.append(f"{wt.name} (branch or HEAD changed during cleanup)")
+                                continue
                             rm_cmd = git_cmd("worktree", "remove", *(["--force"] if args.all else []), str(wt))
                             rm_res = run_cmd(rm_cmd, cwd=repo_root, env_role="orchestrator")
                             if rm_res.returncode != 0:
                                 skipped.append(f"{wt.name} (remove failed: {rm_res.stderr.strip()[:120]})")
                                 continue
                             if br and br not in (base_branch, "HEAD"):
-                                del_res = run_cmd(git_cmd("branch", "-D", br), cwd=repo_root, env_role="orchestrator")
+                                checked_out = run_cmd(git_cmd("for-each-ref", "--format=%(worktreepath)", ref),
+                                                      cwd=repo_root, check=True, env_role="orchestrator")
+                                if checked_out.stdout.strip():
+                                    skipped.append(f"{wt.name} (worktree removed, branch now checked out elsewhere)")
+                                    continue
+                                # Compare-and-delete after removing the worktree. Preserve any newer commit.
+                                del_res = run_cmd(git_cmd("update-ref", "--no-deref", "-d", ref, head_sha),
+                                                  cwd=repo_root, env_role="orchestrator")
                                 if del_res.returncode != 0:
                                     skipped.append(f"{wt.name} (worktree removed, branch delete failed: {del_res.stderr.strip()[:100]})")
                                     continue

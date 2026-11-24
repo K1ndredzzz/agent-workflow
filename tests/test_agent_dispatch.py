@@ -255,6 +255,35 @@ class IsolatedDispatchCase(unittest.TestCase):
 
 
 class TestUnitGatesAndParsing(IsolatedDispatchCase):
+    def test_api_key_headers_are_redacted_across_diagnostic_formats(self) -> None:
+        token = "opaque" + "-synthetic!value"
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            for header in ("X-API-Key", "x-goog-api-key", "X-Api-kEy"):
+                event = {"request": {"headers": {header: token}}, "status": "ok"}
+                plain = f"Request header: {header}: {token}"
+                self.assertTrue(ad.scan_text_for_secrets(plain, "test"))
+                self.assertNotIn(token, ad.redact_secrets(json.dumps(event)))
+                self.assertEqual(json.loads(ad.safe_json(event))["request"]["headers"][header], "<REDACTED_SECRET>")
+                with contextlib.ExitStack() as stack:
+                    writer = ad._RedactedLog(folder / "log", stack)
+                    writer.write((plain + "\n" + json.dumps(event) + "\n").encode())
+                self.assertNotIn(token, (folder / "log").read_text())
+            self.assertEqual(ad.redact_secrets("Document X-API-Key header support."), "Document X-API-Key header support.")
+            for benign_code in (
+                'headers = {"x-api-key": api_key}',
+                'headers = {"x-api-key": my_api_key}',
+                'headers = {"x-api-key": self.api_key}',
+                'headers = {"x-api-key": os.environ["API_KEY"]}',
+                'headers = {"x-api-key": process.env.API_KEY}',
+                'headers = {"x-api-key": ""}',
+                'interface Headers { "x-api-key": string; }',
+                'x-api-key: <your-api-key>',
+                'X-API-Key: ${API_KEY}',
+            ):
+                self.assertEqual(ad.redact_secrets(benign_code), benign_code, f"False positive on code: {benign_code}")
+                self.assertEqual(ad.scan_text_for_secrets(benign_code, "code"), [], f"False block on code: {benign_code}")
+
     def test_nested_authorization_headers_are_redacted_in_structured_logs(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             folder = Path(td)
@@ -450,6 +479,16 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
         w_pi = ad.parse_harness_spec("pi:sol@high")
         self.assertEqual(w_pi.model, "sub2api/gpt-6.2-sol")
         self.assertEqual(w_pi.effort, "high")
+
+    def test_truncated_final_object_cannot_reuse_draft_or_nested_verdict(self) -> None:
+        draft = '{"verdict":"pass"}'
+        for tail in ('{"verdict":"fail"', '{"details":{"verdict":"pass"}', '{', '{"summary":"unfinished'):
+            with self.subTest(tail=tail):
+                for response in (draft + "\nFinal answer:\n" + tail, "```json\n" + draft + "\n```\n" + tail):
+                    with self.assertRaises(ValueError):
+                        ad.extract_json_object(response)
+        self.assertEqual(ad.extract_json_object('draft {"bad": } final {"verdict":"fail"} done'),
+                         {"verdict": "fail"})
 
     def test_extract_json_raw_decode_with_trailing_logs(self) -> None:
         raw = 'noise {"a": 1}\nfinal: {"status": "completed", "summary": "ok"} trailing log line\n'
@@ -727,6 +766,38 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                 ad._stash_dirty_worktree_for_safe_rerun(repo, "halt")
             self.assertIn("halt", _git(repo, "stash", "list"))
             self.assertEqual(_git(repo, "show", "stash^3:safe.txt"), "save me")
+
+    def test_baseline_cache_uses_detected_recipe_on_target(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "repo"
+            repo.mkdir()
+            _git(repo, "init", "-b", "main")
+            _git(repo, "config", "user.name", "Test")
+            _git(repo, "config", "user.email", "test@example.invalid")
+            (repo / "pyproject.toml").touch()
+            (repo / "tests").mkdir()
+            (repo / "tests/test_ok.py").write_text(
+                "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self): pass\n"
+            )
+            _git(repo, "add", ".")
+            _git(repo, "commit", "-m", "base")
+            base = _git(repo, "rev-parse", "HEAD")
+            _git(repo, "commit", "--allow-empty", "-m", "feature")
+            args = (repo, "r", repo, base, None, root / "run")
+            with mock.patch.object(ad.shutil, "which", return_value=None):
+                first = ad.check_base_baseline(*args)
+                self.assertTrue(first["passed"])
+                self.assertIn("unittest", first["command"])
+                self.assertTrue(ad.check_base_baseline(*args)["cached"])
+            _write_exec(root / "pytest", "#!/bin/sh\necho newly-selected-pytest >&2\nexit 1\n")
+            with mock.patch.dict(os.environ, {"PATH": str(root) + os.pathsep + os.environ["PATH"]}), mock.patch.object(
+                ad.shutil, "which", side_effect=lambda name: str(root / "pytest") if name == "pytest" else None
+            ):
+                changed = ad.check_base_baseline(*args)
+            self.assertFalse(changed["cached"])
+            self.assertFalse(changed["passed"])
+            self.assertIn("newly-selected-pytest", changed["output"])
 
     def test_baseline_cache_distinguishes_setup_and_rejects_changed_head(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1189,6 +1260,7 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                 latest_f = d / "latest.json"
                 state = {
                     "run_id": "r1",
+                    "publish_destination": ad.sha256_text(str(bare)),
                     "branch": "feat/tst-p",
                     "base_branch": "main",
                     "candidate_sha": cand_sha,
@@ -1207,6 +1279,14 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                     with mock.patch.object(ad, "fetch_open_pr_for_branch", return_value=non_draft):
                         with self.assertRaisesRegex(RuntimeError, "not a Draft PR"):
                             ad.reconcile_publish(client, iss, repo, run_dir, latest_f, dict(state))
+                # A legacy GitHub checkpoint still has the identity of the original owner/repo.
+                _git(repo, "remote", "set-url", "origin", "https://github.com/test/repo.git")
+                legacy = dict(state, repo_identity=ad.canonical_repo_identity(repo))
+                del legacy["publish_destination"]
+                with mock.patch.object(ad, "fetch_open_pr_for_branch", return_value=non_draft):
+                    with self.assertRaisesRegex(RuntimeError, "not a Draft PR"):
+                        ad.reconcile_publish(client, iss, repo, run_dir, latest_f, legacy)
+                _git(repo, "remote", "set-url", "origin", str(bare))
                 # Remote branch MUST NOT have been pushed!
                 self.assertEqual(ad.get_remote_branch_sha(repo, "feat/tst-p"), "")
 
@@ -1953,6 +2033,14 @@ elif mode == "blocked_dirty":
     }}
     finish(res)
     sys.exit(0)
+elif mode == "add_backend_checks":
+    (cwd / "tests").mkdir(exist_ok=True)
+    check = "self.fail('first backend candidate')" if calls == 1 else "self.assertEqual(2 + 2, 4)"
+    (cwd / "tests/test_backend.py").write_text(
+        "import unittest\\nclass Backend(unittest.TestCase):\\n    def test_sum(self): " + check + "\\n"
+    )
+    if calls > 1:
+        (cwd / "go.mod").write_text("module example.invalid/project\\n")
 elif mode == "parallel_safe":
     import time as _t
     if cwd.name.endswith("P2"):
@@ -2050,7 +2138,9 @@ if args[:2] == ["pr", "create"]:
     base = args[args.index("--base") + 1]
     title = args[args.index("--title") + 1]
     body = Path(args[args.index("--body-file") + 1]).read_text()
-    sha = subprocess.run(["git", "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
+    ref = f"refs/heads/{{head}}"
+    sha = subprocess.run(["git", "ls-remote", "--exit-code", "origin", ref], text=True,
+                         capture_output=True, check=True).stdout.split()[0]
     pr = {{
         "number": len(prs) + 1,
         "url": f"https://github.com/test/demo-repo/pull/{{len(prs)+1}}",
@@ -2117,6 +2207,78 @@ sys.exit(1)
         self.assertEqual(local.returncode, 0, local.stderr + local.stdout)
         self.assertEqual(json.loads(local.stdout)["status"], "passed_local")
         self.assertFalse(self.linear_state.mutation_log)
+
+    def test_relative_origin_from_linked_worktree_only_updates_original_bare(self) -> None:
+        iss = self.linear_state.add_issue("TST-REL", "Relative origin", "Work", labels=["agent-ready"])
+        _git(self.repo, "remote", "set-url", "origin", f"../{self.bare.name}")
+        wt_parent = self.cache_dir / "worktrees" / ad.repo_cache_key(self.repo)
+        wt_parent.mkdir(parents=True)
+        other = wt_parent / self.bare.name
+        _git(wt_parent, "init", "--bare", "-b", "main", str(other))
+        result = self._run_cli(["run", iss["identifier"], "--skip-baseline"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        output = json.loads(result.stdout)
+        self.assertEqual(_git(self.bare, "rev-parse", f"refs/heads/{output['branch']}"), output["commit"])
+        self.assertFalse(_git(other, "for-each-ref", "refs/heads/"))
+        resumed = self._run_cli(["resume", iss["identifier"]])
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+
+    def test_legacy_local_checkpoint_cannot_publish_to_replaced_origin(self) -> None:
+        iss = self.linear_state.add_issue("TST-OLD", "Local legacy delivery", "Work", labels=["agent-ready"])
+        result = self._run_cli(["run", iss["identifier"], "--skip-baseline"], extra_env={"AGENT_DISPATCH_FORCE_GH": "0"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        state_file = Path(json.loads(result.stdout)["run_dir"]) / "state.json"
+        state = json.loads(state_file.read_text())
+        for key in ("publish_destination", "pre_push_sha"):
+            state.pop(key)
+        state.update(stage="verified_and_reviewed", pushed=False, push_attempted=False)
+        state_file.write_text(json.dumps(state))
+        iss["state"] = next(s for s in self.linear_state.states if s["name"] == "In Progress")
+        other = self.root / "replacement.git"
+        _git(self.root, "init", "--bare", "-b", "main", str(other))
+        _git(self.repo, "remote", "set-url", "origin", str(other))
+        result = self._run_cli(["resume", iss["identifier"], "--skip-project-check"], extra_env={"AGENT_DISPATCH_FORCE_GH": "0"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot verify the publish destination", result.stderr)
+        self.assertFalse(_git(other, "for-each-ref", "refs/heads/"))
+        self.assertEqual(iss["state"]["name"], "In Progress")
+
+    def test_cleanup_preserves_human_commit_during_merge_lookup(self) -> None:
+        self.linear_state.add_issue("TST-KEEP", "Race cleanup", "Work", labels=["agent-ready"])
+        result = self._run_cli(["run", "TST-KEEP", "--skip-baseline"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        output = json.loads(result.stdout)
+        wt = Path(output["worktree"])
+        _write_exec(self.fake_bin / "gh", f"""#!/usr/bin/env python3
+import json, subprocess
+subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-m", "new human work"],
+               cwd={str(wt)!r}, check=True, stdout=subprocess.DEVNULL)
+print(json.dumps([{{"number": 1, "headRefOid": {output['commit']!r}, "baseRefName": "main"}}]))
+""")
+        clean = self._run_cli(["cleanup"])
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        self.assertFalse(json.loads(clean.stdout)["removed"])
+        self.assertTrue((wt / ".git").exists())
+        self.assertEqual(_git(self.repo, "log", "-1", "--format=%s", output["branch"]), "new human work")
+
+        # A ref can also move after Git has removed its worktree but before conditional deletion.
+        old = _git(self.repo, "rev-parse", output["branch"])
+        new = _git(self.repo, "commit-tree", f"{old}^{{tree}}", "-p", old, "-m", "late human commit")
+        real_git = shutil.which("git")
+        _write_exec(self.fake_bin / "git", f"""#!/usr/bin/env python3
+import subprocess, sys
+args = sys.argv[1:]
+rc = subprocess.run([{real_git!r}, *args]).returncode
+if rc == 0 and "worktree" in args and args[args.index("worktree") + 1] == "remove":
+    subprocess.run([{real_git!r}, "-c", "core.hooksPath=/dev/null", "update-ref",
+                    {"refs/heads/" + output["branch"]!r}, {new!r}, {old!r}], check=True)
+sys.exit(rc)
+""")
+        clean = self._run_cli(["cleanup", "--all"])
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        self.assertFalse(wt.exists())
+        self.assertFalse(json.loads(clean.stdout)["removed"])
+        self.assertEqual(_git(self.repo, "rev-parse", output["branch"]), new)
 
     def test_mismatched_push_destination_aborts_before_claim(self) -> None:
         self.linear_state.add_issue("TST-DEST", "Destination", "hello")
@@ -2566,6 +2728,25 @@ sys.exit(1)
         wt = Path(out["worktree"])
         self.assertNotIn("helper[*]", _git(wt, "ls-tree", "-r", "--name-only", out["commit"]).splitlines())
         self.assertEqual(_git(wt, "status", "--porcelain"), "")
+
+    def test_worker_changes_trigger_new_verification_recipe_on_each_candidate(self) -> None:
+        issue = self.linear_state.add_issue("TST-CAND", "Backend checks", "## Touches\n- tests", labels=["agent-ready"])
+        _git(self.repo, "rm", "Makefile", "test_app.py")
+        (self.repo / "package.json").write_text('{"scripts":{"test":"echo frontend"}}')
+        _git(self.repo, "add", "package.json")
+        _git(self.repo, "commit", "-m", "start with frontend verification")
+        _git(self.repo, "push", "origin", "main")
+        _write_exec(self.fake_bin / "npm", "#!/bin/sh\necho frontend-check\n")
+        _write_exec(self.fake_bin / "go", "#!/bin/sh\necho go-check-verified\n")
+        result = self._run_cli(["run", issue["identifier"], "--no-push", "--max-rework", "1"],
+                               extra_env={"FAKE_CODEX_MODE": "add_backend_checks"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        out = json.loads(result.stdout)
+        self.assertEqual(out["attempt"], 2)
+        run_dir = Path(out["run_dir"])
+        self.assertIn("first backend candidate", (run_dir / "verify-r1.stderr.log").read_text())
+        self.assertIn("go-check-verified", (run_dir / "verify-r2.log").read_text())
+        self.assertIn("go test", out["verify"]["command"])
 
     def test_reused_feature_checks_current_base_with_base_verify_recipe(self) -> None:
         issue = self.linear_state.add_issue("TST-FORK", "feature", "## Touches\n- app", labels=["agent-ready"])
