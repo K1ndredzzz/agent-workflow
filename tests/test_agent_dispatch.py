@@ -7,6 +7,7 @@ and opt-in live Linear contract tests for agent-dispatch v5 and install.sh.
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import http.server
 import importlib.machinery
 import importlib.util
@@ -1482,6 +1483,139 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                 with self.assertRaisesRegex(RuntimeError, "Multiple open PRs share head branch"):
                     ad.fetch_open_pr_for_branch(prepo, "org/repo", "feat/x")
 
+    def test_auth_redaction_preserves_english_prose_while_redacting_real_credentials(self) -> None:
+        benign_phrases = (
+            "Add basic validation to login form",
+            "Implement basic authentication flow",
+            "Add basic end-to-end tests",
+            "Basic configuration helper",
+            "Support bearer authentication in API",
+            "Support Bearer Authorization header",
+            "Support basic Base64URL encoding",
+        )
+        for phrase in benign_phrases:
+            self.assertEqual(ad.redact_secrets(phrase), phrase, f"False positive on: {phrase}")
+            self.assertEqual(ad.scan_text_for_secrets(phrase, "title"), [], f"False block on: {phrase}")
+
+        secret_cases = (
+            ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("Authorization: Basic simpleword", "simpleword"),
+            ("Authorization: Bearer simpleword", "simpleword"),
+            ('{"authorization": "Bearer simpleword"}', "simpleword"),
+            ("Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("Basic YWRtaW46c2VjcmV0", "YWRtaW46c2VjcmV0"),
+            ("Bearer invented-only-example", "invented-only-example"),
+            ("Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig", "eyJhbGciOiJIUzI1NiJ9"),
+        )
+        for text, secret in secret_cases:
+            redacted = ad.redact_secrets(text)
+            self.assertIn("<REDACTED_SECRET>", redacted, f"Missed redaction for: {text}")
+            self.assertNotIn(secret, redacted, f"Secret leaked in: {text}")
+            self.assertTrue(ad.scan_text_for_secrets(text, "header"), f"Missed scan hit for: {text}")
+
+    def test_redacted_log_json_truncated_pem_does_not_drop_subsequent_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "stream.log"
+            payload = (
+                json.dumps({"type": "tool_result", "output": "-----BEGIN PRIVATE KEY-----\nMIIE_secret_body"}) + "\n"
+                + json.dumps({"type": "thread.started", "thread_id": "11111111-2222-3333-4444-555555555555"}) + "\n"
+                + "plain line after json\n"
+            )
+            with contextlib.ExitStack() as stack:
+                logger = ad._RedactedLog(log_path, stack)
+                logger.write(payload.encode("utf-8"))
+                logger.write(b"")
+            written = log_path.read_text(encoding="utf-8")
+            self.assertNotIn("MIIE_secret_body", written)
+            self.assertIn("<REDACTED_SECRET>", written)
+            self.assertIn("11111111-2222-3333-4444-555555555555", written)
+            self.assertIn("plain line after json", written)
+
+    def test_harness_events_and_pi_archive_tolerate_malformed_lines_without_masking_errors(self) -> None:
+        # Stray non-JSON line starting with '{' must not break NDJSON parsing
+        verdict = json.dumps({"status": "completed"})
+        codex_out = "\n".join([
+            "{non-json diagnostic header",
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": verdict}}),
+            json.dumps({"type": "turn.completed"}),
+        ])
+        self.assertEqual(ad.parse_codex_ndjson(codex_out), verdict)
+
+        # Malformed newline-terminated line in Pi session memfd must not mask outer exception or drop valid lines
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            archive = d / "pi.jsonl"
+            valid_entry = {"type": "message", "id": "m1", "message": {"content": "ok"}}
+            with self.assertRaisesRegex(RuntimeError, "outer harness failure"):
+                with ad._pi_session_archive(archive, "22222222-3333-4444-5555-666666666666", d) as native:
+                    subprocess.run(
+                        [sys.executable, "-B", "-c", "import sys; open(sys.argv[1], 'a').write(sys.stdin.read())", native],
+                        input="\n{malformed json line\n" + json.dumps(valid_entry) + "\n",
+                        text=True,
+                        check=True,
+                    )
+                    raise RuntimeError("outer harness failure")
+            lines = [json.loads(line) for line in archive.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(lines[1]["id"], "m1")
+
+    def test_run_cmd_bounded_buffer_caps_memory_while_streaming_full_log(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            out_log = d / "out.log"
+            # Generate 16KB of numbered lines with a patched 2KB DISPLAY_OUTPUT_CAP
+            code = "for i in range(400):\n    print(f'line-{i:04d}-' + 'x' * 32)\n"
+            with mock.patch.object(ad, "DISPLAY_OUTPUT_CAP", 2048):
+                res = ad.run_cmd(
+                    [sys.executable, "-B", "-c", code],
+                    cwd=d,
+                    cap_output=True,
+                    stdout_path=out_log,
+                )
+            self.assertIn("...[truncated]...", res.stdout)
+            self.assertIn("line-0000-", res.stdout)
+            self.assertIn("line-0399-", res.stdout)
+            self.assertLessEqual(len(res.stdout), 2500)
+            # Full un-truncated output still streamed to disk log
+            self.assertEqual(len(out_log.read_text(encoding="utf-8").splitlines()), 400)
+
+    def test_touches_normalization_fences_headings_wildcards_and_symlink_and_pkg_guards(self) -> None:
+        brief = (
+            "```md\n## Touches\n- fake/from-codeblock\n```\n"
+            "## Touches\n"
+            "- `./src//api/`, `pkg\\core/*`\n"
+            "# Appendix\n"
+            "- unrelated/outside-section\n"
+        )
+        self.assertEqual(ad.parse_touches(brief), {"src/api", "pkg/core"})
+        self.assertTrue(ad.touches_overlap(ad.parse_touches("## Touches\n- ./src/api\n"), {"src/api/v1"}))
+        # Wildcard root fails closed as unscoped empty set
+        self.assertEqual(ad.parse_touches("## Touches\n- *\n"), set())
+        self.assertEqual(ad.parse_touches("## Touches\n- **/*\n"), set())
+
+        # package.json containing non-object valid JSON triggers violation cleanly instead of AttributeError;
+        # symlink pointing to a secret filename is blocked before git write
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            _git(repo, "init", "-b", "main")
+            _git(repo, "config", "user.email", "t@example.invalid")
+            _git(repo, "config", "user.name", "Test")
+            (repo / "package.json").write_text('{"name":"demo"}\n', encoding="utf-8")
+            _git(repo, "add", "package.json")
+            _git(repo, "commit", "-m", "init")
+            base = _git(repo, "rev-parse", "HEAD")
+            (repo / "package.json").write_text("[]\n", encoding="utf-8")
+            _git(repo, "add", "package.json")
+            _git(repo, "commit", "-m", "array pkg")
+            head = _git(repo, "rev-parse", "HEAD")
+            viols = ad.check_protected_paths(repo, base, head)
+            self.assertTrue(any("Invalid JSON object" in v for v in viols))
+
+            (repo / "link_secret").symlink_to("/etc/app/.env")
+            hits = ad._scan_before_git_write(repo)
+            self.assertTrue(any("secret symlink target" in h for h in hits))
+
 
 # ---------------------------------------------------------------------------
 # End-to-End Subprocess CLI Fault-Injection Suite
@@ -2370,6 +2504,103 @@ sys.exit(res.returncode)
             self.assertFalse((cx_skills / "slice").exists())
             self.assertTrue((cx_skills / "grill").is_symlink())
             self.assertTrue((ag_skills / "dispatch").is_symlink())
+
+    def test_cleanup_reclaims_bootstrapped_baseline_with_untracked_files_and_protects_tracked_edits(self) -> None:
+        base = _git(self.repo, "rev-parse", "HEAD")
+        rkey = ad.repo_cache_key(self.repo)
+        wt_root = self.cache_dir / "worktrees" / rkey
+        owner_root = self.cache_dir / "baseline-owners" / rkey
+        wt_root.mkdir(parents=True, exist_ok=True)
+        owner_root.mkdir(parents=True, exist_ok=True)
+
+        # 1. Abandoned baseline with untracked bootstrap artifacts (e.g., node_modules) -> reclaimed by plain cleanup!
+        wt_untracked = wt_root / ".baseline-untracked-test"
+        _git(self.repo, "worktree", "add", "--detach", str(wt_untracked), base)
+        (wt_untracked / "node_modules").mkdir()
+        (wt_untracked / "node_modules" / "pkg.js").write_text("module.exports = 1;\n", encoding="utf-8")
+        (owner_root / wt_untracked.name).write_text(json.dumps({"key": "a" * 64, "base_sha": base}), encoding="utf-8")
+
+        # 2. Abandoned baseline with modified tracked file -> preserved by plain cleanup, reclaimed by --all!
+        wt_tracked = wt_root / ".baseline-tracked-test"
+        _git(self.repo, "worktree", "add", "--detach", str(wt_tracked), base)
+        (wt_tracked / "app.py").write_text("# human edit\n", encoding="utf-8")
+        (owner_root / wt_tracked.name).write_text(json.dumps({"key": "b" * 64, "base_sha": base}), encoding="utf-8")
+
+        out1 = self._run_cli(["cleanup"])
+        self.assertEqual(out1.returncode, 0, out1.stderr)
+        parsed1 = json.loads(out1.stdout)
+        self.assertIn(wt_untracked.name, parsed1["removed"])
+        self.assertFalse(wt_untracked.exists())
+        self.assertTrue(wt_tracked.exists())
+        self.assertTrue(any(wt_tracked.name in s for s in parsed1["skipped"]))
+
+        out2 = self._run_cli(["cleanup", "--all"])
+        self.assertEqual(out2.returncode, 0, out2.stderr)
+        self.assertIn(wt_tracked.name, json.loads(out2.stdout)["removed"])
+        self.assertFalse(wt_tracked.exists())
+
+        # 3. Failed baseline on fresh worktree (head == base_sha) leaves worktree clean!
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CACHE_ROOT": str(self.cache_dir)}):
+            wt_fresh, _, _ = ad.prepare_worktree(self.repo, "TST-RED", "main", issue_uuid="uuid-red")
+            res_red = ad.check_base_baseline(
+                self.repo,
+                rkey,
+                wt_fresh,
+                base,
+                "echo dirty > app.py && echo junk > temp.out && exit 1",
+                self.root / "run-red",
+            )
+            self.assertFalse(res_red["passed"])
+            self.assertEqual(_git(wt_fresh, "status", "--porcelain"), "")
+
+    def test_e2e_frontier_sigterm_cancels_queued_ticket_and_suppresses_bogus_json(self) -> None:
+        t1 = self.linear_state.add_issue(
+            "TST-S1", "Basic validation alpha", "## Touches\n- alpha\n", labels=["agent-ready"]
+        )
+        t2 = self.linear_state.add_issue(
+            "TST-S2", "Basic validation beta", "## Touches\n- beta\n", labels=["agent-ready"]
+        )
+        entered = self.root / "s1_entered"
+        _write_exec(
+            self.fake_bin / "codex",
+            f"""#!/usr/bin/env python3
+import pathlib, time
+pathlib.Path({str(entered)!r}).touch()
+time.sleep(30)
+""",
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "PATH": f"{self.fake_bin}:{env.get('PATH', '')}",
+                "AGENT_DISPATCH_LINEAR_URL": self.linear_url,
+                "AGENT_DISPATCH_CACHE_ROOT": str(self.cache_dir),
+                "LINEAR_API_KEY": "lin_api_fake_e2e_key_123456",
+                "AGENT_DISPATCH_FORCE_GH": "1",
+                "AGENT_DISPATCH_PR_POLL_SLEEP": "0.01",
+            }
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-B", str(BIN_PATH), "frontier", "--repo", str(self.repo), "--max-parallel", "1", "--skip-baseline"],
+            cwd=str(self.repo),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 10
+        while not entered.exists() and proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(entered.exists(), "First frontier ticket never started worker")
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=15)
+        self.assertNotEqual(proc.returncode, 0, f"Expected non-zero signal exit; stdout={out} stderr={err}")
+        self.assertEqual(out.strip(), "", f"SIGTERM during frontier must not print completion JSON: {out}")
+        # First ticket rolled back cleanly with dispatch:failed; second ticket was cancelled before claiming!
+        self.assertEqual(t1["state"]["name"], "Todo")
+        self.assertIn("dispatch:failed", [l["name"] for l in t1["_labels"]])
+        self.assertEqual(t2["state"]["name"], "Todo")
+        self.assertNotIn("dispatch:failed", [l["name"] for l in t2["_labels"]])
 
 
 # ---------------------------------------------------------------------------

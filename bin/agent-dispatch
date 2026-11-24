@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
 import concurrent.futures
 import contextlib
 import fcntl
@@ -281,6 +282,23 @@ def _check_shutdown() -> None:
         raise SystemExit(128 + sig)
 
 
+def _interruptible_sleep(seconds: float, *, ignore_shutdown: bool = False) -> None:
+    if seconds <= 0:
+        if not ignore_shutdown:
+            _check_shutdown()
+        return
+    if ignore_shutdown:
+        time.sleep(seconds)
+        return
+    deadline = time.monotonic() + seconds
+    while True:
+        _check_shutdown()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, 0.1))
+
+
 def _kill_all_active_children(*, wait_sigkill: bool = True) -> None:
     # Read immutable tuple reference without acquiring any lock (safe from a signal handler!)
     pgids = _ACTIVE_PGIDS_SNAPSHOT
@@ -389,14 +407,50 @@ def default_reviewer_for(worker: HarnessSpec) -> HarnessSpec:
 _PEM_START = re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")
 _PEM_END = re.compile(r"-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")
 _PEM_BLOCK = re.compile(_PEM_START.pattern + r".*?(?:" + _PEM_END.pattern + r"|\Z)", re.S)
-_AUTH_VALUE = re.compile(r"""(?i)\b(bearer|basic)([ \t]+)([A-Za-z0-9._~+/-]{8,}=*)""")
+_AUTH_HEADER_VALUE = re.compile(
+    r"""(?i)(\bauthorization\b["']?[ \t]*[:=][ \t]*["']?(?:bearer|basic)[ \t]+)([A-Za-z0-9._~+/-]{8,}=*)"""
+)
+_BEARER_VALUE = re.compile(r"""(?i)\b(bearer)([ \t]+)([A-Za-z0-9._~+/-]{8,}=*)""")
+_BASIC_VALUE = re.compile(r"""(?i)\b(basic)([ \t]+)([A-Za-z0-9+/]{8,}={0,2})(?![A-Za-z0-9._~+/-])""")
+_PLAIN_ALPHA_WORD = re.compile(r"(?:[A-Za-z][a-z]+|[A-Z]+)")
 _CREDENTIAL_ENV = re.compile(r"(?:_API_KEY|_TOKEN|_PASSWORD|_SECRET|_ACCESS_KEY)$")
 _REDACTED = "<REDACTED_SECRET>"
 
 
+def _is_plausible_basic_token(tok: str) -> bool:
+    if _PLAIN_ALPHA_WORD.fullmatch(tok):
+        return False
+    padded = tok + ("=" * (-len(tok) % 4))
+    try:
+        decoded = base64.b64decode(padded, validate=True).decode("utf-8")
+        if ":" in decoded and all(32 <= ord(c) < 127 or c == "\t" for c in decoded):
+            return True
+    except Exception:
+        pass
+    if len(tok) >= 16:
+        classes = sum(bool(re.search(p, tok)) for p in (r"[A-Z]", r"[a-z]", r"[0-9]", r"[+/=]"))
+        if classes >= 3:
+            return True
+    return False
+
+
+def _redact_bearer(m: re.Match[str]) -> str:
+    if _PLAIN_ALPHA_WORD.fullmatch(m.group(3)):
+        return m.group(0)
+    return m.group(1) + m.group(2) + _REDACTED
+
+
+def _redact_basic(m: re.Match[str]) -> str:
+    if not _is_plausible_basic_token(m.group(3)):
+        return m.group(0)
+    return m.group(1) + m.group(2) + _REDACTED
+
+
 def redact_secrets(text: str) -> str:
     out = _PEM_BLOCK.sub(_REDACTED, str(text))
-    out = _AUTH_VALUE.sub(lambda m: m[1] + m[2] + _REDACTED, out)
+    out = _AUTH_HEADER_VALUE.sub(lambda m: m.group(1) + _REDACTED, out)
+    out = _BEARER_VALUE.sub(_redact_bearer, out)
+    out = _BASIC_VALUE.sub(_redact_basic, out)
     for pat in SECRET_VALUE_PATTERNS:
         out = pat.sub(_REDACTED, out)
     for name, value in os.environ.items():
@@ -553,28 +607,71 @@ class _RedactedLog:
         complete = self.pending[:end].decode("utf-8", errors="replace")
         del self.pending[:end]
         for line in re.findall(r"[^\n]*\n|[^\n]+$", complete):
+            if not self.in_pem:
+                # Parse self-contained JSON dicts first so a truncated PEM header inside JSON
+                # cannot poison multiline plain-text PEM state for subsequent log lines.
+                try:
+                    event = json.loads(line) if line.lstrip().startswith("{") else None
+                except ValueError:
+                    event = None
+                if isinstance(event, dict):
+                    if event.get("type") in ("message_update", "item.updated"):
+                        # Deltas can split the same credential across multiple JSON events.
+                        event = {"type": event["type"]}
+                    self.file.write(safe_json(event, ensure_ascii=False) + "\n")
+                    continue
             if self.in_pem:
                 match = _PEM_END.search(line)
                 if not match:
                     continue
                 line = line[match.end():]
                 self.in_pem = False
-            start = _PEM_START.search(line)
-            if start and not _PEM_END.search(line, start.end()):
+            starts = list(_PEM_START.finditer(line))
+            if starts and not _PEM_END.search(line, starts[-1].end()):
                 self.in_pem = True
-            # JSON event strings can contain escaped newlines, quotes or Unicode escapes.
-            try:
-                event = json.loads(line) if line.lstrip().startswith("{") else None
-            except ValueError:
-                event = None
-            if isinstance(event, dict):
-                if event.get("type") in ("message_update", "item.updated"):
-                    # Deltas can split the same credential across multiple JSON events.
-                    event = {"type": event["type"]}
-                self.file.write(safe_json(event, ensure_ascii=False) + "\n")
-            else:
-                self.file.write(redact_secrets(line))
+            self.file.write(redact_secrets(line))
         self.file.flush()
+
+
+class _BoundedBuffer:
+    """Accumulate subprocess output in memory, bounding RAM to head + rolling tail when capped."""
+    def __init__(self, cap: int | None) -> None:
+        self.cap = cap
+        self.head = bytearray()
+        self.tail = bytearray()
+        self.truncated = False
+        self.head_limit = (cap // 4) if cap else 0
+        self.tail_limit = (cap // 2) if cap else 0
+
+    def append(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        if self.cap is None:
+            self.head.extend(chunk)
+            return
+        if not self.truncated:
+            if len(self.head) + len(chunk) <= self.cap:
+                self.head.extend(chunk)
+                return
+            combined = bytes(self.head) + chunk
+            self.head = bytearray(combined[: self.head_limit])
+            self.tail = bytearray(combined[-self.tail_limit :])
+            self.truncated = True
+            return
+        self.tail.extend(chunk)
+        if len(self.tail) > self.tail_limit * 2:
+            del self.tail[: len(self.tail) - self.tail_limit]
+
+    def decode(self) -> str:
+        if not self.truncated:
+            return self.head.decode("utf-8", errors="replace")
+        head_s = self.head.decode("utf-8", errors="replace")
+        tail_s = self.tail[-self.tail_limit :].decode("utf-8", errors="replace")
+        if "\n" in head_s:
+            head_s = head_s.rsplit("\n", 1)[0]
+        if "\n" in tail_s:
+            tail_s = tail_s.split("\n", 1)[1]
+        return redact_secrets(head_s) + "\n...[truncated]...\n" + redact_secrets(tail_s)
 
 
 def run_cmd(
@@ -596,7 +693,7 @@ def run_cmd(
         _check_shutdown()
     env = build_child_env(role=env_role)
 
-    def _terminate_proc(proc: subprocess.Popen[str]) -> None:
+    def _terminate_proc(proc: subprocess.Popen[bytes]) -> None:
         try:
             os.killpg(proc.pid, signal.SIGTERM)
             time.sleep(0.3)
@@ -621,13 +718,17 @@ def run_cmd(
         try:
             selector = stack.enter_context(selectors.DefaultSelector())
             assert proc.stdout is not None and proc.stderr is not None
-            buffers = {"stdout": bytearray(), "stderr": bytearray()}
+            cap_bytes = DISPLAY_OUTPUT_CAP if cap_output else None
+            buffers = {"stdout": _BoundedBuffer(cap_bytes), "stderr": _BoundedBuffer(cap_bytes)}
             for name, pipe in (("stdout", proc.stdout), ("stderr", proc.stderr)):
-                selector.register(stack.enter_context(pipe), selectors.EVENT_READ, name)
+                stack.enter_context(pipe)
+                os.set_blocking(pipe.fileno(), False)
+                selector.register(pipe, selectors.EVENT_READ, name)
             pending_input = memoryview((stdin_text or "").encode("utf-8"))
             if proc.stdin is not None:
                 stack.enter_context(proc.stdin)
                 if pending_input:
+                    os.set_blocking(proc.stdin.fileno(), False)
                     selector.register(proc.stdin, selectors.EVENT_WRITE, "stdin")
                 else:
                     proc.stdin.close()
@@ -650,14 +751,19 @@ def run_cmd(
                         try:
                             written = os.write(key.fd, pending_input[:4096])
                             pending_input = pending_input[written:]
-                        except BrokenPipeError:
+                        except BlockingIOError:
+                            continue
+                        except (BrokenPipeError, OSError):
                             pending_input = memoryview(b"")
                         if not pending_input:
                             selector.unregister(key.fd)
                             key.fileobj.close()
                         continue
-                    chunk = os.read(key.fd, 65536)
-                    buffers[key.data].extend(chunk)
+                    try:
+                        chunk = os.read(key.fd, 65536)
+                    except BlockingIOError:
+                        continue
+                    buffers[key.data].append(chunk)
                     if key.data in logs:
                         logs[key.data].write(chunk)
                     if not chunk:
@@ -666,27 +772,27 @@ def run_cmd(
                 _check_shutdown()
         except BaseException:
             _terminate_proc(proc)
-            # Drain diagnostics already in the pipes even if shutdown won the poll race.
+            # Drain a bounded amount of diagnostics already in the pipes without blocking.
             for name, pipe in (("stdout", proc.stdout), ("stderr", proc.stderr)):
                 if name in logs and pipe is not None and not pipe.closed:
-                    os.set_blocking(pipe.fileno(), False)
-                    tail = pipe.read()
-                    if tail:
-                        logs[name].write(tail)
+                    try:
+                        fd = pipe.fileno()
+                        os.set_blocking(fd, False)
+                        drained = 0
+                        while drained < 1024 * 1024:
+                            chunk = os.read(fd, 65536)
+                            if not chunk:
+                                break
+                            logs[name].write(chunk)
+                            drained += len(chunk)
+                    except (BlockingIOError, OSError, ValueError):
+                        pass
                     logs[name].write(b"")
             raise
         finally:
             _unregister_active_pgid(proc.pid)
-        stdout = buffers["stdout"].decode("utf-8", errors="replace")
-        stderr = buffers["stderr"].decode("utf-8", errors="replace")
-
-    if cap_output:
-        if len(stdout) > DISPLAY_OUTPUT_CAP:
-            stdout = redact_secrets(stdout)
-            stdout = stdout[: DISPLAY_OUTPUT_CAP // 4] + "\n...[truncated]...\n" + stdout[-(DISPLAY_OUTPUT_CAP // 2) :]
-        if len(stderr) > DISPLAY_OUTPUT_CAP:
-            stderr = redact_secrets(stderr)
-            stderr = stderr[: DISPLAY_OUTPUT_CAP // 4] + "\n...[truncated]...\n" + stderr[-(DISPLAY_OUTPUT_CAP // 2) :]
+        stdout = buffers["stdout"].decode()
+        stderr = buffers["stderr"].decode()
 
     result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
     if check and result.returncode != 0:
@@ -806,8 +912,8 @@ class LinearClient:
                     time.sleep(1.5 * (2**attempt))
                     last_err = e
                     continue
-                raise RuntimeError(f"Linear network error: {e}") from e
-        raise RuntimeError(f"Linear query failed after retries: {last_err}")
+                raise RuntimeError(f"Linear network error: {redact_secrets(str(e))}") from e
+        raise RuntimeError(f"Linear query failed after retries: {redact_secrets(str(last_err))}")
 
     def _paginate_root(self, field: str, node_selection: str) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
@@ -1086,12 +1192,22 @@ class LinearClient:
                 return match
             raise RuntimeError(f"Failed to create Linear label {label_name!r}")
         except RuntimeError:
-            # Handle concurrent creation race from a sibling worker: refresh team labels once before failing
+            # Handle concurrent creation race from a sibling worker: refresh team and workspace labels once before failing
             fresh_team_labels = self._paginate_entity_field("team", team["id"], "labels", "id name")
             team["labels"] = {"nodes": fresh_team_labels}
             raced = next((l for l in fresh_team_labels if l["name"].lower() == label_name.lower()), None)
             if raced:
                 return raced
+            raced_ws = self.query(
+                """query($name: String!) {
+                    issueLabels(filter: { name: { eqIgnoreCase: $name }, team: { null: true } }, first: 1) {
+                        nodes { id name }
+                    }
+                }""",
+                {"name": label_name},
+            )["issueLabels"]["nodes"]
+            if raced_ws:
+                return raced_ws[0]
             raise
 
     def ensure_label_and_add(self, issue: dict[str, Any], label_name: str) -> None:
@@ -1220,20 +1336,56 @@ def resolve_project(client: LinearClient, repo_root: Path, explicit: str | None 
     )
 
 
+def _normalize_touch_token(raw: str) -> str | None:
+    """Normalize a Touches entry to lowercase POSIX relative path; return None for broad wildcards (fail-closed unscoped)."""
+    tok = raw.strip().strip("`").replace("\\", "/").lower()
+    if not tok or tok in ("none", "n/a", "nil"):
+        return ""
+    while tok.startswith("./"):
+        tok = tok[2:]
+    tok = re.sub(r"/{2,}", "/", tok).strip("/")
+    while tok.endswith("/**") or tok.endswith("/*"):
+        tok = tok.rsplit("/", 1)[0].strip("/")
+    if not tok or tok in (".", "*", "**", "all"):
+        return None
+    parts = [p for p in tok.split("/") if p and p != "."]
+    if not parts or any(p == ".." for p in parts):
+        return None
+    return "/".join(parts)
+
+
 def parse_touches(description: str) -> set[str]:
-    """Extract normalized resource tokens under '## Touches' (preserves path slashes, ignores 'none'/'n/a')."""
-    m = re.search(r"^##\s+Touches\s*\n(.*?)(?=^##\s|\Z)", description or "", re.M | re.S | re.I)
-    if not m:
-        return set()
+    """Extract normalized resource tokens under '## Touches' (fence-aware, heading-aware, normalized POSIX paths)."""
     tokens: set[str] = set()
-    for line in m.group(1).splitlines():
-        cleaned = re.sub(r"^[\s\-*`]+|[\s`]+$", "", line).strip()
+    in_section = False
+    fence = ""
+    for raw_line in (description or "").splitlines():
+        stripped = raw_line.strip()
+        if fence:
+            if re.fullmatch(r" {0,3}" + fence[0] + "{" + str(len(fence)) + r",}[ \t]*", raw_line):
+                fence = ""
+            continue
+        opening = re.match(r"^ {0,3}(`{3,}|~{3,})", raw_line)
+        if opening:
+            fence = opening[1]
+            continue
+        if re.match(r"^ {0,3}#{1,6}(?:\s|$)", raw_line):
+            if in_section:
+                break
+            in_section = bool(re.fullmatch(r"##\s+Touches", stripped, re.I))
+            continue
+        if not in_section or not stripped or stripped.startswith(">"):
+            continue
+        cleaned = re.sub(r"^[\s\-*`]+|[\s`]+$", "", stripped).strip()
         if not cleaned or cleaned.lower() in ("none", "n/a", "nil"):
             continue
         for part in re.split(r"[,;]+", cleaned):
-            tok = part.strip().strip("`").strip("/").lower()
-            if tok and tok not in ("none", "n/a", "nil"):
-                tokens.add(tok)
+            norm = _normalize_touch_token(part)
+            if norm is None:
+                # Wildcard / root scope -> fail closed as unscoped (exclusive lock on repo root)
+                return set()
+            if norm:
+                tokens.add(norm)
     return tokens
 
 
@@ -2043,6 +2195,10 @@ def check_base_baseline(
                         cache = {}
                 cache[cache_key] = True
                 atomic_write_text(baselines_file, json.dumps(cache, indent=2))
+        elif temp_wt is None:
+            # Leave reused fresh worktree clean if baseline verification failed and dirtied it.
+            run_cmd(git_cmd("reset", "--hard", base_sha), cwd=worktree, env_role="orchestrator", ignore_shutdown=True)
+            run_cmd(git_cmd("clean", "-fd", "-e", ".dispatch"), cwd=worktree, env_role="orchestrator", ignore_shutdown=True)
         return {"checked": True, "cached": False, **res}
 
 
@@ -2087,12 +2243,17 @@ def check_protected_paths(
                 except json.JSONDecodeError as exc:
                     violations.append(f"Invalid JSON in `{f}`: {exc}")
                     continue
+                if not isinstance(new_pkg, dict):
+                    violations.append(f"Invalid JSON object in `{f}`")
+                    continue
             else:
                 new_pkg = {}
             if old_raw.returncode == 0:
                 try:
                     old_pkg = json.loads(old_raw.stdout)
                 except json.JSONDecodeError:
+                    old_pkg = {}
+                if not isinstance(old_pkg, dict):
                     old_pkg = {}
                 for section in ("scripts", "jest", "vitest", "eslintConfig"):
                     if old_pkg.get(section) != new_pkg.get(section):
@@ -2229,9 +2390,20 @@ def _scan_before_git_write(worktree: Path, *, for_stash: bool = False) -> list[s
             continue
         path = worktree / name
         if path.is_symlink():
-            content = os.readlink(path)
+            try:
+                content = os.readlink(path)
+            except OSError:
+                findings.append(f"Unable to read untracked symlink: {redact_secrets(name)}")
+                continue
+            if _is_secret_filename(content):
+                findings.append(f"Potential secret symlink target: {redact_secrets(name)}")
+                continue
         elif path.is_file():
-            content = path.read_bytes().decode("utf-8", errors="replace")
+            try:
+                content = path.read_bytes().decode("utf-8", errors="replace")
+            except OSError:
+                findings.append(f"Unable to read untracked file for secret scan: {redact_secrets(name)}")
+                continue
         else:
             findings.append("Unable to scan untracked entry as a regular file or symbolic link")
             continue
@@ -2371,7 +2543,10 @@ def validate_schema(obj: Any, schema: dict[str, Any], *, expected_axis: str | No
 def _harness_events(stdout: str) -> Iterator[dict[str, Any]]:
     for line in stdout.split("\n"):
         if line.lstrip().startswith("{"):
-            event = json.loads(line)
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
             if isinstance(event, dict):
                 yield event
 
@@ -2386,9 +2561,11 @@ def parse_codex_ndjson(stdout: str) -> str:
         if kind == "turn.started":
             text, completed = "", False
         elif kind == "item.completed":
-            item = event.get("item") or {}
-            if item.get("type") == "agent_message":
-                text = item.get("text", "")
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                msg_text = item.get("text", "")
+                if isinstance(msg_text, str):
+                    text = msg_text
         elif kind == "turn.completed":
             completed = True
     if not text or not completed:
@@ -2402,7 +2579,8 @@ def parse_opencode_ndjson(stdout: str) -> str:
     finished = False
     for event in _harness_events(stdout):
         kind = event.get("type")
-        part = event.get("part") or {}
+        raw_part = event.get("part")
+        part = raw_part if isinstance(raw_part, dict) else {}
         msg_id = str(part.get("messageID") or event.get("messageID") or "")
         if kind == "error":
             raise RuntimeError("OpenCode reported an error event")
@@ -2434,7 +2612,8 @@ def parse_pi_ndjson(stdout: str) -> str:
         elif kind in ("message_start", "message_update", "message_end") and isinstance(msg, dict) and msg.get("role") == "assistant":
             final = msg if kind == "message_end" else None
         elif kind == "agent_end":
-            final = next((m for m in reversed(event.get("messages") or [])
+            msgs = event.get("messages")
+            final = next((m for m in reversed(msgs if isinstance(msgs, list) else [])
                           if isinstance(m, dict) and m.get("role") == "assistant"), None)
     if final and final.get("stopReason") in (None, "stop"):
         content = final.get("content")
@@ -2473,12 +2652,21 @@ def _pi_session_archive(path: Path, session_id: str, worktree: Path) -> Iterator
         try:
             yield f"/proc/{os.getpid()}/fd/{session.fileno()}"
         finally:
-            session.seek(0)
-            entries = []
-            for line in session:
-                if line.endswith("\n"):
-                    entries.append(safe_json(json.loads(line), ensure_ascii=False))
-            atomic_write_text(path, "\n".join(entries) + "\n")
+            try:
+                session.seek(0)
+                entries = []
+                for line in session:
+                    if not line.endswith("\n") or not line.strip():
+                        continue
+                    try:
+                        parsed = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    entries.append(safe_json(parsed, ensure_ascii=False))
+                if entries:
+                    atomic_write_text(path, "\n".join(entries) + "\n")
+            except Exception as exc:
+                log(f"Warning: failed persisting redacted Pi session archive {path}: {exc}")
 
 
 def invoke_harness(
@@ -2969,7 +3157,7 @@ def run_two_axis_review(
                     log(f"{axis} review failed transiently ({type(exc).__name__}: {exc}); retrying once...")
                     retry_delay = float(os.environ.get("AGENT_DISPATCH_REVIEW_RETRY_SLEEP", "2.0"))
                     if retry_delay > 0:
-                        time.sleep(retry_delay)
+                        _interruptible_sleep(retry_delay)
                     continue
                 raise
         assert last_err is not None
@@ -3340,11 +3528,12 @@ def reconcile_publish(
             attempts = max(1, int(os.environ.get("AGENT_DISPATCH_PR_POLL_ATTEMPTS", "5")))
             pause = float(os.environ.get("AGENT_DISPATCH_PR_POLL_SLEEP", "2.0"))
             for attempt_i in range(attempts):
+                _check_shutdown()
                 pr = fetch_open_pr_for_branch(worktree, gh_repo, branch)
                 if pr and pr.get("headRefOid") == candidate_sha:
                     break
                 if attempt_i + 1 < attempts:
-                    time.sleep(pause)
+                    _interruptible_sleep(pause)
             verified = _validate_open_draft_pr(pr, base_branch=base_branch, candidate_sha=candidate_sha, context="PR read-back")
             if state.get("pr_number") and verified["number"] != state["pr_number"]:
                 raise RuntimeError("Open PR changed during publication; human action preserved.")
@@ -3645,9 +3834,18 @@ def execute_ticket(
     with file_lock(t_lock, blocking=False):
         latest_file = _cache_root() / "runs" / rkey / issue["identifier"] / ("latest-local.json" if no_push else "latest.json")
         if not no_push and not force_rerun and latest_file.is_file():
-            latest = json.loads(latest_file.read_text(encoding="utf-8"))
-            authoritative = Path(latest["run_dir"]) / "state.json"
-            previous = json.loads(authoritative.read_text(encoding="utf-8")) if authoritative.is_file() else latest
+            try:
+                latest = json.loads(latest_file.read_text(encoding="utf-8"))
+                if not isinstance(latest, dict) or not latest.get("run_dir"):
+                    raise ValueError("missing run_dir")
+                authoritative = Path(latest["run_dir"]) / "state.json"
+                previous = json.loads(authoritative.read_text(encoding="utf-8")) if authoritative.is_file() else latest
+                if not isinstance(previous, dict):
+                    raise ValueError("state is not a JSON object")
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Corrupt checkpoint at {latest_file} ({exc}); inspect manually or pass --force-rerun."
+                ) from exc
             if previous.get("stage") in ("claim_pending", *PUBLISH_STAGES):
                 raise RuntimeError(f"Checkpoint at {previous['stage']}; run agent-dispatch resume {issue['identifier']} first.")
         # 1. Initial eligibility check inside lock
@@ -4327,11 +4525,18 @@ def cmd_resume(args: argparse.Namespace) -> int:
         latest_file = _cache_root() / "runs" / rkey / issue["identifier"] / "latest.json"
         if not latest_file.is_file():
             raise RuntimeError(f"No checkpoint found at {latest_file}")
-        latest_data = json.loads(latest_file.read_text(encoding="utf-8"))
-        run_dir = Path(latest_data["run_dir"])
-        state_file = run_dir / "state.json"
-        # Prefer authoritative run_dir/state.json over latest.json index to avoid split-brain on mid-write crash!
-        state = json.loads(state_file.read_text(encoding="utf-8")) if state_file.is_file() else latest_data
+        try:
+            latest_data = json.loads(latest_file.read_text(encoding="utf-8"))
+            if not isinstance(latest_data, dict) or not latest_data.get("run_dir"):
+                raise ValueError("missing run_dir")
+            run_dir = Path(latest_data["run_dir"])
+            state_file = run_dir / "state.json"
+            # Prefer authoritative run_dir/state.json over latest.json index to avoid split-brain on mid-write crash!
+            state = json.loads(state_file.read_text(encoding="utf-8")) if state_file.is_file() else latest_data
+            if not isinstance(state, dict):
+                raise ValueError("state is not a JSON object")
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"Corrupt checkpoint at {latest_file}: {exc}") from exc
         if state.get("issue_uuid") and state["issue_uuid"] != issue["id"]:
             raise RuntimeError(f"Checkpoint issue UUID mismatch ({state['issue_uuid']} != {issue['id']}).")
         if state.get("repo_identity") and state["repo_identity"] != cur_repo_identity:
@@ -4343,7 +4548,10 @@ def cmd_resume(args: argparse.Namespace) -> int:
         if state.get("stage") in ("claim_pending", "claim_released"):
             live = client.get_issue(issue["id"])
             if state["stage"] == "claim_pending":
-                if live["state"]["id"] != state["pre_claim_state_id"]:
+                pre_state_id = state.get("pre_claim_state_id")
+                if not pre_state_id:
+                    raise RuntimeError("Interrupted claim checkpoint missing pre_claim_state_id; human state preserved.")
+                if live["state"]["id"] != pre_state_id:
                     # Older claim_pending records lack an assignee/description snapshot.
                     if not state.get("claimed_ownership") or live["state"]["id"] != state.get("claimed_state_id"):
                         raise RuntimeError("Cannot verify ownership of interrupted claim; human state preserved.")
@@ -4351,7 +4559,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
                     client.ensure_label_and_add(live, "dispatch:failed")
                     live = client.get_issue(issue["id"])
                     _require_publish_ownership(live, state)
-                    client.update_issue_state_by_id(live, state["pre_claim_state_id"])
+                    client.update_issue_state_by_id(live, pre_state_id)
                 state["stage"] = "claim_released"
                 save_checkpoint(run_dir, latest_file, state)
             print(safe_json({"issue": issue["identifier"], "status": "claim_released", "rerun": f"agent-dispatch run {issue['identifier']}"}))
@@ -4588,12 +4796,26 @@ def run_batch_safely(
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.max_parallel))
     try:
         futs = {pool.submit(_safe_exec, iss): iss["identifier"] for iss in wave}
-        for fut in concurrent.futures.as_completed(futs):
-            result = fut.result()
-            if result["status"] == "deferred":
-                deferred.append({"id": result["issue"], "reason": result["reason"]})
-            else:
-                results.append(result)
+        pending = set(futs)
+        cancelled_for_shutdown = False
+        while pending:
+            done, pending = concurrent.futures.wait(
+                pending, timeout=0.1, return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            for fut in done:
+                result = fut.result()
+                if result["status"] == "deferred":
+                    deferred.append({"id": result["issue"], "reason": result["reason"]})
+                else:
+                    results.append(result)
+            if _is_shutdown_requested() and not cancelled_for_shutdown:
+                cancelled_for_shutdown = True
+                for fut in list(pending):
+                    if fut.cancel():
+                        pending.discard(fut)
+                _kill_all_active_children(wait_sigkill=False)
+        if _is_shutdown_requested():
+            _check_shutdown()
     except (KeyboardInterrupt, SystemExit):
         global _SHUTDOWN_SIGNAL
         if _SHUTDOWN_SIGNAL == 0:
@@ -4956,10 +5178,15 @@ def cleanup_baseline(repo_root: Path, rkey: str, wt: Path, force: bool) -> None:
     with file_lock(lock, blocking=False):
         head = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=wt, check=True, env_role="orchestrator").stdout.strip()
         branch = run_cmd(git_cmd("branch", "--show-current"), cwd=wt, check=True, env_role="orchestrator").stdout.strip()
-        if branch or head != owner.get("base_sha") or wt != get_repo_root(str(wt)):
+        if branch or head != owner.get("base_sha") or wt.resolve() != get_repo_root(str(wt)):
             raise RuntimeError("baseline ownership changed")
-        run_cmd(git_cmd("worktree", "remove", *(["--force"] if force else []), str(wt)),
-                cwd=repo_root, check=True, env_role="orchestrator")
+        tracked_dirty = run_cmd(
+            git_cmd("status", "--porcelain", "--untracked-files=no"), cwd=wt, check=True, env_role="orchestrator"
+        ).stdout.strip()
+        if tracked_dirty and not force:
+            raise RuntimeError("baseline has modified tracked files")
+        # Allow reclaiming detached baselines with untracked bootstrap/verify artifacts (e.g., node_modules/.venv)
+        run_cmd(git_cmd("worktree", "remove", "--force", str(wt)), cwd=repo_root, check=True, env_role="orchestrator")
         owner_file.unlink()
 
 
@@ -4985,6 +5212,9 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
 
         if wt_root.is_dir():
             for wt in sorted(wt_root.iterdir()):
+                if wt.is_symlink():
+                    skipped.append(f"{wt.name} (symlink in worktree root; refusing delete)")
+                    continue
                 if not wt.is_dir():
                     continue
                 if not (wt / ".git").exists():
@@ -5173,6 +5403,8 @@ def main() -> int:
         status = args.func(args)
         _check_shutdown()
         return status
+    except KeyboardInterrupt:
+        return 128 + signal.SIGINT
     except Exception as exc:
         print(safe_json({"status": "error", "error": redact_secrets(str(exc))}, indent=2, ensure_ascii=False), file=sys.stderr)
         return 2
