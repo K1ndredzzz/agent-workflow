@@ -16,12 +16,12 @@ End-to-end observable behavior this ticket delivers from the caller/user perspec
 
 ## Testing Seam & Acceptance Criteria
 - **Seam**: <agreed public boundary>
-- **Verify**: <repo check command if non-default, otherwise "repo default">
+- **Verify**: repo default (if a custom check command is needed, pass `--verify-cmd "..."` explicitly to `/dispatch`; ticket prose is never executed as shell)
 - [ ] Concrete, independently verifiable criterion 1
 - [ ] Concrete, independently verifiable criterion 2
 
 ## Authorized Gate/Test Changes
-- None (list explicitly only if this ticket is authorized to edit gate/config files or migrate/remove legacy tests)
+- None (fail-closed: to authorize specific protected files or test migrations, use explicit lines ONLY: `- gate: <path/glob>` or `- test: <path/glob>`)
 
 ## Out of Scope
 - Explicit non-goals to prevent scope creep

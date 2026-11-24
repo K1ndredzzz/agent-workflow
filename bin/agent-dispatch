@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-agent-dispatch v3: Production-grade cross-harness headless orchestrator.
+agent-dispatch v4: Production-grade cross-harness headless orchestrator.
 
 Pipeline:
-  Preflight (Project + Dirty Docs + Remote FF + Verify Detect + Bootstrap + Base Baseline) ->
-  Canonical Repo & Ticket Flock Locks -> Claim Linear (skipped in --no-push) ->
+  Preflight (Project + Dirty Docs + Remote FF + Verify Detect + Bootstrap + Real Base Baseline) ->
+  Canonical Repo & Ticket Flock Locks (worktree owner.json inside repo lock) ->
+  Fresh Post-Preflight Claim (skipped in --no-push) ->
   Worker (Codex/OpenCode/Pi/Antigravity, streaming logs + instant sessions.jsonl) ->
-  Orchestrator Commit + Full-Range Untruncated Secret Scan ->
-  Protected-Paths (--no-renames) + Deterministic Test-Integrity (--no-renames) + Mandatory Verify ->
-  Cross-Vendor Read-Only Two-Axis Review (pre-generated diff.patch + verified immutable artifacts) ->
-  Post-Review Worktree & External Mutation Verification -> Bounded Rework (1 + max_rework) ->
-  True Remote-Reconciled Option B Delivery (FF Push + Verified Open Draft PR + Live Linear In Review
-  + Label Cleanup + Idempotent Delivery Comment) with Atomic Checkpoints (`resume`).
+  Branch/History Check + Secret-Checked Orchestrator Commit (hooks/fsmonitor disabled) ->
+  Full-Range Untruncated Secret Scan (diffs + commit msgs + merges) ->
+  Granular Protected-Paths + Deterministic Test-Integrity (-z NUL-safe) + Mandatory Verify ->
+  Cross-Vendor Read-Only Two-Axis Review (pre-generated diff.patch + SHA-256 verified artifacts) ->
+  Post-Review Worktree, Artifact & Ownership Verification -> Bounded Rework (1 + max_rework) ->
+  True Remote-Reconciled Option B Delivery (Pre-Push PR Guard + FF Push + Verified Open Draft PR
+  + Human-State-Safe Linear In Review + Atomic Label Cleanup + Idempotent Delivery Comment)
+  with Atomic Checkpoints (`resume`).
 """
 
 from __future__ import annotations
@@ -20,7 +23,9 @@ import argparse
 import concurrent.futures
 import contextlib
 import fcntl
+import fnmatch
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -51,7 +56,17 @@ def _cache_root() -> Path:
     return Path(custom).resolve() if custom else (Path.home() / ".cache" / "agent-dispatch")
 
 
-SKILLS_ROOT = Path("/root/.agent/skills")
+def _resolve_skills_root() -> Path:
+    custom = os.environ.get("AGENT_DISPATCH_SKILLS_ROOT", "").strip()
+    if custom:
+        return Path(custom).resolve()
+    rel = Path(__file__).resolve().parent.parent / "skills"
+    if (rel / "dispatch" / "references").is_dir():
+        return rel
+    return Path("/root/.agent/skills")
+
+
+SKILLS_ROOT = _resolve_skills_root()
 TDD_REF_PATH = SKILLS_ROOT / "dispatch" / "references" / "tdd.md"
 REVIEW_STANDARDS_REF_PATH = SKILLS_ROOT / "dispatch" / "references" / "review-standards.md"
 REVIEW_SPEC_REF_PATH = SKILLS_ROOT / "dispatch" / "references" / "review-spec.md"
@@ -62,6 +77,15 @@ PRELOADED_REFS: dict[str, str] = {
     "standards": REVIEW_STANDARDS_REF_PATH.read_text(encoding="utf-8") if REVIEW_STANDARDS_REF_PATH.is_file() else "",
     "spec": REVIEW_SPEC_REF_PATH.read_text(encoding="utf-8") if REVIEW_SPEC_REF_PATH.is_file() else "",
 }
+
+
+def assert_required_rubrics_loaded() -> None:
+    missing = [k for k in ("tdd", "standards", "spec") if not PRELOADED_REFS.get(k, "").strip()]
+    if missing:
+        raise RuntimeError(
+            f"Required workflow rubric files missing or empty under {SKILLS_ROOT}: {missing}. "
+            f"Re-run install.sh or set AGENT_DISPATCH_SKILLS_ROOT."
+        )
 
 DISPLAY_OUTPUT_CAP = 2 * 1024 * 1024
 
@@ -144,7 +168,9 @@ HARNESS_ALIASES: dict[str, dict[str, str]] = {
     },
 }
 
-PROTECTED_EXACT_FILES = {
+PROTECTED_EXACT_FILES: set[str] = set()
+
+PROTECTED_BASENAMES = {
     "justfile",
     "Justfile",
     "Makefile",
@@ -159,12 +185,12 @@ PROTECTED_EXACT_FILES = {
     "pyproject.toml",
     "setup.cfg",
     "tox.ini",
+    "noxfile.py",
     "ruff.toml",
     ".ruff.toml",
     ".pre-commit-config.yaml",
+    "conftest.py",
 }
-
-PROTECTED_BASENAMES = {"conftest.py"}
 
 PROTECTED_PREFIXES = (
     "docs/adr/",
@@ -175,6 +201,7 @@ PROTECTED_REGEXES = (
     re.compile(r"(^|/)(vitest|jest|eslint)\.config\..+$"),
     re.compile(r"(^|/)\.eslintrc(\..+)?$"),
     re.compile(r"(^|/)tsconfig(\..+)?\.json$"),
+    re.compile(r"\.mk$", re.I),
 )
 
 SECRET_FILENAME_ALLOWLIST = (
@@ -190,7 +217,12 @@ SECRET_FILENAME_PATTERNS = (
 SECRET_VALUE_PATTERNS = (
     re.compile(r"(?<![A-Za-z0-9_-])lin_api_[A-Za-z0-9_-]{12,}"),
     re.compile(r"(?<![A-Za-z0-9_-])gh[pousr]_[A-Za-z0-9_]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9_-])github_pat_[A-Za-z0-9_]{20,}"),
     re.compile(r"(?<![A-Za-z0-9_-])sk-(?:proj-|live-|test-|ant-)?[A-Za-z0-9_-]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9_-])[sr]k_live_[A-Za-z0-9]{16,}"),
+    re.compile(r"(?<![A-Za-z0-9_-])xox[baprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])"),
+    re.compile(r"(?<![A-Za-z0-9_-])glpat-[A-Za-z0-9_-]{20,}"),
     re.compile(r"(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])"),
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
 )
@@ -199,51 +231,88 @@ PLANNING_TITLE_PREFIXES = ("[research]", "[grill]", "[prototype]", "[map]", "[ta
 
 TEST_FILE_RE = re.compile(
     r"(^|/)(tests?|__tests__|spec|specs)/|"
-    r"(^|/)(test_[^/]+|[^/]+_(test|spec)\.[^/]+|[^/]+\.(test|spec)\.[^/]+|[^/]+Test\.[^/]+)$",
+    r"(^|/)(tests?\.py|test_[^/]+|[^/]+_(test|spec)\.[^/]+|[^/]+\.(test|spec)\.[^/]+|[^/]+Test\.[^/]+)$",
     re.I,
 )
 
 TEST_SKIP_PATTERNS = (
-    re.compile(r"\b(it|test|describe|context)\.(skip|only|todo)\s*\("),
+    re.compile(r"\b(it|test|describe|context)\.(skip|only|todo|skipIf|runIf)\s*\("),
     re.compile(r"\b(xit|xtest|xdescribe|fit|fdescribe)\s*\("),
     re.compile(r"@pytest\.mark\.(skip|skipif|xfail)\b"),
+    re.compile(r"\bpytestmark\s*=.*pytest\.mark\.(skip|skipif|xfail)\b"),
     re.compile(r"\bpytest\.(skip|xfail)\s*\("),
-    re.compile(r"@unittest\.(skip|skipIf|skipUnless)\b"),
+    re.compile(r"@unittest\.(skip|skipIf|skipUnless|expectedFailure)\b"),
+    re.compile(r"\bself\.skipTest\s*\("),
     re.compile(r"#\s*\[\s*ignore\b"),
-    re.compile(r"\bt\.Skip\s*\("),
+    re.compile(r"\bt\.Skip(?:Now)?\s*\("),
     re.compile(r"@Disabled\b"),
 )
 
 TRUSTED_PR_AUTHOR_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 
-# Active subprocess PGID tracking for clean SIGTERM/SIGHUP teardown
-_ACTIVE_PGIDS_LOCK = threading.Lock()
+# Lock-free signal-safe shutdown coordination & active PGID tracking
+_SHUTDOWN_EVENT = threading.Event()
+_SHUTDOWN_SIGNAL: int = 0
+_ACTIVE_PGIDS_LOCK = threading.RLock()
 _ACTIVE_PGIDS: set[int] = set()
+_ACTIVE_PGIDS_SNAPSHOT: tuple[int, ...] = ()
 
 
-def _kill_all_active_children() -> None:
+def _register_active_pgid(pid: int) -> None:
+    global _ACTIVE_PGIDS_SNAPSHOT
     with _ACTIVE_PGIDS_LOCK:
-        pgids = list(_ACTIVE_PGIDS)
+        _ACTIVE_PGIDS.add(pid)
+        _ACTIVE_PGIDS_SNAPSHOT = tuple(_ACTIVE_PGIDS)
+
+
+def _unregister_active_pgid(pid: int) -> None:
+    global _ACTIVE_PGIDS_SNAPSHOT
+    with _ACTIVE_PGIDS_LOCK:
+        _ACTIVE_PGIDS.discard(pid)
+        _ACTIVE_PGIDS_SNAPSHOT = tuple(_ACTIVE_PGIDS)
+
+
+def _check_shutdown() -> None:
+    if _SHUTDOWN_EVENT.is_set():
+        sig = _SHUTDOWN_SIGNAL or signal.SIGTERM
+        if sig == signal.SIGINT:
+            raise KeyboardInterrupt("Interrupted by SIGINT")
+        raise SystemExit(128 + sig)
+
+
+def _kill_all_active_children(*, wait_sigkill: bool = True) -> None:
+    # Read immutable tuple reference without acquiring lock (safe even from a signal handler!)
+    pgids = _ACTIVE_PGIDS_SNAPSHOT
     for pgid in pgids:
         try:
             os.killpg(pgid, signal.SIGTERM)
         except ProcessLookupError:
             pass
-    if pgids:
+        except OSError:
+            pass
+    if pgids and wait_sigkill:
         time.sleep(0.3)
         for pgid in pgids:
             try:
                 os.killpg(pgid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            except OSError:
+                pass
 
 
 def _install_signal_handlers() -> None:
     def _handler(signum: int, _frame: Any) -> None:
-        _kill_all_active_children()
+        global _SHUTDOWN_SIGNAL
+        _SHUTDOWN_SIGNAL = signum
+        _SHUTDOWN_EVENT.set()
+        # Lock-free SIGTERM broadcast only; callers/finally handle clean SIGKILL wait
+        _kill_all_active_children(wait_sigkill=False)
+        if signum == signal.SIGINT:
+            raise KeyboardInterrupt("Interrupted by SIGINT")
         raise SystemExit(128 + signum)
 
-    for sig in (signal.SIGTERM, signal.SIGHUP):
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         try:
             signal.signal(sig, _handler)
         except ValueError:
@@ -345,28 +414,71 @@ def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def ensure_sanitized_gitconfig() -> tuple[Path, Path]:
-    """Create an empty GH_CONFIG_DIR and a sanitized global gitconfig with credential helpers removed."""
-    base = _cache_root() / "child-sandbox-env"
-    gh_empty = base / "empty-gh-config"
-    gh_empty.mkdir(parents=True, exist_ok=True)
-    sanitized_git = base / "sanitized.gitconfig"
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
+
+def scan_text_for_secrets(text: str, field_name: str) -> list[str]:
+    hits: list[str] = []
+    for pat in SECRET_VALUE_PATTERNS:
+        if pat.search(text or ""):
+            hits.append(f"Potential secret token in {field_name} matching {pat.pattern}")
+    return hits
+
+
+def git_cmd(*args: str) -> list[str]:
+    """Safe orchestrator git invocation: disables repo hooks, fsmonitor, pager, and path quoting."""
+    return [
+        "git",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=",
+        "-c",
+        "core.quotePath=false",
+        "--no-pager",
+        *args,
+    ]
+
+
+_SAN_GIT_CACHE: dict[tuple[str, float], tuple[Path, Path]] = {}
+_SAN_GIT_LOCK = threading.Lock()
+
+
+def ensure_sanitized_gitconfig() -> tuple[Path, Path]:
+    """Create cached empty GH_CONFIG_DIR and sanitized global gitconfig (strips credential/http-auth/include)."""
+    base = _cache_root() / "child-sandbox-env"
     src_gitconfig = Path.home() / ".gitconfig"
-    lines: list[str] = []
-    if src_gitconfig.is_file():
-        skip_section = False
-        for raw_line in src_gitconfig.read_text(encoding="utf-8", errors="ignore").splitlines():
-            stripped = raw_line.strip()
-            if stripped.startswith("["):
-                skip_section = stripped.lower().startswith("[credential")
-            if skip_section or re.match(r"^\s*helper\s*=", raw_line, re.I):
-                continue
-            lines.append(raw_line)
-    # Explicitly neutralize credential helpers
-    lines += ["[credential]", "\thelper ="]
-    atomic_write_text(sanitized_git, "\n".join(lines) + "\n")
-    return gh_empty, sanitized_git
+    src_mtime = src_gitconfig.stat().st_mtime if src_gitconfig.is_file() else -1.0
+    cache_key = (str(base), src_mtime)
+    with _SAN_GIT_LOCK:
+        cached = _SAN_GIT_CACHE.get(cache_key)
+        if cached and cached[0].is_dir() and cached[1].is_file():
+            return cached
+
+        gh_empty = base / "empty-gh-config"
+        gh_empty.mkdir(parents=True, exist_ok=True)
+        sanitized_git = base / "sanitized.gitconfig"
+
+        lines: list[str] = []
+        if src_gitconfig.is_file():
+            skip_section = False
+            for raw_line in src_gitconfig.read_text(encoding="utf-8", errors="ignore").splitlines():
+                stripped = raw_line.strip()
+                if stripped.startswith("["):
+                    low = stripped.lower()
+                    skip_section = (
+                        low.startswith("[credential")
+                        or low.startswith("[include")
+                        or low.startswith("[http")
+                    )
+                if skip_section or re.match(r"^\s*(helper|extraheader|cookiefile|askpass)\s*=", raw_line, re.I):
+                    continue
+                lines.append(raw_line)
+        lines += ["[credential]", "\thelper ="]
+        atomic_write_text(sanitized_git, "\n".join(lines) + "\n")
+        _SAN_GIT_CACHE[cache_key] = (gh_empty, sanitized_git)
+        return gh_empty, sanitized_git
 
 
 def resolve_linear_auth() -> str:
@@ -416,7 +528,7 @@ def build_child_env(*, role: str = "child") -> dict[str, str]:
         return env
 
     env["AGENT_DISPATCH_CHILD"] = "1"
-    for var in ("LINEAR_API_KEY", "GH_TOKEN", "GITHUB_TOKEN"):
+    for var in ("LINEAR_API_KEY", "GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "GIT_ASKPASS", "SSH_ASKPASS"):
         env.pop(var, None)
     if role != "codex":
         env.pop("CODEX_SUB2API_API_KEY", None)
@@ -442,15 +554,29 @@ def run_cmd(
     stdout_path: Path | None = None,
     stderr_path: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run subprocess in its own process group; supports live streaming to disk and untruncated capture."""
+    """Run subprocess in its own process group; UTF-8 replacement safe, shutdown-aware, streaming to disk."""
+    _check_shutdown()
     env = build_child_env(role=env_role)
+
+    def _terminate_proc(proc: subprocess.Popen[str]) -> None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            time.sleep(0.3)
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
     if stdout_path is not None or stderr_path is not None:
         if stdout_path:
             stdout_path.parent.mkdir(parents=True, exist_ok=True)
         if stderr_path:
             stderr_path.parent.mkdir(parents=True, exist_ok=True)
-        f_out = stdout_path.open("w+", encoding="utf-8") if stdout_path else None
-        f_err = stderr_path.open("w+", encoding="utf-8") if stderr_path else None
+        f_out = stdout_path.open("w+", encoding="utf-8", errors="replace") if stdout_path else None
+        f_err = stderr_path.open("w+", encoding="utf-8", errors="replace") if stderr_path else None
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -459,26 +585,21 @@ def run_cmd(
                 stdout=f_out if f_out is not None else subprocess.PIPE,
                 stderr=f_err if f_err is not None else subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 shell=shell,
                 env=env,
                 start_new_session=True,
             )
-            with _ACTIVE_PGIDS_LOCK:
-                _ACTIVE_PGIDS.add(proc.pid)
+            _register_active_pgid(proc.pid)
             try:
+                _check_shutdown()
                 out_mem, err_mem = proc.communicate(input=stdin_text, timeout=timeout)
             except (subprocess.TimeoutExpired, KeyboardInterrupt, SystemExit):
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                    time.sleep(0.3)
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                proc.wait()
+                _terminate_proc(proc)
                 raise
             finally:
-                with _ACTIVE_PGIDS_LOCK:
-                    _ACTIVE_PGIDS.discard(proc.pid)
+                _unregister_active_pgid(proc.pid)
 
             stdout = ""
             stderr = ""
@@ -507,26 +628,21 @@ def run_cmd(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             shell=shell,
             env=env,
             start_new_session=True,
         )
-        with _ACTIVE_PGIDS_LOCK:
-            _ACTIVE_PGIDS.add(proc.pid)
+        _register_active_pgid(proc.pid)
         try:
+            _check_shutdown()
             stdout, stderr = proc.communicate(input=stdin_text, timeout=timeout)
         except (subprocess.TimeoutExpired, KeyboardInterrupt, SystemExit):
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-                time.sleep(0.3)
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.wait()
+            _terminate_proc(proc)
             raise
         finally:
-            with _ACTIVE_PGIDS_LOCK:
-                _ACTIVE_PGIDS.discard(proc.pid)
+            _unregister_active_pgid(proc.pid)
 
     if cap_output:
         if len(stdout) > DISPLAY_OUTPUT_CAP:
@@ -637,7 +753,7 @@ class LinearClient:
                     last_err = RuntimeError(f"Linear API HTTP {e.code}: {err_body[:400]}")
                     continue
                 raise RuntimeError(f"Linear API HTTP {e.code}: {err_body[:500]}") from e
-            except urllib.error.URLError as e:
+            except (urllib.error.URLError, TimeoutError, ConnectionResetError, http.client.IncompleteRead, OSError) as e:
                 if retry and attempt < attempts - 1:
                     time.sleep(1.5 * (2**attempt))
                     last_err = e
@@ -761,6 +877,32 @@ class LinearClient:
         data = self.query("query($id: String!) { issue(id: $id) { updatedAt } }", {"id": issue_uuid})
         return str((data.get("issue") or {}).get("updatedAt") or "")
 
+    def get_issue_ownership_snapshot(self, issue_uuid: str) -> dict[str, str]:
+        """Fetch meaningful ownership fields (state, assignee, description hash) to detect real human edits without false alarms."""
+        data = self.query(
+            """
+            query($id: String!) {
+              issue(id: $id) {
+                updatedAt
+                description
+                assignee { id }
+                state { id name type }
+              }
+            }
+            """,
+            {"id": issue_uuid},
+        )
+        iss = data.get("issue") or {}
+        st = iss.get("state") or {}
+        return {
+            "updated_at": str(iss.get("updatedAt") or ""),
+            "state_id": str(st.get("id") or ""),
+            "state_name": str(st.get("name") or ""),
+            "state_type": str(st.get("type") or ""),
+            "assignee_id": str((iss.get("assignee") or {}).get("id") or ""),
+            "description_sha": sha256_text(str(iss.get("description") or "")),
+        }
+
     def list_project_issues(self, project_id: str, *, state_type: str | None = None) -> list[dict[str, Any]]:
         issues: list[dict[str, Any]] = []
         cursor: str | None = None
@@ -817,14 +959,9 @@ class LinearClient:
             "issue", issue_id, "inverseRelations", "type issue { id identifier title state { name type } }"
         )
 
-    def update_issue_state(self, issue: dict[str, Any], target_state: str) -> dict[str, Any]:
-        states = issue.get("team", {}).get("states", {}).get("nodes", [])
-        match = next((s for s in states if s["name"].lower() == target_state.lower()), None)
-        if not match:
-            avail = [s["name"] for s in states]
-            raise RuntimeError(f"Linear state '{target_state}' not found in team states: {avail}")
-        if (issue.get("state") or {}).get("id") == match["id"]:
-            return match
+    def update_issue_state_by_id(self, issue: dict[str, Any], target_state_id: str, label_hint: str = "") -> dict[str, Any]:
+        if (issue.get("state") or {}).get("id") == target_state_id:
+            return issue["state"]
         data = self.query(
             """
             mutation($id: String!, $stateId: String!) {
@@ -834,20 +971,28 @@ class LinearClient:
               }
             }
             """,
-            {"id": issue["id"], "stateId": match["id"]},
+            {"id": issue["id"], "stateId": target_state_id},
             retry=False,
         )
         upd = data.get("issueUpdate") or {}
         returned_issue = upd.get("issue") or {}
         returned_state = returned_issue.get("state") or {}
-        if not upd.get("success") or returned_state.get("id") != match["id"]:
+        if not upd.get("success") or returned_state.get("id") != target_state_id:
             raise RuntimeError(
-                f"Linear issueUpdate failed verification for {issue['identifier']} -> {target_state}: {upd}"
+                f"Linear issueUpdate failed verification for {issue['identifier']} -> {label_hint or target_state_id}: {upd}"
             )
         issue["state"] = returned_state
         if returned_issue.get("updatedAt"):
             issue["updatedAt"] = returned_issue["updatedAt"]
         return returned_state
+
+    def update_issue_state(self, issue: dict[str, Any], target_state: str) -> dict[str, Any]:
+        states = issue.get("team", {}).get("states", {}).get("nodes", [])
+        match = next((s for s in states if s["name"].lower() == target_state.lower()), None)
+        if not match:
+            avail = [s["name"] for s in states]
+            raise RuntimeError(f"Linear state '{target_state}' not found in team states: {avail}")
+        return self.update_issue_state_by_id(issue, match["id"], label_hint=target_state)
 
     def _find_or_create_label(self, issue: dict[str, Any], label_name: str) -> dict[str, Any]:
         team = issue.get("team") or {}
@@ -903,7 +1048,8 @@ class LinearClient:
                 issue["labels"]["nodes"].append(match)
             return
         except RuntimeError as exc:
-            if "addedLabelIds" not in str(exc):
+            msg = str(exc)
+            if not ("addedLabelIds" in msg and ("not defined" in msg or "Unknown" in msg or "GRAPHQL_VALIDATION_FAILED" in msg or "Cannot query field" in msg)):
                 raise
         new_ids = list(dict.fromkeys([*(l["id"] for l in fresh_labels), match["id"]]))
         upd = self.query(
@@ -933,6 +1079,30 @@ class LinearClient:
         to_remove = [l["id"] for l in fresh_labels if l["name"].lower() in targets]
         if not to_remove:
             return
+        # Prefer atomic removedLabelIds so concurrent human label edits are never clobbered
+        try:
+            upd = self.query(
+                """
+                mutation($id: String!, $removedLabelIds: [String!]!) {
+                  issueUpdate(id: $id, input: { removedLabelIds: $removedLabelIds }) {
+                    success
+                    issue { updatedAt labels { nodes { id name } } }
+                  }
+                }
+                """,
+                {"id": issue["id"], "removedLabelIds": to_remove},
+                retry=False,
+            )
+            res = upd.get("issueUpdate") or {}
+            if not res.get("success"):
+                raise RuntimeError(f"issueUpdate(removedLabelIds) returned success=false for {issue['identifier']}: {res}")
+            if (res.get("issue") or {}).get("labels"):
+                issue["labels"] = res["issue"]["labels"]
+            return
+        except RuntimeError as exc:
+            msg = str(exc)
+            if not ("removedLabelIds" in msg and ("not defined" in msg or "Unknown" in msg or "GRAPHQL_VALIDATION_FAILED" in msg or "Cannot query field" in msg)):
+                raise
         remaining_ids = [l["id"] for l in fresh_labels if l["name"].lower() not in targets]
         upd = self.query(
             """
@@ -1025,7 +1195,7 @@ def resolve_project(client: LinearClient, repo_root: Path, explicit: str | None 
         raise RuntimeError(f"Explicit Linear project '{val}' from {src} not found. Available: {avail}")
 
     candidates: list[str] = []
-    remote = run_cmd(["git", "remote", "get-url", "origin"], cwd=repo_root, env_role="orchestrator")
+    remote = run_cmd(git_cmd("remote", "get-url", "origin"), cwd=repo_root, env_role="orchestrator")
     if remote.returncode == 0 and remote.stdout.strip():
         slug = remote.stdout.strip().rstrip("/").rsplit("/", 1)[-1]
         if slug.endswith(".git"):
@@ -1066,19 +1236,72 @@ def parse_touches(description: str) -> set[str]:
     return tokens
 
 
-def has_authorized_gate_or_test_changes(description: str) -> bool:
-    """Return True if the ticket brief explicitly authorizes gate/test changes under '## Authorized Gate/Test Changes'."""
-    m = re.search(r"^##\s+Authorized\s+Gate/Test\s+Changes\s*\n(.*?)(?=^##\s|\Z)", description or "", re.M | re.S | re.I)
+def touches_overlap(a: set[str], b: set[str]) -> list[str]:
+    """Return sorted conflict descriptions; treats parent/child module paths (e.g., src/routes & src/routes/admin) as overlapping."""
+    conflicts: set[str] = set()
+    for x in a:
+        for y in b:
+            if x == y:
+                conflicts.add(x)
+            elif x.startswith(y + "/") or y.startswith(x + "/"):
+                conflicts.add(f"{x}~{y}")
+    return sorted(conflicts)
+
+
+def parse_authorized_changes(description: str) -> tuple[list[str], list[str]]:
+    """
+    Fail-closed structured authorization parser under '## Authorized Gate/Test Changes'.
+    ONLY accepts explicit allowlist lines:
+      - gate: <path-or-glob>
+      - test: <path-or-glob>
+    All free-form text (including 'None', 'Not applicable', '(none)', 'N/A', '无', etc.) is ignored (fail-closed).
+    Returns (gate_patterns, test_patterns).
+    """
+    m = re.search(
+        r"^##\s+Authorized\s+Gate/Test\s+Changes\s*\n(.*?)(?=^##\s|\Z)",
+        description or "",
+        re.M | re.S | re.I,
+    )
     if not m:
-        return False
-    for line in m.group(1).splitlines():
-        cleaned = re.sub(r"^[\s\-*`]+|[\s`]+$", "", line).strip()
-        if not cleaned:
+        return [], []
+    gate_pats: list[str] = []
+    test_pats: list[str] = []
+    benign_none = re.compile(
+        r"^[\(\[_\*]*(none|n/?a|no|false|nothing|nil|not\s+applicable|无|暂无|无须修改|无需修改)[\)\]_\*\s.,;:!-]*(\(.*\))?$",
+        re.I,
+    )
+    for raw_line in m.group(1).splitlines():
+        cleaned = re.sub(r"^[\s\-*]+", "", raw_line).strip()
+        if not cleaned or benign_none.match(cleaned):
             continue
-        low = cleaned.lower()
-        if low.startswith("none") or low in ("n/a", "no", "false"):
+        sm = re.match(r"^(gate|test)\s*:\s*(.+)$", cleaned, re.I)
+        if not sm:
+            log(f"Ignoring unstructured Authorized Gate/Test Changes line (fail-closed): {cleaned[:80]!r}")
             continue
-        return True
+        kind = sm.group(1).lower()
+        target = sm.group(2).strip().strip("`").strip()
+        # Strip inline explanatory comment after whitespace/parens if present
+        target = re.split(r"\s+[#(]", target, maxsplit=1)[0].strip().strip("`")
+        if target.startswith("./"):
+            target = target[2:]
+        target = target.lstrip("/")
+        if not target or target in ("*", "**", "**/*"):
+            log(f"Rejecting overly broad wildcard authorization pattern '{target}' (use --allow-gate-edits / --allow-test-edits explicitly).")
+            continue
+        if kind == "gate":
+            gate_pats.append(target)
+        else:
+            test_pats.append(target)
+    return list(dict.fromkeys(gate_pats)), list(dict.fromkeys(test_pats))
+
+
+def path_matches_any_pattern(path: str, patterns: list[str]) -> bool:
+    norm_path = path.lstrip("/")
+    if norm_path.startswith("./"):
+        norm_path = norm_path[2:]
+    for pat in patterns:
+        if norm_path == pat or fnmatch.fnmatchcase(norm_path, pat):
+            return True
     return False
 
 
@@ -1097,11 +1320,8 @@ def is_ready_for_frontier(issue: dict[str, Any]) -> tuple[bool, str]:
     for blocked_lbl in ("spec", "dispatch:failed", "dispatch:publish-incomplete", "needs-human", "wontfix"):
         if blocked_lbl in label_names:
             return False, f"label={blocked_lbl}"
-    desc = issue.get("description") or ""
-    has_ready_label = "agent-ready" in label_names
-    has_brief_section = bool(re.search(r"^##\s+(Testing Seam &\s*)?Acceptance Criteria\b", desc, re.M | re.I))
-    if not (has_ready_label or has_brief_section):
-        return False, "missing_agent_brief_or_agent_ready_label"
+    if "agent-ready" not in label_names:
+        return False, "missing_agent_ready_label"
     return True, "ready"
 
 
@@ -1111,34 +1331,34 @@ def is_ready_for_frontier(issue: dict[str, Any]) -> tuple[bool, str]:
 
 def get_repo_root(repo_arg: str | None) -> Path:
     start = Path(repo_arg).resolve() if repo_arg else Path.cwd().resolve()
-    res = run_cmd(["git", "rev-parse", "--show-toplevel"], cwd=start, env_role="orchestrator")
+    res = run_cmd(git_cmd("rev-parse", "--show-toplevel"), cwd=start, env_role="orchestrator")
     if res.returncode != 0:
         raise RuntimeError(f"Not inside a git repository: {start}")
     return Path(res.stdout.strip()).resolve()
 
 
 def get_git_common_dir(path: Path) -> Path:
-    res = run_cmd(["git", "rev-parse", "--git-common-dir"], cwd=path, check=True, env_role="orchestrator")
+    res = run_cmd(git_cmd("rev-parse", "--git-common-dir"), cwd=path, check=True, env_role="orchestrator")
     p = Path(res.stdout.strip())
     return p.resolve() if p.is_absolute() else (path / p).resolve()
 
 
 def detect_default_branch(repo_root: Path) -> str:
-    res = run_cmd(["git", "symbolic-ref", "refs/remotes/origin/HEAD"], cwd=repo_root, env_role="orchestrator")
+    res = run_cmd(git_cmd("symbolic-ref", "refs/remotes/origin/HEAD"), cwd=repo_root, env_role="orchestrator")
     if res.returncode == 0:
         ref = res.stdout.strip()
         if ref.startswith("refs/remotes/origin/"):
             return ref.removeprefix("refs/remotes/origin/")
     for cand in ("main", "master"):
-        if run_cmd(["git", "rev-parse", "--verify", f"refs/remotes/origin/{cand}"], cwd=repo_root, env_role="orchestrator").returncode == 0:
+        if run_cmd(git_cmd("rev-parse", "--verify", f"refs/remotes/origin/{cand}"), cwd=repo_root, env_role="orchestrator").returncode == 0:
             return cand
-        if run_cmd(["git", "rev-parse", "--verify", f"refs/heads/{cand}"], cwd=repo_root, env_role="orchestrator").returncode == 0:
+        if run_cmd(git_cmd("rev-parse", "--verify", f"refs/heads/{cand}"), cwd=repo_root, env_role="orchestrator").returncode == 0:
             return cand
     raise RuntimeError(f"Cannot determine default branch (main/master) for {repo_root}")
 
 
 def parse_github_owner_repo(repo_root: Path) -> str | None:
-    res = run_cmd(["git", "remote", "get-url", "origin"], cwd=repo_root, env_role="orchestrator")
+    res = run_cmd(git_cmd("remote", "get-url", "origin"), cwd=repo_root, env_role="orchestrator")
     if res.returncode != 0:
         return None
     url = res.stdout.strip()
@@ -1148,25 +1368,40 @@ def parse_github_owner_repo(repo_root: Path) -> str | None:
 
 def get_remote_branch_sha(repo_root: Path, branch: str) -> str:
     """Return 40-char remote SHA for origin/refs/heads/<branch>, or '' if branch does not exist remotely."""
-    if run_cmd(["git", "remote", "get-url", "origin"], cwd=repo_root, env_role="orchestrator").returncode != 0:
+    if run_cmd(git_cmd("remote", "get-url", "origin"), cwd=repo_root, env_role="orchestrator").returncode != 0:
         return ""
-    res = run_cmd(["git", "ls-remote", "origin", f"refs/heads/{branch}"], cwd=repo_root, env_role="orchestrator")
+    res = run_cmd(git_cmd("ls-remote", "origin", f"refs/heads/{branch}"), cwd=repo_root, env_role="orchestrator")
     if res.returncode != 0:
         raise RuntimeError(f"git ls-remote origin {branch} failed: {redact_secrets(res.stderr)}")
     line = res.stdout.strip().splitlines()
     return line[0].split()[0] if line else ""
 
 
+def get_remote_refs_snapshot(repo_root: Path) -> dict[str, str]:
+    """Return full ref -> SHA map for origin (catches unauthorized pushes to ANY branch, not just feat/<id>)."""
+    if run_cmd(git_cmd("remote", "get-url", "origin"), cwd=repo_root, env_role="orchestrator").returncode != 0:
+        return {}
+    res = run_cmd(git_cmd("ls-remote", "--heads", "origin"), cwd=repo_root, env_role="orchestrator", cap_output=False)
+    if res.returncode != 0:
+        raise RuntimeError(f"git ls-remote --heads origin failed: {redact_secrets(res.stderr)}")
+    refs: dict[str, str] = {}
+    for line in res.stdout.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2:
+            refs[parts[1].strip()] = parts[0].strip()
+    return refs
+
+
 def check_dirty_docs_in_main_repo(repo_root: Path, base_branch: str) -> list[str]:
-    """Flag ONLY uncommitted local doc changes or locally unpushed commits (never behind-origin merges!)."""
+    """Flag ONLY uncommitted local doc changes or locally unpushed commits (includes monorepo **/GLOSSARY.md)."""
     issues: list[str] = []
-    doc_paths = ["GLOSSARY.md", "GLOSSARY-MAP.md", "CODING_STANDARDS.md", "docs/adr"]
-    st = run_cmd(["git", "status", "--porcelain", "--", *doc_paths], cwd=repo_root, env_role="orchestrator").stdout.strip()
+    doc_paths = ["GLOSSARY.md", ":(glob)**/GLOSSARY.md", "GLOSSARY-MAP.md", "CODING_STANDARDS.md", "docs/adr"]
+    st = run_cmd(git_cmd("status", "--porcelain", "--", *doc_paths), cwd=repo_root, env_role="orchestrator").stdout.strip()
     if st:
         issues.append(f"Uncommitted domain/standard docs in main repo:\n{st}")
-    if run_cmd(["git", "rev-parse", "--verify", f"refs/remotes/origin/{base_branch}"], cwd=repo_root, env_role="orchestrator").returncode == 0:
+    if run_cmd(git_cmd("rev-parse", "--verify", f"refs/remotes/origin/{base_branch}"), cwd=repo_root, env_role="orchestrator").returncode == 0:
         unpushed = run_cmd(
-            ["git", "log", "--oneline", f"origin/{base_branch}..HEAD", "--", *doc_paths],
+            git_cmd("log", "--oneline", f"origin/{base_branch}..HEAD", "--", *doc_paths),
             cwd=repo_root,
             env_role="orchestrator",
         ).stdout.strip()
@@ -1178,7 +1413,7 @@ def check_dirty_docs_in_main_repo(repo_root: Path, base_branch: str) -> list[str
 
 
 def ensure_dispatch_excluded(worktree: Path) -> None:
-    res = run_cmd(["git", "rev-parse", "--git-path", "info/exclude"], cwd=worktree, env_role="orchestrator")
+    res = run_cmd(git_cmd("rev-parse", "--git-path", "info/exclude"), cwd=worktree, env_role="orchestrator")
     if res.returncode != 0:
         return
     exclude_path = Path(res.stdout.strip())
@@ -1193,31 +1428,51 @@ def ensure_dispatch_excluded(worktree: Path) -> None:
             fh.write(".dispatch/\n")
 
 
+def write_worktree_owner(worktree: Path, identifier: str, issue_uuid: str, repo_identity: str, branch: str) -> None:
+    """Persist worktree lock-owner metadata inside repo lock so cleanup can NEVER race before first checkpoint."""
+    owner_path = worktree / ".dispatch" / "owner.json"
+    atomic_write_text(
+        owner_path,
+        json.dumps(
+            {
+                "issue": identifier,
+                "issue_uuid": issue_uuid,
+                "repo_identity": repo_identity,
+                "branch": branch,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+    )
+
+
 def prepare_worktree(
     repo_root: Path,
     identifier: str,
     base_branch: str,
     *,
     fresh: bool = False,
+    issue_uuid: str = "",
 ) -> tuple[Path, str, str]:
-    """Create or safely reuse an isolated worktree under repo flock. Returns (wt_dir, branch, base_sha)."""
+    """Create or safely reuse an isolated worktree under repo flock; writes owner.json before releasing repo lock."""
     rkey = repo_cache_key(repo_root)
+    repo_id = canonical_repo_identity(repo_root)
     branch = f"feat/{identifier.lower()}"
     wt_dir = _cache_root() / "worktrees" / rkey / identifier.upper()
     wt_dir.parent.mkdir(parents=True, exist_ok=True)
     repo_common = get_git_common_dir(repo_root)
 
     with file_lock(_cache_root() / "locks" / f"repo-{rkey}.lock", blocking=True):
-        run_cmd(["git", "worktree", "prune"], cwd=repo_root, env_role="orchestrator")
+        run_cmd(git_cmd("worktree", "prune"), cwd=repo_root, env_role="orchestrator")
 
-        has_origin = run_cmd(["git", "remote", "get-url", "origin"], cwd=repo_root, env_role="orchestrator").returncode == 0
+        has_origin = run_cmd(git_cmd("remote", "get-url", "origin"), cwd=repo_root, env_role="orchestrator").returncode == 0
         if has_origin:
-            run_cmd(["git", "fetch", "origin", base_branch], cwd=repo_root, check=True, env_role="orchestrator")
+            run_cmd(git_cmd("fetch", "origin", base_branch), cwd=repo_root, check=True, env_role="orchestrator")
             base_ref = f"origin/{base_branch}"
         else:
             base_ref = base_branch
 
-        base_sha = run_cmd(["git", "rev-parse", base_ref], cwd=repo_root, check=True, env_role="orchestrator").stdout.strip()
+        base_sha = run_cmd(git_cmd("rev-parse", base_ref), cwd=repo_root, check=True, env_role="orchestrator").stdout.strip()
 
         if wt_dir.exists():
             if not (wt_dir / ".git").exists():
@@ -1225,35 +1480,41 @@ def prepare_worktree(
             wt_common = get_git_common_dir(wt_dir)
             if wt_common != repo_common:
                 raise RuntimeError(f"Worktree ownership mismatch at {wt_dir}: belongs to {wt_common}, not {repo_common}")
-            cur_br = run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=wt_dir, check=True, env_role="orchestrator").stdout.strip()
+            cur_br = run_cmd(git_cmd("rev-parse", "--abbrev-ref", "HEAD"), cwd=wt_dir, check=True, env_role="orchestrator").stdout.strip()
             if cur_br != branch:
                 raise RuntimeError(f"Worktree {wt_dir} is on branch '{cur_br}', expected '{branch}'")
             if fresh:
-                run_cmd(["git", "worktree", "remove", "--force", str(wt_dir)], cwd=repo_root, check=True, env_role="orchestrator")
-                run_cmd(["git", "branch", "-D", branch], cwd=repo_root, env_role="orchestrator")
+                run_cmd(git_cmd("worktree", "remove", "--force", str(wt_dir)), cwd=repo_root, check=True, env_role="orchestrator")
+                run_cmd(git_cmd("branch", "-D", branch), cwd=repo_root, env_role="orchestrator")
             else:
-                dirty = run_cmd(["git", "status", "--porcelain"], cwd=wt_dir, env_role="orchestrator").stdout.strip()
+                dirty = run_cmd(git_cmd("status", "--porcelain"), cwd=wt_dir, env_role="orchestrator").stdout.strip()
                 if dirty:
                     raise RuntimeError(
                         f"Existing worktree {wt_dir} has uncommitted changes; pass --fresh to recreate cleanly:\n{dirty}"
                     )
                 ensure_dispatch_excluded(wt_dir)
-                mb = run_cmd(["git", "merge-base", base_sha, "HEAD"], cwd=wt_dir, check=True, env_role="orchestrator").stdout.strip()
+                if issue_uuid:
+                    write_worktree_owner(wt_dir, identifier, issue_uuid, repo_id, branch)
+                mb = run_cmd(git_cmd("merge-base", base_sha, "HEAD"), cwd=wt_dir, check=True, env_role="orchestrator").stdout.strip()
                 return wt_dir, branch, mb
 
-        branch_exists = run_cmd(["git", "rev-parse", "--verify", f"refs/heads/{branch}"], cwd=repo_root, env_role="orchestrator").returncode == 0
+        branch_exists = run_cmd(git_cmd("rev-parse", "--verify", f"refs/heads/{branch}"), cwd=repo_root, env_role="orchestrator").returncode == 0
         if branch_exists and fresh:
-            run_cmd(["git", "branch", "-D", branch], cwd=repo_root, check=True, env_role="orchestrator")
+            run_cmd(git_cmd("branch", "-D", branch), cwd=repo_root, check=True, env_role="orchestrator")
             branch_exists = False
 
         if branch_exists:
-            run_cmd(["git", "worktree", "add", str(wt_dir), branch], cwd=repo_root, check=True, env_role="orchestrator")
-            mb = run_cmd(["git", "merge-base", base_sha, "HEAD"], cwd=wt_dir, check=True, env_role="orchestrator").stdout.strip()
+            run_cmd(git_cmd("worktree", "add", str(wt_dir), branch), cwd=repo_root, check=True, env_role="orchestrator")
+            mb = run_cmd(git_cmd("merge-base", base_sha, "HEAD"), cwd=wt_dir, check=True, env_role="orchestrator").stdout.strip()
             ensure_dispatch_excluded(wt_dir)
+            if issue_uuid:
+                write_worktree_owner(wt_dir, identifier, issue_uuid, repo_id, branch)
             return wt_dir, branch, mb
 
-        run_cmd(["git", "worktree", "add", "-b", branch, str(wt_dir), base_sha], cwd=repo_root, check=True, env_role="orchestrator")
+        run_cmd(git_cmd("worktree", "add", "-b", branch, str(wt_dir), base_sha), cwd=repo_root, check=True, env_role="orchestrator")
         ensure_dispatch_excluded(wt_dir)
+        if issue_uuid:
+            write_worktree_owner(wt_dir, identifier, issue_uuid, repo_id, branch)
         return wt_dir, branch, base_sha
 
 
@@ -1262,9 +1523,9 @@ def check_remote_fast_forward_ready(worktree: Path, branch: str) -> None:
     remote_sha = get_remote_branch_sha(worktree, branch)
     if not remote_sha:
         return
-    run_cmd(["git", "fetch", "origin", f"refs/heads/{branch}"], cwd=worktree, env_role="orchestrator")
-    local_head = run_cmd(["git", "rev-parse", "HEAD"], cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
-    anc = run_cmd(["git", "merge-base", "--is-ancestor", remote_sha, local_head], cwd=worktree, env_role="orchestrator")
+    run_cmd(git_cmd("fetch", "origin", f"refs/heads/{branch}"), cwd=worktree, env_role="orchestrator")
+    local_head = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
+    anc = run_cmd(git_cmd("merge-base", "--is-ancestor", remote_sha, local_head), cwd=worktree, env_role="orchestrator")
     if anc.returncode != 0:
         raise RuntimeError(
             f"Remote branch origin/{branch} ({remote_sha[:8]}) has diverged from local HEAD ({local_head[:8]}). "
@@ -1320,11 +1581,12 @@ def is_active_adr(text: str) -> bool:
 
 
 def snapshot_baseline_standards(worktree: Path, base_sha: str, dest_dir: Path) -> tuple[list[str], dict[str, str]]:
-    """Snapshot baseline standards from immutable base_sha; returns (file_list, {rel_path: content})."""
+    """Snapshot baseline standards from immutable base_sha using NUL-delimited ls-tree; returns (file_list, {rel_path: sha256})."""
     dest_dir.mkdir(parents=True, exist_ok=True)
-    listed = run_cmd(
-        ["git", "ls-tree", "-r", "--name-only", base_sha], cwd=worktree, check=True, env_role="orchestrator", cap_output=False
-    ).stdout.splitlines()
+    raw_listed = run_cmd(
+        git_cmd("ls-tree", "-r", "-z", "--name-only", base_sha), cwd=worktree, check=True, env_role="orchestrator", cap_output=False
+    ).stdout
+    listed = [p for p in raw_listed.split("\x00") if p]
     candidates: list[str] = []
     for path in listed:
         if path in ("CODING_STANDARDS.md", "CONTRIBUTING.md", "GLOSSARY.md", "GLOSSARY-MAP.md", "AGENTS.md"):
@@ -1335,9 +1597,9 @@ def snapshot_baseline_standards(worktree: Path, base_sha: str, dest_dir: Path) -
             candidates.append(path)
 
     active_files: list[str] = []
-    contents: dict[str, str] = {}
+    hashes: dict[str, str] = {}
     for rel in sorted(candidates):
-        show = run_cmd(["git", "show", f"{base_sha}:{rel}"], cwd=worktree, env_role="orchestrator", cap_output=False)
+        show = run_cmd(git_cmd("show", f"{base_sha}:{rel}"), cwd=worktree, env_role="orchestrator", cap_output=False)
         if show.returncode != 0:
             continue
         content = show.stdout
@@ -1347,13 +1609,13 @@ def snapshot_baseline_standards(worktree: Path, base_sha: str, dest_dir: Path) -
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(content, encoding="utf-8")
         active_files.append(rel)
-        contents[rel] = content
-    return active_files, contents
+        hashes[rel] = sha256_file(out)
+    return active_files, hashes
 
 
-def restore_if_tampered(path: Path, expected_content: str, label: str) -> None:
-    """Detect and fail if a child process tampered with an orchestrator-owned artifact."""
-    if not path.is_file() or path.read_text(encoding="utf-8") != expected_content:
+def assert_sha256_intact(path: Path, expected_sha256: str, label: str) -> None:
+    """Detect and fail if a child process tampered with an orchestrator-owned artifact (SHA-256 verified)."""
+    if not path.is_file() or sha256_file(path) != expected_sha256:
         raise RuntimeError(f"Orchestrator integrity violation: child process modified immutable artifact '{label}' ({path})")
 
 
@@ -1439,19 +1701,43 @@ def detect_verify_command(worktree: Path, explicit_cmd: str | None) -> str | Non
         cmds: list[str] = []
         if shutil.which("ruff"):
             cmds.append("ruff check .")
+        has_test_runner = False
         if (worktree / ".venv" / "bin" / "pytest").is_file():
             cmds.append(".venv/bin/pytest")
+            has_test_runner = True
         elif (worktree / "uv.lock").is_file() and shutil.which("uv"):
             cmds.append("uv run pytest")
+            has_test_runner = True
         elif shutil.which("pytest"):
             cmds.append("pytest")
-        if cmds:
+            has_test_runner = True
+        elif (worktree / "tests").is_dir() and any((worktree / "tests").glob("test_*.py")):
+            cmds.append("python3 -m unittest discover -s tests")
+            has_test_runner = True
+        # Never treat linter-only ruff as sufficient verification when a test suite directory exists!
+        if cmds and (has_test_runner or not (worktree / "tests").is_dir()):
             return " && ".join(cmds)
 
     if (worktree / "go.mod").is_file():
         return "go vet ./... && go test ./..."
 
+    if (worktree / "tests").is_dir() and any((worktree / "tests").glob("test_*.py")):
+        return "python3 -m unittest discover -s tests"
+
     return None
+
+
+def _clean_benign_tool_caches(worktree: Path) -> None:
+    """Prune Python/tool caches without traversing .git/.venv/node_modules."""
+    skip_dirs = {".git", ".venv", "venv", "node_modules"}
+    targets = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+    for root, dirs, _ in os.walk(worktree):
+        for d in list(dirs):
+            if d in skip_dirs:
+                dirs.remove(d)
+            elif d in targets:
+                shutil.rmtree(Path(root) / d, ignore_errors=True)
+                dirs.remove(d)
 
 
 def run_verify_gate(
@@ -1474,7 +1760,6 @@ def run_verify_gate(
             "output": "No verification command detected. Pass --verify-cmd or configure a repo check script (or --allow-no-verify).",
         }
     log(f"Running verification gate: {verify_cmd}")
-    # Serialize verify per repo to prevent parallel port/DB collisions
     with file_lock(_cache_root() / "locks" / f"verify-{repo_key}.lock", blocking=True):
         try:
             res = run_cmd(
@@ -1495,12 +1780,10 @@ def run_verify_gate(
                 "output": f"Verification timed out after {timeout}s (see {log_file}).",
             }
     combined = (res.stdout + "\n" + res.stderr).strip()
-    # Ignore benign Python/tool cache dirs if repo forgot them in .gitignore, but fail on ANY tracked file mutation
-    for cache_dir in ("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"):
-        for hit in worktree.rglob(cache_dir):
-            if hit.is_dir() and ".git" not in hit.parts:
-                shutil.rmtree(hit, ignore_errors=True)
-    tracked_dirty = run_cmd(["git", "status", "--porcelain", "--untracked-files=no"], cwd=worktree, env_role="orchestrator").stdout.strip()
+    _clean_benign_tool_caches(worktree)
+    tracked_dirty = run_cmd(
+        git_cmd("status", "--porcelain", "--untracked-files=no"), cwd=worktree, env_role="orchestrator"
+    ).stdout.strip()
     if res.returncode == 0 and tracked_dirty:
         return {
             "ran": True,
@@ -1509,6 +1792,11 @@ def run_verify_gate(
             "returncode": 0,
             "output": f"Verification mutated tracked files (uncommitted changes left behind):\n{tracked_dirty}",
         }
+    # Clean untracked verify artifacts (e.g., coverage.xml, junit.xml) so they never pollute next commit or review!
+    untracked_dirty = run_cmd(git_cmd("status", "--porcelain"), cwd=worktree, env_role="orchestrator").stdout.strip()
+    if res.returncode == 0 and untracked_dirty:
+        log(f"Cleaning untracked artifacts generated by verify command: {untracked_dirty.splitlines()[:5]}")
+        run_cmd(git_cmd("clean", "-fd", "-e", ".dispatch"), cwd=worktree, env_role="orchestrator")
     return {
         "ran": True,
         "passed": res.returncode == 0,
@@ -1519,12 +1807,15 @@ def run_verify_gate(
 
 
 def check_base_baseline(
+    repo_root: Path,
     repo_key: str,
     worktree: Path,
     base_sha: str,
     verify_cmd: str | None,
     run_dir: Path,
     *,
+    setup_cmd_override: str | None = None,
+    setup_timeout: int = 600,
     timeout: int = 900,
 ) -> dict[str, Any]:
     if not verify_cmd:
@@ -1543,19 +1834,36 @@ def check_base_baseline(
         if cache.get(cache_key) is True:
             return {"checked": True, "cached": True, "passed": True}
 
-    head = run_cmd(["git", "rev-parse", "HEAD"], cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
-    if head != base_sha:
-        return {"checked": False, "cached": False, "passed": True, "note": "reused_branch_not_at_base"}
+    head = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
+    target_wt = worktree
+    temp_wt: Path | None = None
+    try:
+        if head != base_sha:
+            # Reused feature branch with baseline cache miss: verify base_sha in a temporary detached worktree!
+            temp_wt = _cache_root() / "worktrees" / repo_key / f".baseline-{base_sha[:10]}-{os.getpid()}"
+            with file_lock(_cache_root() / "locks" / f"repo-{repo_key}.lock", blocking=True):
+                if temp_wt.exists():
+                    run_cmd(git_cmd("worktree", "remove", "--force", str(temp_wt)), cwd=repo_root, env_role="orchestrator")
+                run_cmd(git_cmd("worktree", "add", "--detach", str(temp_wt), base_sha), cwd=repo_root, check=True, env_role="orchestrator")
+            bootstrap_worktree(temp_wt, setup_cmd_override, timeout=setup_timeout)
+            target_wt = temp_wt
 
-    log(f"Checking clean base baseline ({base_sha[:8]}): {verify_cmd}")
-    res = run_verify_gate(
-        worktree,
-        verify_cmd,
-        allow_no_verify=False,
-        log_file=run_dir / "baseline-verify.log",
-        repo_key=repo_key,
-        timeout=timeout,
-    )
+        log(f"Checking clean base baseline ({base_sha[:8]}): {verify_cmd}")
+        res = run_verify_gate(
+            target_wt,
+            verify_cmd,
+            allow_no_verify=False,
+            log_file=run_dir / "baseline-verify.log",
+            repo_key=repo_key,
+            timeout=timeout,
+        )
+    finally:
+        if temp_wt is not None:
+            with file_lock(_cache_root() / "locks" / f"repo-{repo_key}.lock", blocking=True):
+                run_cmd(git_cmd("worktree", "remove", "--force", str(temp_wt)), cwd=repo_root, env_role="orchestrator")
+                if temp_wt.exists():
+                    shutil.rmtree(temp_wt, ignore_errors=True)
+
     if res["passed"]:
         with file_lock(baselines_lock, blocking=True):
             cache = {}
@@ -1569,17 +1877,30 @@ def check_base_baseline(
     return {"checked": True, "cached": False, **res}
 
 
-def check_protected_paths(worktree: Path, base_sha: str, candidate_sha: str) -> list[str]:
-    """Use --no-renames so `git mv` cannot bypass protected-file checks; includes nested package.json#scripts."""
-    changed = run_cmd(
-        ["git", "diff", "--no-renames", "--name-only", f"{base_sha}..{candidate_sha}"],
+def check_protected_paths(
+    worktree: Path,
+    base_sha: str,
+    candidate_sha: str,
+    *,
+    allowed_patterns: list[str] | None = None,
+    allow_all: bool = False,
+) -> list[str]:
+    """Use --no-renames -z (NUL-safe for non-ASCII/special paths); supports granular allowlist patterns."""
+    if allow_all:
+        return []
+    pats = allowed_patterns or []
+    raw = run_cmd(
+        git_cmd("diff", "--no-renames", "--no-ext-diff", "--no-textconv", "-z", "--name-only", f"{base_sha}..{candidate_sha}"),
         cwd=worktree,
         check=True,
         env_role="orchestrator",
         cap_output=False,
-    ).stdout.splitlines()
+    ).stdout
+    changed = [f for f in raw.split("\x00") if f]
     violations: list[str] = []
     for f in changed:
+        if pats and path_matches_any_pattern(f, pats):
+            continue
         base_name = Path(f).name
         if (
             f in PROTECTED_EXACT_FILES
@@ -1589,53 +1910,86 @@ def check_protected_paths(worktree: Path, base_sha: str, candidate_sha: str) -> 
         ):
             violations.append(f"Protected gate/policy file modified: {f}")
         elif base_name == "package.json":
-            old_raw = run_cmd(["git", "show", f"{base_sha}:{f}"], cwd=worktree, env_role="orchestrator", cap_output=False)
-            new_raw = run_cmd(["git", "show", f"{candidate_sha}:{f}"], cwd=worktree, env_role="orchestrator", cap_output=False)
-            old_scripts = json.loads(old_raw.stdout).get("scripts") if old_raw.returncode == 0 else None
-            new_scripts = json.loads(new_raw.stdout).get("scripts") if new_raw.returncode == 0 else None
-            if old_scripts != new_scripts:
-                violations.append(f"Protected `{f}` `scripts` section modified")
+            old_raw = run_cmd(git_cmd("show", f"{base_sha}:{f}"), cwd=worktree, env_role="orchestrator", cap_output=False)
+            new_raw = run_cmd(git_cmd("show", f"{candidate_sha}:{f}"), cwd=worktree, env_role="orchestrator", cap_output=False)
+            if new_raw.returncode == 0:
+                try:
+                    new_pkg = json.loads(new_raw.stdout)
+                except json.JSONDecodeError as exc:
+                    violations.append(f"Invalid JSON in `{f}`: {exc}")
+                    continue
+            else:
+                new_pkg = {}
+            if old_raw.returncode == 0:
+                try:
+                    old_pkg = json.loads(old_raw.stdout)
+                except json.JSONDecodeError:
+                    old_pkg = {}
+                for section in ("scripts", "jest", "vitest", "eslintConfig"):
+                    if old_pkg.get(section) != new_pkg.get(section):
+                        violations.append(f"Protected `{f}` `{section}` section modified")
+            elif f == "package.json":
+                # Brand new root package.json introducing gate scripts still requires explicit authorization
+                if any(new_pkg.get(s) is not None for s in ("scripts", "jest", "vitest", "eslintConfig")):
+                    violations.append(f"Protected root `{f}` gate/script config added")
     return violations
 
 
-def check_test_integrity_diff(worktree: Path, base_sha: str, candidate_sha: str) -> list[str]:
-    """Deterministically detect deleted/renamed-away test files or added skip/only/ignore markers (untruncated)."""
+def _parse_nul_name_status(raw: str) -> list[tuple[str, str]]:
+    tokens = [t for t in raw.split("\x00") if t]
+    pairs: list[tuple[str, str]] = []
+    i = 0
+    while i + 1 < len(tokens):
+        pairs.append((tokens[i], tokens[i + 1]))
+        i += 2
+    return pairs
+
+
+def check_test_integrity_diff(
+    worktree: Path,
+    base_sha: str,
+    candidate_sha: str,
+    *,
+    allowed_patterns: list[str] | None = None,
+    allow_all: bool = False,
+) -> list[str]:
+    """Deterministically detect deleted test files or added skip/only/ignore markers (NUL-safe, granular allowlist)."""
+    if allow_all:
+        return []
+    pats = allowed_patterns or []
     findings: list[str] = []
-    status_lines = run_cmd(
-        ["git", "diff", "--no-renames", "--name-status", f"{base_sha}..{candidate_sha}"],
+    raw_status = run_cmd(
+        git_cmd("diff", "--no-renames", "--no-ext-diff", "--no-textconv", "-z", "--name-status", f"{base_sha}..{candidate_sha}"),
         cwd=worktree,
         check=True,
         env_role="orchestrator",
         cap_output=False,
-    ).stdout.splitlines()
+    ).stdout
     test_files: list[str] = []
-    for line in status_lines:
-        parts = line.split("\t")
-        if len(parts) >= 2:
-            st, path = parts[0], parts[-1]
-            if st.startswith("D") and TEST_FILE_RE.search(path):
-                findings.append(f"Deleted test file: {path}")
-            elif TEST_FILE_RE.search(path):
-                test_files.append(path)
+    for st, path in _parse_nul_name_status(raw_status):
+        if pats and path_matches_any_pattern(path, pats):
+            continue
+        if st.startswith("D") and TEST_FILE_RE.search(path):
+            findings.append(f"Deleted test file: {path}")
+        elif TEST_FILE_RE.search(path):
+            test_files.append(path)
 
     if test_files:
-        diff_txt = run_cmd(
-            ["git", "diff", "--no-renames", "-U0", f"{base_sha}..{candidate_sha}", "--", *test_files],
-            cwd=worktree,
-            check=True,
-            env_role="orchestrator",
-            cap_output=False,
-        ).stdout
-        cur_file = ""
-        for line in diff_txt.splitlines():
-            if line.startswith("+++ b/"):
-                cur_file = line[6:]
-            elif line.startswith("+") and not line.startswith("+++"):
-                added = line[1:]
-                for pat in TEST_SKIP_PATTERNS:
-                    if pat.search(added):
-                        findings.append(f"Added test skip/only/ignore marker in {cur_file}: {added.strip()[:120]}")
-                        break
+        for tf in test_files:
+            diff_txt = run_cmd(
+                git_cmd("diff", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color", "-U0", f"{base_sha}..{candidate_sha}", "--", tf),
+                cwd=worktree,
+                check=True,
+                env_role="orchestrator",
+                cap_output=False,
+            ).stdout
+            for line in diff_txt.splitlines():
+                if line.startswith("+") and not line.startswith("+++"):
+                    added = line[1:]
+                    for pat in TEST_SKIP_PATTERNS:
+                        if pat.search(added):
+                            findings.append(f"Added test skip/only/ignore marker in {tf}: {added.strip()[:120]}")
+                            break
     return findings
 
 
@@ -1646,22 +2000,32 @@ def _is_secret_filename(path: str) -> bool:
 
 
 def scan_range_for_secrets(worktree: Path, base_sha: str, candidate_sha: str) -> list[str]:
-    """Scan FULL untruncated diff and commit history in base_sha..candidate_sha for secret files or tokens."""
+    """Scan FULL untruncated commit range (NUL-safe file names, commit messages, and merge+regular patches)."""
     findings: list[str] = []
-    changed_files = run_cmd(
-        ["git", "log", "--name-only", "--pretty=format:", f"{base_sha}..{candidate_sha}"],
+    raw_files = run_cmd(
+        git_cmd("log", "-z", "-m", "--name-only", "--pretty=format:", f"{base_sha}..{candidate_sha}"),
         cwd=worktree,
         check=True,
         env_role="orchestrator",
         cap_output=False,
-    ).stdout.splitlines()
-    for f in sorted(set(x.strip() for x in changed_files if x.strip())):
+    ).stdout
+    for f in sorted(set(x for x in raw_files.split("\x00") if x)):
         if _is_secret_filename(f):
             findings.append(f"Potential secret file in commit range: {f}")
 
-    # Inspect every commit patch in base_sha..candidate_sha (catches secrets added then deleted in history!)
+    # Inspect all commit messages in range
+    commit_msgs = run_cmd(
+        git_cmd("log", "--pretty=format:%B%n", f"{base_sha}..{candidate_sha}"),
+        cwd=worktree,
+        check=True,
+        env_role="orchestrator",
+        cap_output=False,
+    ).stdout
+    findings.extend(scan_text_for_secrets(commit_msgs, "commit message"))
+
+    # Inspect every commit patch (including merge commits via -m) in base_sha..candidate_sha
     full_patch = run_cmd(
-        ["git", "log", "-p", "-U0", f"{base_sha}..{candidate_sha}"],
+        git_cmd("log", "-m", "-p", "--no-ext-diff", "--no-textconv", "--no-color", "-U0", f"{base_sha}..{candidate_sha}"),
         cwd=worktree,
         check=True,
         env_role="orchestrator",
@@ -1682,18 +2046,18 @@ def scan_range_for_secrets(worktree: Path, base_sha: str, candidate_sha: str) ->
 
 def scan_staged_for_secrets(worktree: Path) -> list[str]:
     findings: list[str] = []
-    staged_files = run_cmd(
-        ["git", "diff", "--cached", "--name-only"],
+    raw_staged = run_cmd(
+        git_cmd("diff", "--cached", "-z", "--name-only"),
         cwd=worktree,
         check=True,
         env_role="orchestrator",
         cap_output=False,
-    ).stdout.splitlines()
-    for f in staged_files:
+    ).stdout
+    for f in (x for x in raw_staged.split("\x00") if x):
         if _is_secret_filename(f):
             findings.append(f"Refusing to commit potential secret file: {f}")
     staged_diff = run_cmd(
-        ["git", "diff", "--cached", "-U0"],
+        git_cmd("diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color", "-U0"),
         cwd=worktree,
         check=True,
         env_role="orchestrator",
@@ -1711,27 +2075,45 @@ def scan_staged_for_secrets(worktree: Path) -> list[str]:
     return sorted(set(findings))
 
 
+def verify_worktree_branch_integrity(worktree: Path, expected_common_dir: Path, expected_branch: str, base_sha: str) -> None:
+    """Guard against worker switching branches or rewriting history away from base_sha before orchestrator commit."""
+    actual_common = get_git_common_dir(worktree)
+    if actual_common != expected_common_dir:
+        raise RuntimeError(f"Worktree common-dir mismatch after worker: {actual_common} != {expected_common_dir}")
+    actual_branch = run_cmd(git_cmd("rev-parse", "--abbrev-ref", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
+    if actual_branch != expected_branch:
+        raise RuntimeError(f"Worker switched branch from '{expected_branch}' to '{actual_branch}'; refusing to commit.")
+    anc = run_cmd(git_cmd("merge-base", "--is-ancestor", base_sha, "HEAD"), cwd=worktree, env_role="orchestrator")
+    if anc.returncode != 0:
+        raise RuntimeError(f"Worker rewrote git history so base_sha {base_sha[:8]} is no longer an ancestor of HEAD.")
+
+
 def orchestrator_commit(worktree: Path, identifier: str, title: str, attempt: int) -> tuple[str, list[str]]:
-    """Stage & commit changes safely. Returns (head_sha, secret_violations_if_blocked)."""
+    """Stage & commit changes safely (hooks/fsmonitor disabled; scans commit msg + staged diff). Returns (head_sha, violations)."""
     ensure_dispatch_excluded(worktree)
-    status = run_cmd(["git", "status", "--porcelain"], cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
+    commit_msg = f"{identifier}: {title} (attempt {attempt})"
+    msg_secret_hits = scan_text_for_secrets(commit_msg, "ticket title / commit message")
+    if msg_secret_hits:
+        head = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
+        return head, msg_secret_hits
+    status = run_cmd(git_cmd("status", "--porcelain"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
     if status:
-        run_cmd(["git", "add", "-A"], cwd=worktree, check=True, env_role="orchestrator")
-        run_cmd(["git", "reset", "-q", "--", ".dispatch"], cwd=worktree, env_role="orchestrator")
-        staged = run_cmd(["git", "diff", "--cached", "--name-only"], cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
-        if staged:
+        run_cmd(git_cmd("add", "-A"), cwd=worktree, check=True, env_role="orchestrator")
+        run_cmd(git_cmd("reset", "-q", "--", ".dispatch"), cwd=worktree, env_role="orchestrator")
+        staged = run_cmd(git_cmd("diff", "--cached", "-z", "--name-only"), cwd=worktree, check=True, env_role="orchestrator").stdout
+        if staged.strip("\x00"):
             secret_hits = scan_staged_for_secrets(worktree)
             if secret_hits:
-                run_cmd(["git", "reset", "-q"], cwd=worktree, env_role="orchestrator")
-                head = run_cmd(["git", "rev-parse", "HEAD"], cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
+                run_cmd(git_cmd("reset", "-q"), cwd=worktree, env_role="orchestrator")
+                head = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
                 return head, secret_hits
             run_cmd(
-                ["git", "commit", "-m", f"{identifier}: {title} (attempt {attempt})"],
+                git_cmd("commit", "--no-verify", "-m", commit_msg),
                 cwd=worktree,
                 check=True,
                 env_role="orchestrator",
             )
-    head = run_cmd(["git", "rev-parse", "HEAD"], cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
+    head = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
     return head, []
 
 
@@ -1932,6 +2314,7 @@ def invoke_harness(
             "harness": spec.harness,
             "model": spec.label,
             "read_only": read_only,
+            **({"session_id": pi_session_id} if pi_session_id else {}),
             "stdout_log": str(stdout_log),
             "stderr_log": str(stderr_log),
         },
@@ -1945,6 +2328,7 @@ def invoke_harness(
         "model": spec.label,
         "read_only": read_only,
         "status": "error",
+        **({"session_id": pi_session_id, "resume_cmd": f"pi --session {pi_session_dir}"} if pi_session_id else {}),
         "stdout_log": str(stdout_log),
         "stderr_log": str(stderr_log),
         "output_file": str(out_file),
@@ -2033,6 +2417,7 @@ def invoke_harness(
                 cwd=worktree,
                 timeout=timeout,
                 env_role="child",
+                cap_output=False,
                 stdout_path=stdout_log,
                 stderr_path=stderr_log,
             )
@@ -2110,6 +2495,7 @@ def invoke_harness(
                 cwd=worktree,
                 timeout=timeout,
                 env_role="child",
+                cap_output=False,
                 stdout_path=stdout_log,
                 stderr_path=stderr_log,
             )
@@ -2160,6 +2546,7 @@ def invoke_harness(
                 cwd=worktree,
                 timeout=timeout,
                 env_role="child",
+                cap_output=False,
                 stdout_path=stdout_log,
                 stderr_path=stderr_log,
             )
@@ -2220,16 +2607,22 @@ def build_worker_prompt(
     verify_cmd: str | None,
     *,
     allow_gate_edits: bool,
+    authorized_gate_patterns: list[str] | None = None,
     feedback: str | None = None,
 ) -> str:
     tdd_rules = PRELOADED_REFS["tdd"]
     verify_line = f"Run `{verify_cmd}` before finishing." if verify_cmd else "Run the repository tests and typecheck before finishing."
     protected_summary = ", ".join(sorted(PROTECTED_EXACT_FILES | PROTECTED_BASENAMES))
-    gate_line = (
-        "- Gate/policy file edits are explicitly enabled for this ticket; keep changes minimal and justified."
-        if allow_gate_edits
-        else f"- Do NOT modify protected gate/policy files ({protected_summary}, `docs/adr/*`, `.github/workflows/*`, or `package.json#scripts`)."
-    )
+    if allow_gate_edits:
+        gate_line = "- Gate/policy file edits are explicitly enabled via CLI flag for this ticket; keep changes minimal and justified."
+    elif authorized_gate_patterns:
+        pats_str = ", ".join(f"`{p}`" for p in authorized_gate_patterns)
+        gate_line = (
+            f"- ONLY these protected paths are authorized for editing by the ticket brief: {pats_str}. "
+            f"Do NOT modify any other protected gate/policy files ({protected_summary}, `docs/adr/*`, `.github/workflows/*`, `*.mk`, or `package.json` gate sections)."
+        )
+    else:
+        gate_line = f"- Do NOT modify protected gate/policy files ({protected_summary}, `docs/adr/*`, `.github/workflows/*`, `*.mk`, or `package.json` gate sections)."
     lines = [
         f"You are implementing Linear ticket {identifier} inside an isolated git worktree.",
         "",
@@ -2260,37 +2653,42 @@ def run_two_axis_review(
     base_sha: str,
     candidate_sha: str,
     auth_brief_path: Path | None,
-    auth_brief_content: str | None,
+    auth_brief_sha256: str | None,
     baseline_std_dir: Path,
-    baseline_std_contents: dict[str, str],
+    baseline_std_hashes: dict[str, str],
     round_num: int,
     *,
     prior_findings: dict[str, list[str]] | None = None,
     pr_feedback: str | None = None,
     trace_sink: list[dict[str, Any]] | None = None,
+    review_timeout: int = 900,
 ) -> dict[str, Any]:
-    # Verify orchestrator-owned immutable artifacts were not tampered with by worker!
-    if auth_brief_path is not None and auth_brief_content is not None:
-        restore_if_tampered(auth_brief_path, auth_brief_content, "brief.md")
-    for rel, content in baseline_std_contents.items():
-        restore_if_tampered(baseline_std_dir / rel, content, f"baseline-standards/{rel}")
+    # Verify orchestrator-owned immutable artifacts via SHA-256 BEFORE review
+    if auth_brief_path is not None and auth_brief_sha256 is not None:
+        assert_sha256_intact(auth_brief_path, auth_brief_sha256, "brief.md")
+    for rel, digest in baseline_std_hashes.items():
+        assert_sha256_intact(baseline_std_dir / rel, digest, f"baseline-standards/{rel}")
 
-    # Pre-generate immutable diff.patch so even pure read-only reviewers (Pi without bash!) can inspect full diff
+    # Pre-generate immutable diff.patch so even pure read-only reviewers (Pi/OpenCode) can inspect full diff
     diff_patch_path = run_dir / f"diff-r{round_num}.patch"
     diff_text = run_cmd(
-        ["git", "diff", "--no-renames", f"{base_sha}..{candidate_sha}"],
+        git_cmd("diff", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color", f"{base_sha}..{candidate_sha}"),
         cwd=worktree,
         check=True,
         env_role="orchestrator",
         cap_output=False,
     ).stdout
     atomic_write_text(diff_patch_path, diff_text)
+    diff_patch_sha256 = sha256_file(diff_patch_path)
 
     commits = run_cmd(
-        ["git", "log", f"{base_sha}..{candidate_sha}", "--oneline"], cwd=worktree, check=True, env_role="orchestrator"
+        git_cmd("log", f"{base_sha}..{candidate_sha}", "--oneline"), cwd=worktree, check=True, env_role="orchestrator"
     ).stdout.strip()
     diff_stat = run_cmd(
-        ["git", "diff", "--stat", f"{base_sha}..{candidate_sha}"], cwd=worktree, check=True, env_role="orchestrator"
+        git_cmd("diff", "--no-ext-diff", "--no-textconv", "--no-color", "--stat", f"{base_sha}..{candidate_sha}"),
+        cwd=worktree,
+        check=True,
+        env_role="orchestrator",
     ).stdout.strip()
 
     std_rubric = PRELOADED_REFS["standards"]
@@ -2305,7 +2703,7 @@ def run_two_axis_review(
         f"Read the complete pre-generated candidate diff at `{diff_patch_path}` (commit range `{base_sha}..{candidate_sha}`).",
         f"Commits:\n{commits or '(none)'}",
         f"Diff stat:\n{diff_stat or '(empty)'}",
-        f"Immutable baseline standard snapshots live under `{baseline_std_dir}`: {', '.join(sorted(baseline_std_contents)) or '(none)'}",
+        f"Immutable baseline standard snapshots live under `{baseline_std_dir}`: {', '.join(sorted(baseline_std_hashes)) or '(none)'}",
         "",
         std_rubric.strip(),
     ]
@@ -2330,26 +2728,40 @@ def run_two_axis_review(
         spec_lines += ["", "## Prior Round Findings (verify resolution first)", *[f"- {x}" for x in prior_spec]]
     spec_lines += ["", 'Set `axis` to `"spec"`. Return ONLY valid JSON matching the schema.']
 
-    std_attach = [diff_patch_path, *(baseline_std_dir / rel for rel in sorted(baseline_std_contents))]
+    std_attach = [diff_patch_path, *(baseline_std_dir / rel for rel in sorted(baseline_std_hashes))]
     spec_attach = [diff_patch_path, *([auth_brief_path] if auth_brief_path else [])]
 
     def _run_axis(axis: str, prompt_text: str, axis_attach: list[Path]) -> dict[str, Any]:
-        log(f"Running {axis} review via {reviewer.label} (attempt {round_num})...")
-        return invoke_harness(
-            reviewer,
-            prompt_text,
-            worktree=worktree,
-            run_dir=run_dir,
-            schema=REVIEW_SCHEMA,
-            schema_file=run_dir / f"review-{axis}-schema.json",
-            prompt_file=run_dir / f"prompt-{axis}-r{round_num}.md",
-            out_file=run_dir / f"review-{axis}-r{round_num}.json",
-            read_only=True,
-            expected_axis=axis,
-            session_label=f"review-{axis}-r{round_num}",
-            trace_sink=trace_sink,
-            attach_files=axis_attach,
-        )
+        last_parse_err: Exception | None = None
+        for parse_try in (1, 2):
+            _check_shutdown()
+            suffix = "" if parse_try == 1 else f"-retry{parse_try}"
+            log(f"Running {axis} review via {reviewer.label} (attempt {round_num}{suffix})...")
+            try:
+                return invoke_harness(
+                    reviewer,
+                    prompt_text,
+                    worktree=worktree,
+                    run_dir=run_dir,
+                    schema=REVIEW_SCHEMA,
+                    schema_file=run_dir / f"review-{axis}-schema.json",
+                    prompt_file=run_dir / f"prompt-{axis}-r{round_num}{suffix}.md",
+                    out_file=run_dir / f"review-{axis}-r{round_num}{suffix}.json",
+                    read_only=True,
+                    expected_axis=axis,
+                    session_label=f"review-{axis}-r{round_num}{suffix}",
+                    trace_sink=trace_sink,
+                    attach_files=axis_attach,
+                    timeout=review_timeout,
+                )
+            except ValueError as exc:
+                last_parse_err = exc
+                if parse_try == 1:
+                    log(f"{axis} review JSON/schema validation failed ({exc}); retrying once...")
+                    continue
+                raise
+        assert last_parse_err is not None
+        raise last_parse_err
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         f_std = pool.submit(_run_axis, "standards", "\n".join(std_lines) + "\n", std_attach)
@@ -2368,16 +2780,18 @@ def run_two_axis_review(
             }
         )
 
-    # Post-review immutability checks on BOTH worktree AND orchestrator artifacts
-    head_after = run_cmd(["git", "rev-parse", "HEAD"], cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
-    dirty_after = run_cmd(["git", "status", "--porcelain"], cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
+    # Post-review immutability checks on worktree AND ALL orchestrator-owned artifacts (SHA-256 verified!)
+    head_after = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
+    dirty_after = run_cmd(git_cmd("status", "--porcelain"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
     if head_after != candidate_sha or dirty_after:
         raise RuntimeError(
             f"Reviewer mutated worktree! expected HEAD={candidate_sha}, got {head_after}; dirty={dirty_after!r}"
         )
-    if auth_brief_path is not None and auth_brief_content is not None:
-        restore_if_tampered(auth_brief_path, auth_brief_content, "brief.md")
-    restore_if_tampered(diff_patch_path, diff_text, diff_patch_path.name)
+    if auth_brief_path is not None and auth_brief_sha256 is not None:
+        assert_sha256_intact(auth_brief_path, auth_brief_sha256, "brief.md")
+    assert_sha256_intact(diff_patch_path, diff_patch_sha256, diff_patch_path.name)
+    for rel, digest in baseline_std_hashes.items():
+        assert_sha256_intact(baseline_std_dir / rel, digest, f"baseline-standards/{rel}")
 
     spec_ok = (spec_res["verdict"] == "pass") if auth_brief_path else True
     passed = (
@@ -2427,10 +2841,22 @@ def build_pr_body(
     verify_res: dict[str, Any],
     review_res: dict[str, Any],
     discovered_issues: list[str],
+    *,
+    gate_authorizations: dict[str, Any] | None = None,
 ) -> str:
     verify_cmd_safe = redact_secrets(str(verify_res.get("command") or ""))
     verify_line = f"`{verify_cmd_safe}` -> **PASS**" if verify_res.get("ran") else "Bypassed (`--allow-no-verify`)"
     tests_safe = ", ".join(redact_secrets(t) for t in tests_run) or "N/A"
+    auth_lines: list[str] = []
+    if gate_authorizations:
+        if gate_authorizations.get("cli_allow_gate_edits"):
+            auth_lines.append("- CLI override: `--allow-gate-edits` (all protected gate paths)")
+        if gate_authorizations.get("cli_allow_test_edits"):
+            auth_lines.append("- CLI override: `--allow-test-edits` (all test-integrity checks)")
+        if gate_authorizations.get("brief_gate_patterns"):
+            auth_lines.append(f"- Brief-authorized gate paths: {', '.join(f'`{p}`' for p in gate_authorizations['brief_gate_patterns'])}")
+        if gate_authorizations.get("brief_test_patterns"):
+            auth_lines.append(f"- Brief-authorized test paths: {', '.join(f'`{p}`' for p in gate_authorizations['brief_test_patterns'])}")
     lines = [
         "## Linear Issue",
         f"- [{issue['identifier']}: {issue['title']}]({issue.get('url', '')})",
@@ -2444,6 +2870,10 @@ def build_pr_body(
         "## Verification",
         f"- {verify_line}",
         f"- Worker tests run: {tests_safe}",
+    ]
+    if auth_lines:
+        lines += ["", "## Active Gate/Test Authorizations", *auth_lines]
+    lines += [
         "",
         "## Two-Axis Code Review (Unmerged)",
         format_review_markdown(review_res),
@@ -2455,7 +2885,7 @@ def build_pr_body(
 
 
 def fetch_open_pr_for_branch(worktree: Path, gh_repo: str | None, branch: str) -> dict[str, Any] | None:
-    cmd = ["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url,number,isDraft,headRefOid,baseRefName"]
+    cmd = ["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url,number,state,isDraft,headRefOid,baseRefName"]
     if gh_repo:
         cmd += ["--repo", gh_repo]
     res = run_cmd(cmd, cwd=worktree, env_role="orchestrator")
@@ -2465,8 +2895,21 @@ def fetch_open_pr_for_branch(worktree: Path, gh_repo: str | None, branch: str) -
     return prs[0] if prs else None
 
 
+def fetch_pr_by_number(worktree: Path, gh_repo: str | None, pr_number: int) -> dict[str, Any] | None:
+    cmd = ["gh", "pr", "view", str(pr_number), "--json", "url,number,state,isDraft,headRefOid,baseRefName"]
+    if gh_repo:
+        cmd += ["--repo", gh_repo]
+    res = run_cmd(cmd, cwd=worktree, env_role="orchestrator")
+    if res.returncode != 0:
+        return None
+    try:
+        return json.loads(res.stdout or "{}") or None
+    except json.JSONDecodeError:
+        return None
+
+
 def fetch_open_pr_feedback(worktree: Path, gh_repo: str | None, branch: str) -> str | None:
-    """Fetch PR comments, reviews, and inline review threads from trusted authors."""
+    """Fetch PR comments, reviews, and paginated inline review threads ONLY from explicitly trusted authors."""
     pr = fetch_open_pr_for_branch(worktree, gh_repo, branch)
     if not pr:
         return None
@@ -2480,7 +2923,7 @@ def fetch_open_pr_feedback(worktree: Path, gh_repo: str | None, branch: str) -> 
     notes: list[str] = []
     for r in data.get("reviews") or []:
         assoc = (r.get("authorAssociation") or "").upper()
-        if assoc and assoc not in TRUSTED_PR_AUTHOR_ASSOCIATIONS:
+        if assoc not in TRUSTED_PR_AUTHOR_ASSOCIATIONS:
             continue
         body = (r.get("body") or "").strip()
         if body and r.get("state") in ("CHANGES_REQUESTED", "COMMENTED"):
@@ -2488,25 +2931,37 @@ def fetch_open_pr_feedback(worktree: Path, gh_repo: str | None, branch: str) -> 
             notes.append(f"- [PR Review by @{author} ({r.get('state')})]: {redact_secrets(body)}")
     for c in data.get("comments") or []:
         assoc = (c.get("authorAssociation") or "").upper()
-        if assoc and assoc not in TRUSTED_PR_AUTHOR_ASSOCIATIONS:
+        if assoc not in TRUSTED_PR_AUTHOR_ASSOCIATIONS:
             continue
         body = (c.get("body") or "").strip()
         if body and "[agent-dispatch]" not in body:
             author = (c.get("author") or {}).get("login", "user")
             notes.append(f"- [PR Comment by @{author}]: {redact_secrets(body)}")
 
-    # Also fetch inline code review comments via REST API
+    # Paginated inline code review comments via REST API
     if gh_repo:
         inline = run_cmd(
-            ["gh", "api", f"repos/{gh_repo}/pulls/{pr['number']}/comments"],
+            ["gh", "api", "--paginate", "--slurp", f"repos/{gh_repo}/pulls/{pr['number']}/comments"],
             cwd=worktree,
             env_role="orchestrator",
+            cap_output=False,
         )
-        if inline.returncode == 0 and inline.stdout.strip():
+        if inline.returncode != 0:
+            log(f"Warning: failed fetching inline PR comments for #{pr['number']}: {redact_secrets(inline.stderr[:300])}")
+        elif inline.stdout.strip():
             try:
-                for ic in json.loads(inline.stdout):
+                parsed = json.loads(inline.stdout)
+                # --slurp produces list of pages (list[list[dict]]) or list[dict]
+                items: list[dict[str, Any]] = []
+                if isinstance(parsed, list):
+                    for elem in parsed:
+                        if isinstance(elem, list):
+                            items.extend(x for x in elem if isinstance(x, dict))
+                        elif isinstance(elem, dict):
+                            items.append(elem)
+                for ic in items:
                     assoc = (ic.get("author_association") or "").upper()
-                    if assoc and assoc not in TRUSTED_PR_AUTHOR_ASSOCIATIONS:
+                    if assoc not in TRUSTED_PR_AUTHOR_ASSOCIATIONS:
                         continue
                     body = (ic.get("body") or "").strip()
                     if body:
@@ -2514,8 +2969,8 @@ def fetch_open_pr_feedback(worktree: Path, gh_repo: str | None, branch: str) -> 
                         path = ic.get("path", "")
                         line = ic.get("line") or ic.get("original_line") or ""
                         notes.append(f"- [Inline PR Comment by @{author} on `{path}:{line}`]: {redact_secrets(body)}")
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as exc:
+                log(f"Warning: could not parse inline PR comments JSON for #{pr['number']}: {exc}")
     return "\n".join(notes) if notes else None
 
 
@@ -2524,6 +2979,22 @@ def save_checkpoint(run_dir: Path, latest_file: Path, state: dict[str, Any]) -> 
     payload = json.dumps(state, indent=2, ensure_ascii=False)
     atomic_write_text(run_dir / "state.json", payload)
     atomic_write_text(latest_file, json.dumps({"run_dir": str(run_dir), **state}, indent=2, ensure_ascii=False))
+
+
+def _validate_open_draft_pr(pr: dict[str, Any] | None, *, base_branch: str, candidate_sha: str | None = None, context: str = "") -> dict[str, Any]:
+    if not pr:
+        raise RuntimeError(f"Expected open Draft PR ({context}), but GitHub returned no open PR.")
+    if pr.get("isDraft") is not True:
+        raise RuntimeError(f"Open PR #{pr.get('number')} ({context}) is not a Draft PR; refusing to overwrite.")
+    if pr.get("baseRefName") != base_branch:
+        raise RuntimeError(
+            f"Open PR #{pr.get('number')} ({context}) targets '{pr.get('baseRefName')}', expected '{base_branch}'."
+        )
+    if candidate_sha is not None and pr.get("headRefOid") != candidate_sha:
+        raise RuntimeError(
+            f"Open PR #{pr.get('number')} ({context}) headRefOid ({str(pr.get('headRefOid') or 'missing')[:8]}) != reviewed SHA ({candidate_sha[:8]})."
+        )
+    return pr
 
 
 def reconcile_publish(
@@ -2535,32 +3006,59 @@ def reconcile_publish(
     state: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    True remote reconciliation (never trusts stale local booleans):
-      1. Verify or execute fast-forward push of exact candidate_sha -> origin/<branch>.
-      2. Verify or create/update OPEN Draft PR matching base_branch and headRefOid == candidate_sha.
-      3. Re-read live Linear issue -> transition to In Review + remove failure labels.
+    True remote reconciliation (never trusts stale local booleans; protects human states & pre-checks PR before push):
+      0. Re-check live Linear state (refuse if Done/Canceled), scan PR title for secrets, and pre-validate any existing open PR BEFORE pushing.
+      1. Persist push_attempted=True, execute fast-forward push (--no-verify) of exact candidate_sha, verify remote SHA.
+      2. For GitHub remotes: verify/create/update OPEN Draft PR matching exact base_branch and headRefOid == candidate_sha (with backoff poll for GitHub async SHA update).
+         For non-GitHub remotes: mark explicit branch_only delivery (never fabricate a fake Draft PR URL).
+      3. Re-read LIVE Linear issue (refuse if Done/Canceled) -> sync In Review & atomically remove failure labels.
       4. Post idempotent delivery summary comment keyed by run_id + candidate_sha marker.
     """
     branch = state["branch"]
     base_branch = state["base_branch"]
     candidate_sha = state["candidate_sha"]
     gh_repo = parse_github_owner_repo(worktree)
+    is_github = bool(gh_repo or os.environ.get("AGENT_DISPATCH_FORCE_GH") == "1")
 
-    # 1. Verify / perform fast-forward push of EXACT candidate_sha
+    # 0. Pre-push live Linear terminal guard + PR title secret guard + pre-push PR compatibility guard
+    live_pre = client.get_issue(issue["identifier"])
+    pre_st_type = (live_pre.get("state") or {}).get("type", "")
+    if pre_st_type in ("completed", "canceled"):
+        raise RuntimeError(
+            f"Human terminal state conflict before publish: {live_pre['identifier']} is already '{live_pre['state']['name']}'; aborting publish."
+        )
+    pr_title = f"{issue['identifier']}: {issue['title']}"
+    title_secrets = scan_text_for_secrets(pr_title, "PR title")
+    if title_secrets:
+        raise RuntimeError("Refusing to publish PR with secret in title: " + "; ".join(title_secrets))
+
+    pre_existing_pr: dict[str, Any] | None = None
+    if is_github:
+        pre_existing_pr = fetch_open_pr_for_branch(worktree, gh_repo, branch)
+        if pre_existing_pr:
+            # Validate Draft + baseRefName BEFORE pushing so we NEVER mutate a human-readied non-Draft PR!
+            _validate_open_draft_pr(pre_existing_pr, base_branch=base_branch, candidate_sha=None, context="pre-push check")
+
+    # 1. Persist push_attempted BEFORE any remote write, then fast-forward push exact candidate_sha
     remote_sha = get_remote_branch_sha(worktree, branch)
     if remote_sha == candidate_sha:
+        state["push_attempted"] = True
         state["pushed"] = True
     else:
         if remote_sha:
-            run_cmd(["git", "fetch", "origin", f"refs/heads/{branch}"], cwd=worktree, env_role="orchestrator")
-            anc = run_cmd(["git", "merge-base", "--is-ancestor", remote_sha, candidate_sha], cwd=worktree, env_role="orchestrator")
+            run_cmd(git_cmd("fetch", "origin", f"refs/heads/{branch}"), cwd=worktree, check=True, env_role="orchestrator")
+            anc = run_cmd(git_cmd("merge-base", "--is-ancestor", remote_sha, candidate_sha), cwd=worktree, env_role="orchestrator")
             if anc.returncode != 0:
                 raise RuntimeError(
                     f"Remote origin/{branch} ({remote_sha[:8]}) diverged from reviewed SHA ({candidate_sha[:8]}); refusing to overwrite."
                 )
+        state["push_attempted"] = True
+        state["stage"] = "pushing"
+        save_checkpoint(run_dir, latest_file, state)
+
         log(f"Pushing exact reviewed SHA {candidate_sha[:8]} -> origin/{branch} (fast-forward only)...")
         push = run_cmd(
-            ["git", "push", "origin", f"{candidate_sha}:refs/heads/{branch}"],
+            git_cmd("push", "--no-verify", "origin", f"{candidate_sha}:refs/heads/{branch}"),
             cwd=worktree,
             env_role="orchestrator",
         )
@@ -2573,27 +3071,30 @@ def reconcile_publish(
     state["stage"] = "pushed"
     save_checkpoint(run_dir, latest_file, state)
 
-    # 2. Verify / create / update OPEN Draft PR carrying exact candidate_sha (skip if non-GitHub bare remote)
-    if gh_repo or os.environ.get("AGENT_DISPATCH_FORCE_GH") == "1":
-        pr_title = f"{issue['identifier']}: {issue['title']}"
+    # 2. Verify / create / update OPEN Draft PR carrying exact candidate_sha
+    poll_attempts = max(1, int(os.environ.get("AGENT_DISPATCH_PR_POLL_ATTEMPTS", "5")))
+    poll_sleep = float(os.environ.get("AGENT_DISPATCH_PR_POLL_SLEEP", "2.0"))
+
+    if is_github:
         pr_body = state["pr_body"]
-        existing = fetch_open_pr_for_branch(worktree, gh_repo, branch)
-        if existing:
-            if not existing.get("isDraft"):
-                raise RuntimeError(f"Existing open PR #{existing['number']} for {branch} is not a Draft PR; refusing to overwrite.")
-            if existing.get("baseRefName") and existing["baseRefName"] != base_branch:
-                raise RuntimeError(
-                    f"Existing open PR #{existing['number']} targets '{existing['baseRefName']}', expected '{base_branch}'."
-                )
-            if existing.get("headRefOid") and existing["headRefOid"] != candidate_sha:
-                raise RuntimeError(
-                    f"Existing open PR #{existing['number']} headRefOid ({existing['headRefOid'][:8]}) != reviewed SHA ({candidate_sha[:8]})."
-                )
+        existing: dict[str, Any] | None = None
+        if pre_existing_pr:
+            # Poll briefly for GitHub's async headRefOid update after push
+            for attempt_i in range(poll_attempts):
+                existing = fetch_open_pr_for_branch(worktree, gh_repo, branch)
+                if existing and existing.get("headRefOid") == candidate_sha:
+                    break
+                if attempt_i < poll_attempts - 1 and poll_sleep > 0:
+                    time.sleep(poll_sleep)
+            _validate_open_draft_pr(existing, base_branch=base_branch, candidate_sha=candidate_sha, context="existing PR")
+            assert existing is not None
             edit_cmd = ["gh", "pr", "edit", str(existing["number"]), "--title", pr_title, "--body", pr_body]
             if gh_repo:
                 edit_cmd += ["--repo", gh_repo]
             run_cmd(edit_cmd, cwd=worktree, check=True, env_role="orchestrator")
+            state["pr_number"] = existing["number"]
             state["pr_url"] = existing["url"]
+            state["delivery_mode"] = "draft_pr"
         else:
             create_cmd = [
                 "gh",
@@ -2611,22 +3112,31 @@ def reconcile_publish(
             ]
             if gh_repo:
                 create_cmd += ["--repo", gh_repo]
-            created = run_cmd(create_cmd, cwd=worktree, check=True, env_role="orchestrator")
-            pr_url = created.stdout.strip().splitlines()[-1]
-            # Read back open PR to verify headRefOid & draft state
-            verified = fetch_open_pr_for_branch(worktree, gh_repo, branch)
-            if verified:
-                if verified.get("headRefOid") and verified["headRefOid"] != candidate_sha:
-                    raise RuntimeError(f"Created PR headRefOid mismatch: {verified['headRefOid']} != {candidate_sha}")
-                pr_url = verified.get("url") or pr_url
-            state["pr_url"] = pr_url
+            run_cmd(create_cmd, cwd=worktree, check=True, env_role="orchestrator")
+            verified: dict[str, Any] | None = None
+            for attempt_i in range(poll_attempts):
+                verified = fetch_open_pr_for_branch(worktree, gh_repo, branch)
+                if verified and verified.get("headRefOid") == candidate_sha:
+                    break
+                if attempt_i < poll_attempts - 1 and poll_sleep > 0:
+                    time.sleep(poll_sleep)
+            _validate_open_draft_pr(verified, base_branch=base_branch, candidate_sha=candidate_sha, context="created PR read-back")
+            assert verified is not None
+            state["pr_number"] = verified["number"]
+            state["pr_url"] = verified["url"]
+            state["delivery_mode"] = "draft_pr"
     else:
-        state["pr_url"] = f"local-remote://{branch}@{candidate_sha[:8]}"
+        state["delivery_mode"] = "branch_only"
+        state["pr_url"] = ""
     state["stage"] = "pr_ready"
     save_checkpoint(run_dir, latest_file, state)
 
-    # 3. Re-read LIVE Linear issue -> sync In Review & clear failure labels
+    # 3. Re-read LIVE Linear issue -> guard against human Done/Canceled, sync In Review & clear failure labels
     live_issue = client.get_issue(issue["identifier"])
+    if (live_issue.get("state") or {}).get("type") in ("completed", "canceled"):
+        raise RuntimeError(
+            f"Human terminal state conflict at Linear sync: {live_issue['identifier']} is already '{live_issue['state']['name']}'; refusing to move to In Review."
+        )
     client.update_issue_state(live_issue, "In Review")
     client.remove_labels_if_present(live_issue, {"dispatch:failed", "dispatch:publish-incomplete"})
     issue["state"] = live_issue["state"]
@@ -2641,10 +3151,11 @@ def reconcile_publish(
     already_posted = any(marker in (c.get("body") or "") for c in existing_comments)
     if not already_posted:
         rev = state["review"]
+        pr_line = state["pr_url"] if state.get("pr_url") else "N/A (branch-only non-GitHub remote)"
         comment_lines = [
             marker,
             f"### [agent-dispatch] Ready for Human Merge (`{candidate_sha[:8]}`)",
-            f"- **Draft PR**: {state['pr_url']}",
+            f"- **Draft PR**: {pr_line}",
             f"- **Branch**: `{branch}` (`{candidate_sha}`)",
             f"- **Worker / Reviewer**: `{state['worker']}` / `{state['reviewer']}`",
             f"- **Attempts**: {state['attempt']}/{state['max_attempts']}",
@@ -2652,14 +3163,62 @@ def reconcile_publish(
             f"- **Standards**: `{rev['standards']['verdict'].upper()}` — {redact_secrets(rev['standards']['summary'])}",
             f"- **Spec**: `{rev['spec']['verdict'].upper()}` — {redact_secrets(rev['spec']['summary'])}",
         ]
+        auth_meta = state.get("gate_authorizations") or {}
+        if any(auth_meta.values()):
+            comment_lines.append(f"- **Gate/Test Authorizations**: `{json.dumps(auth_meta, ensure_ascii=False)}`")
         if state.get("discovered_issues"):
             comment_lines += ["", "**Discovered Side Issues (untouched):**"]
             comment_lines.extend(f"- {redact_secrets(d)}" for d in state["discovered_issues"])
         client.add_comment(live_issue["id"], "\n".join(comment_lines))
     state["linear_comment_posted"] = True
-    state["stage"] = "completed"
+    state["stage"] = "completed" if state.get("delivery_mode") == "draft_pr" else "completed_branch_only"
     save_checkpoint(run_dir, latest_file, state)
     return state
+
+
+def verify_completed_publish_readonly(
+    client: LinearClient,
+    live_issue: dict[str, Any],
+    worktree: Path,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Read-only verification for already-completed checkpoints so `resume` NEVER undoes a human-closed PR or edited body."""
+    branch = state["branch"]
+    candidate_sha = state["candidate_sha"]
+    gh_repo = parse_github_owner_repo(worktree)
+    is_github = bool(gh_repo or os.environ.get("AGENT_DISPATCH_FORCE_GH") == "1")
+    conflicts: list[str] = []
+
+    remote_sha = get_remote_branch_sha(worktree, branch)
+    if remote_sha != candidate_sha:
+        conflicts.append(f"Remote origin/{branch} SHA is '{remote_sha[:8] or 'deleted'}', expected '{candidate_sha[:8]}'.")
+
+    if is_github and state.get("delivery_mode", "draft_pr") == "draft_pr":
+        pr_num = state.get("pr_number")
+        pr_obj = fetch_pr_by_number(worktree, gh_repo, int(pr_num)) if pr_num else fetch_open_pr_for_branch(worktree, gh_repo, branch)
+        if not pr_obj:
+            conflicts.append(f"Delivered PR ({state.get('pr_url') or branch}) no longer exists or is inaccessible.")
+        else:
+            pr_state = str(pr_obj.get("state") or "OPEN").upper()
+            if pr_state != "OPEN":
+                conflicts.append(f"Delivered PR #{pr_obj.get('number')} is '{pr_state}' (human action preserved; refusing to reopen/recreate).")
+
+    if conflicts:
+        raise RuntimeError(
+            "Checkpoint is already completed, and remote state diverged (likely human action); refusing to overwrite:\n"
+            + "\n".join(f"- {c}" for c in conflicts)
+        )
+    return {
+        "issue": live_issue["identifier"],
+        "status": "passed",
+        "reconciled": False,
+        "verified_readonly": True,
+        "commit": candidate_sha,
+        "pr_url": state.get("pr_url", ""),
+        "linear_state": (live_issue.get("state") or {}).get("name"),
+        "run_dir": state.get("run_dir", ""),
+        "sessions": state.get("sessions", []),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2669,25 +3228,34 @@ def reconcile_publish(
 def _assert_no_external_tampering(
     client: LinearClient,
     worktree: Path,
-    branch: str,
     issue_uuid: str,
-    expected_remote_sha: str,
-    expected_linear_updated: str,
+    expected_remote_refs: dict[str, str],
+    expected_ownership: dict[str, str],
     phase: str,
 ) -> None:
-    cur_remote = get_remote_branch_sha(worktree, branch)
-    if cur_remote != expected_remote_sha:
+    cur_refs = get_remote_refs_snapshot(worktree)
+    if cur_refs != expected_remote_refs:
+        changed = sorted(set(cur_refs) ^ set(expected_remote_refs) | {k for k in cur_refs if cur_refs.get(k) != expected_remote_refs.get(k)})
         raise RuntimeError(
-            f"Unauthorized external mutation during {phase}: origin/{branch} changed "
-            f"from {expected_remote_sha[:8] or 'none'} to {cur_remote[:8] or 'none'}."
+            f"Unauthorized external mutation during {phase}: remote origin refs changed ({', '.join(changed[:5])})."
         )
-    if expected_linear_updated:
-        cur_upd = client.get_issue_updated_at(issue_uuid)
-        if cur_upd and cur_upd != expected_linear_updated:
+    if expected_ownership:
+        cur = client.get_issue_ownership_snapshot(issue_uuid)
+        if cur.get("state_type") in ("completed", "canceled"):
             raise RuntimeError(
-                f"Unauthorized external mutation during {phase}: Linear issue updatedAt changed "
-                f"from {expected_linear_updated} to {cur_upd}."
+                f"Human terminal state conflict during {phase}: Linear issue was moved to '{cur.get('state_name')}'."
             )
+        if expected_ownership.get("state_id") and cur.get("state_id") != expected_ownership.get("state_id"):
+            raise RuntimeError(
+                f"External Linear state mutation during {phase}: state changed from "
+                f"'{expected_ownership.get('state_name')}' to '{cur.get('state_name')}'."
+            )
+        if cur.get("assignee_id") != expected_ownership.get("assignee_id"):
+            raise RuntimeError(f"External Linear assignee mutation during {phase}: assignee changed mid-run.")
+        if expected_ownership.get("description_sha") and cur.get("description_sha") != expected_ownership.get("description_sha"):
+            raise RuntimeError(f"External Linear description mutation during {phase}: acceptance criteria changed mid-run.")
+        if expected_ownership.get("updated_at") and cur.get("updated_at") and cur.get("updated_at") != expected_ownership.get("updated_at"):
+            log(f"Note: benign Linear metadata update detected during {phase} (state/assignee/description unchanged).")
 
 
 def execute_ticket(
@@ -2703,6 +3271,8 @@ def execute_ticket(
     max_rework: int,
     verify_timeout: int,
     setup_timeout: int,
+    worker_timeout: int = 1800,
+    review_timeout: int = 900,
     no_push: bool,
     allow_no_verify: bool,
     allow_gate_edits: bool,
@@ -2716,8 +3286,11 @@ def execute_ticket(
 ) -> dict[str, Any]:
     if max_rework < 0 or max_rework > 5:
         raise ValueError("--max-rework must be between 0 and 5")
+    assert_required_rubrics_loaded()
+    _check_shutdown()
 
     rkey = repo_cache_key(repo_root)
+    repo_common = get_git_common_dir(repo_root)
     base_branch = detect_default_branch(repo_root)
 
     if not allow_dirty_docs:
@@ -2732,60 +3305,61 @@ def execute_ticket(
     issue = client.get_issue(identifier)
     t_lock = ticket_lock_path(repo_root, issue["id"])
 
-    with file_lock(t_lock, blocking=False):
-        # Re-read inside lock for atomic freshness
-        issue = client.get_issue(issue["id"])
-
-        # Cross-repo ownership check
+    def _validate_claim_eligibility(iss_obj: dict[str, Any]) -> dict[str, Any] | None:
         if not skip_project_check and repo_project:
-            iss_proj = issue.get("project") or {}
+            iss_proj = iss_obj.get("project") or {}
             if iss_proj.get("id") != repo_project["id"]:
                 raise RuntimeError(
-                    f"Cross-repo guard: {issue['identifier']} belongs to Linear project "
+                    f"Cross-repo guard: {iss_obj['identifier']} belongs to Linear project "
                     f"'{iss_proj.get('name', 'None')}', but current repo maps to '{repo_project['name']}'."
                 )
-
-        # Container, spec-label & state guards
-        label_names_l = {l["name"].lower() for l in (issue.get("labels") or {}).get("nodes", [])}
-        if (issue.get("children") or {}).get("nodes") or "spec" in label_names_l:
+        label_names_l = {l["name"].lower() for l in (iss_obj.get("labels") or {}).get("nodes", [])}
+        if (iss_obj.get("children") or {}).get("nodes") or "spec" in label_names_l:
             raise RuntimeError(
-                f"{issue['identifier']} is a Spec/parent container (not a leaf slice); use `spec {issue['identifier']}`."
+                f"{iss_obj['identifier']} is a Spec/parent container (not a leaf slice); use `spec {iss_obj['identifier']}`."
             )
-        st_type = (issue.get("state") or {}).get("type", "")
+        st_type = (iss_obj.get("state") or {}).get("type", "")
         if st_type in ("completed", "canceled"):
-            raise RuntimeError(f"{issue['identifier']} is already {issue['state']['name']}; refusing to run.")
+            raise RuntimeError(f"{iss_obj['identifier']} is already {iss_obj['state']['name']}; refusing to run.")
         if auto_claimed:
-            ready_ok, ready_reason = is_ready_for_frontier(issue)
+            ready_ok, ready_reason = is_ready_for_frontier(iss_obj)
             if not ready_ok:
-                return {"issue": issue["identifier"], "status": "skipped_changed_before_claim", "reason": ready_reason}
+                return {"issue": iss_obj["identifier"], "status": "skipped_changed_before_claim", "reason": ready_reason}
         elif st_type == "started" and not force_rerun:
             raise RuntimeError(
-                f"{issue['identifier']} is already '{issue['state']['name']}'. Pass --force-rerun (or `resume`) to proceed."
+                f"{iss_obj['identifier']} is already '{iss_obj['state']['name']}'. Pass --force-rerun (or `resume`) to proceed."
             )
-
-        active_blks, canceled_blks = classify_blockers(issue)
+        active_blks, canceled_blks = classify_blockers(iss_obj)
         if active_blks or canceled_blks:
             return {
-                "issue": issue["identifier"],
+                "issue": iss_obj["identifier"],
                 "status": "blocked_by_dependencies",
                 "active_blockers": active_blks,
                 "canceled_blockers": canceled_blks,
             }
-
-        # Verify required workflow states BEFORE touching Linear
         if not no_push:
-            team_state_names = {s["name"].lower() for s in (issue.get("team") or {}).get("states", {}).get("nodes", [])}
+            team_state_names = {s["name"].lower() for s in (iss_obj.get("team") or {}).get("states", {}).get("nodes", [])}
             for req_state in ("in progress", "todo", "in review"):
                 if req_state not in team_state_names:
-                    raise RuntimeError(f"Required Linear workflow state '{req_state}' missing in team {issue['team']['key']}.")
+                    raise RuntimeError(f"Required Linear workflow state '{req_state}' missing in team {iss_obj['team']['key']}.")
+        return None
+
+    with file_lock(t_lock, blocking=False):
+        # 1. Initial eligibility check inside lock
+        issue = client.get_issue(issue["id"])
+        early_ret = _validate_claim_eligibility(issue)
+        if early_ret is not None:
+            return early_ret
 
         run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
         run_dir = _cache_root() / "runs" / rkey / issue["identifier"] / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
         latest_file = _cache_root() / "runs" / rkey / issue["identifier"] / "latest.json"
 
-        # Prepare worktree, check remote FF, bootstrap, verify detect & base baseline ALL BEFORE claiming Linear!
-        worktree, branch, base_sha = prepare_worktree(repo_root, issue["identifier"], base_branch, fresh=fresh)
+        # 2. Prepare worktree (writes owner.json INSIDE repo lock!), remote FF, bootstrap, verify detect & base baseline ALL BEFORE claiming Linear!
+        worktree, branch, base_sha = prepare_worktree(
+            repo_root, issue["identifier"], base_branch, fresh=fresh, issue_uuid=issue["id"]
+        )
         if not no_push:
             check_remote_fast_forward_ready(worktree, branch)
 
@@ -2800,7 +3374,17 @@ def execute_ticket(
             }
 
         if not skip_baseline:
-            base_check = check_base_baseline(rkey, worktree, base_sha, verify_cmd, run_dir, timeout=verify_timeout)
+            base_check = check_base_baseline(
+                repo_root,
+                rkey,
+                worktree,
+                base_sha,
+                verify_cmd,
+                run_dir,
+                setup_cmd_override=setup_cmd_override,
+                setup_timeout=setup_timeout,
+                timeout=verify_timeout,
+            )
             if not base_check["passed"]:
                 return {
                     "issue": issue["identifier"],
@@ -2810,21 +3394,35 @@ def execute_ticket(
                     "run_dir": str(run_dir),
                 }
 
-        # Authoritative immutable artifacts
+        # 3. Re-read live Linear issue AFTER expensive preflight so human edits during bootstrap/baseline are respected!
+        issue = client.get_issue(issue["id"])
+        early_ret2 = _validate_claim_eligibility(issue)
+        if early_ret2 is not None:
+            return early_ret2
+
+        pre_claim_state_id = str((issue.get("state") or {}).get("id") or "")
+        pre_claim_state_name = str((issue.get("state") or {}).get("name") or "Todo")
+
+        # Authoritative immutable artifacts (SHA-256 verified before and after review)
         auth_brief_content = render_issue_snapshot(issue)
         auth_brief_path = run_dir / "brief.md"
         atomic_write_text(auth_brief_path, auth_brief_content)
+        auth_brief_sha256 = sha256_file(auth_brief_path)
         wt_brief_path = worktree / ".dispatch" / f"{issue['identifier']}.md"
         wt_brief_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(wt_brief_path, auth_brief_content)
         wt_brief_rel = f".dispatch/{issue['identifier']}.md"
 
         baseline_std_dir = run_dir / "baseline-standards"
-        _, baseline_std_contents = snapshot_baseline_standards(worktree, base_sha, baseline_std_dir)
+        _, baseline_std_hashes = snapshot_baseline_standards(worktree, base_sha, baseline_std_dir)
 
-        brief_authorizes_gate = has_authorized_gate_or_test_changes(issue.get("description") or "")
-        effective_allow_gate = allow_gate_edits or brief_authorizes_gate
-        effective_allow_test = allow_test_edits or brief_authorizes_gate
+        brief_gate_pats, brief_test_pats = parse_authorized_changes(issue.get("description") or "")
+        gate_authorizations = {
+            "cli_allow_gate_edits": allow_gate_edits,
+            "cli_allow_test_edits": allow_test_edits,
+            "brief_gate_patterns": brief_gate_pats,
+            "brief_test_patterns": brief_test_pats,
+        }
 
         sessions: list[dict[str, Any]] = []
         state: dict[str, Any] = {
@@ -2841,22 +3439,30 @@ def execute_ticket(
             "worker": worker.label,
             "reviewer": reviewer.label,
             "no_push": no_push,
+            "pre_claim_state_id": pre_claim_state_id,
+            "pre_claim_state_name": pre_claim_state_name,
+            "gate_authorizations": gate_authorizations,
             "stage": "preflight_ok",
+            "push_attempted": False,
             "pushed": False,
         }
         save_checkpoint(run_dir, latest_file, state)
 
         moved_in_progress = False
+        claimed_state_id = ""
         publish_started = False
         terminal_ok = False
         failure_reason = ""
         try:
             if not no_push:
-                client.update_issue_state(issue, "In Progress")
+                claimed_st = client.update_issue_state(issue, "In Progress")
+                claimed_state_id = str(claimed_st.get("id") or "")
                 moved_in_progress = True
             state["stage"] = "in_progress"
+            state["claimed_state_id"] = claimed_state_id
             save_checkpoint(run_dir, latest_file, state)
 
+            expected_ownership = client.get_issue_ownership_snapshot(issue["id"]) if not no_push else {}
             gh_repo = parse_github_owner_repo(worktree)
             pr_feedback: str | None = fetch_open_pr_feedback(worktree, gh_repo, branch) if (gh_repo and not no_push) else None
             feedback: str | None = pr_feedback
@@ -2868,44 +3474,54 @@ def execute_ticket(
             last_review_res: dict[str, Any] = {}
 
             for attempt in range(1, max_attempts + 1):
+                _check_shutdown()
                 log(f"=== {issue['identifier']} Attempt {attempt}/{max_attempts} | worker={worker.label} ===")
-                pre_remote_sha = get_remote_branch_sha(worktree, branch) if not no_push else ""
-                pre_linear_upd = client.get_issue_updated_at(issue["id"]) if not no_push else ""
+                pre_remote_refs = get_remote_refs_snapshot(worktree) if not no_push else {}
 
                 w_prompt = build_worker_prompt(
                     issue["identifier"],
                     wt_brief_rel,
                     verify_cmd,
-                    allow_gate_edits=effective_allow_gate,
+                    allow_gate_edits=allow_gate_edits,
+                    authorized_gate_patterns=brief_gate_pats,
                     feedback=feedback,
                 )
-                w_res = invoke_harness(
-                    worker,
-                    w_prompt,
-                    worktree=worktree,
-                    run_dir=run_dir,
-                    schema=WORKER_SCHEMA,
-                    schema_file=run_dir / "worker-schema.json",
-                    prompt_file=run_dir / f"prompt-worker-r{attempt}.md",
-                    out_file=run_dir / f"worker-r{attempt}.json",
-                    read_only=False,
-                    session_label=f"{issue['identifier']}-worker-r{attempt}",
-                    trace_sink=sessions,
-                )
+                try:
+                    w_res = invoke_harness(
+                        worker,
+                        w_prompt,
+                        worktree=worktree,
+                        run_dir=run_dir,
+                        schema=WORKER_SCHEMA,
+                        schema_file=run_dir / "worker-schema.json",
+                        prompt_file=run_dir / f"prompt-worker-r{attempt}.md",
+                        out_file=run_dir / f"worker-r{attempt}.json",
+                        read_only=False,
+                        session_label=f"{issue['identifier']}-worker-r{attempt}",
+                        trace_sink=sessions,
+                        timeout=worker_timeout,
+                    )
+                except subprocess.TimeoutExpired:
+                    feedback = (
+                        f"Previous worker attempt timed out after {worker_timeout}s. "
+                        "Inspect current partial edits in the worktree, keep changes minimal, verify, and return JSON promptly."
+                    )
+                    log(f"{issue['identifier']} worker timed out on attempt {attempt} ({worker_timeout}s); routing to rework.")
+                    continue
 
                 if not no_push:
                     _assert_no_external_tampering(
-                        client, worktree, branch, issue["id"], pre_remote_sha, pre_linear_upd, f"worker attempt {attempt}"
+                        client, worktree, issue["id"], pre_remote_refs, expected_ownership, f"worker attempt {attempt}"
                     )
 
                 for raw_item in w_res.get("discovered_issues") or []:
                     norm = raw_item.strip().lower()
                     if norm and norm not in discovered_seen:
                         discovered_seen.add(norm)
-                        all_discovered.append(f"[attempt {attempt}] {raw_item.strip()}")
+                        all_discovered.append(f"[attempt {attempt}] {redact_secrets(raw_item.strip())}")
 
                 if w_res["status"] == "blocked":
-                    failure_reason = f"Worker reported blocked: {w_res['blockers']}"
+                    failure_reason = f"Worker reported blocked: {redact_secrets(w_res['blockers'])}"
                     state["stage"] = "worker_blocked"
                     state["sessions"] = sessions
                     save_checkpoint(run_dir, latest_file, state)
@@ -2916,14 +3532,29 @@ def execute_ticket(
                         "branch": branch,
                         "worktree": str(worktree),
                         "run_dir": str(run_dir),
-                        "blockers": w_res["blockers"],
-                        "summary": w_res["summary"],
+                        "blockers": redact_secrets(w_res["blockers"]),
+                        "summary": redact_secrets(w_res["summary"]),
                         "discovered_issues": all_discovered,
                         "sessions": sessions,
                     }
 
+                verify_worktree_branch_integrity(worktree, repo_common, branch, base_sha)
                 candidate_sha, staged_secret_hits = orchestrator_commit(worktree, issue["identifier"], issue["title"], attempt)
                 if staged_secret_hits:
+                    if any("ticket title" in h for h in staged_secret_hits):
+                        failure_reason = "Secret detected in ticket title / commit message:\n" + "\n".join(f"- {s}" for s in staged_secret_hits)
+                        state["stage"] = "secret_in_metadata"
+                        state["sessions"] = sessions
+                        save_checkpoint(run_dir, latest_file, state)
+                        return {
+                            "issue": issue["identifier"],
+                            "status": "secret_in_metadata",
+                            "error": failure_reason,
+                            "branch": branch,
+                            "worktree": str(worktree),
+                            "run_dir": str(run_dir),
+                            "sessions": sessions,
+                        }
                     feedback = "Secret scan blocked staging (remove secrets/credential files and retry):\n" + "\n".join(
                         f"- {s}" for s in staged_secret_hits
                     )
@@ -2931,16 +3562,16 @@ def execute_ticket(
                     continue
 
                 diff_nonempty = run_cmd(
-                    ["git", "diff", "--name-only", f"{base_sha}..{candidate_sha}"],
+                    git_cmd("diff", "-z", "--name-only", f"{base_sha}..{candidate_sha}"),
                     cwd=worktree,
                     check=True,
                     env_role="orchestrator",
-                ).stdout.strip()
+                ).stdout.strip("\x00")
                 if not diff_nonempty:
                     feedback = "Net diff against base commit is empty. Implement the ticket acceptance criteria."
                     continue
 
-                # Full commit-range secret scan (catches secrets if worker committed directly!)
+                # Full commit-range secret scan (catches secrets in history, commit messages, and merge commits!)
                 range_secret_hits = scan_range_for_secrets(worktree, base_sha, candidate_sha)
                 if range_secret_hits:
                     failure_reason = "Secret detected in commit history:\n" + "\n".join(f"- {s}" for s in range_secret_hits)
@@ -2957,27 +3588,37 @@ def execute_ticket(
                         "sessions": sessions,
                     }
 
-                # Protected paths gate (--no-renames)
-                if not effective_allow_gate:
-                    prot_violations = check_protected_paths(worktree, base_sha, candidate_sha)
-                    if prot_violations:
-                        feedback = (
-                            f"Protected policy/gate files were modified. Restore them to base commit `{base_sha}` "
-                            f"(e.g., `git checkout {base_sha} -- <path>`):\n"
-                            + "\n".join(f"- {v}" for v in prot_violations)
-                        )
-                        log(f"{issue['identifier']} protected-paths gate FAILED on attempt {attempt}.")
-                        continue
+                # Granular Protected paths gate (--no-renames -z)
+                prot_violations = check_protected_paths(
+                    worktree,
+                    base_sha,
+                    candidate_sha,
+                    allowed_patterns=brief_gate_pats,
+                    allow_all=allow_gate_edits,
+                )
+                if prot_violations:
+                    feedback = (
+                        f"Protected policy/gate files were modified. Restore them to base commit `{base_sha}` "
+                        f"(e.g., `git checkout {base_sha} -- <path>`):\n"
+                        + "\n".join(f"- {v}" for v in prot_violations)
+                    )
+                    log(f"{issue['identifier']} protected-paths gate FAILED on attempt {attempt}.")
+                    continue
 
-                # Deterministic test-integrity diff gate (--no-renames)
-                if not effective_allow_test:
-                    det_test_violations = check_test_integrity_diff(worktree, base_sha, candidate_sha)
-                    if det_test_violations:
-                        feedback = "Deterministic test-integrity check FAILED (restore skipped/deleted tests):\n" + "\n".join(
-                            f"- {v}" for v in det_test_violations
-                        )
-                        log(f"{issue['identifier']} deterministic test-integrity gate FAILED on attempt {attempt}.")
-                        continue
+                # Granular Deterministic test-integrity diff gate (--no-renames -z)
+                det_test_violations = check_test_integrity_diff(
+                    worktree,
+                    base_sha,
+                    candidate_sha,
+                    allowed_patterns=brief_test_pats,
+                    allow_all=allow_test_edits,
+                )
+                if det_test_violations:
+                    feedback = "Deterministic test-integrity check FAILED (restore skipped/deleted tests):\n" + "\n".join(
+                        f"- {v}" for v in det_test_violations
+                    )
+                    log(f"{issue['identifier']} deterministic test-integrity gate FAILED on attempt {attempt}.")
+                    continue
 
                 # Mandatory verify gate
                 last_verify_res = run_verify_gate(
@@ -2989,9 +3630,8 @@ def execute_ticket(
                     timeout=verify_timeout,
                 )
                 if not last_verify_res["passed"]:
-                    # Clean any dirty artifacts left by failed verification so next round stays clean
-                    run_cmd(["git", "reset", "--hard", candidate_sha], cwd=worktree, env_role="orchestrator")
-                    run_cmd(["git", "clean", "-fd", "-e", ".dispatch"], cwd=worktree, env_role="orchestrator")
+                    run_cmd(git_cmd("reset", "--hard", candidate_sha), cwd=worktree, env_role="orchestrator")
+                    run_cmd(git_cmd("clean", "-fd", "-e", ".dispatch"), cwd=worktree, env_role="orchestrator")
                     feedback = (
                         f"Deterministic verification failed (`{last_verify_res['command']}`, exit {last_verify_res.get('returncode')}):\n"
                         f"```\n{last_verify_res['output'][-2500:]}\n```"
@@ -2999,9 +3639,14 @@ def execute_ticket(
                     log(f"{issue['identifier']} verify FAILED on attempt {attempt}.")
                     continue
 
+                # Check ownership BEFORE review as well (so human canceling during verify halts immediately!)
+                if not no_push:
+                    _assert_no_external_tampering(
+                        client, worktree, issue["id"], pre_remote_refs, expected_ownership, f"verify attempt {attempt}"
+                    )
+
                 # Cross-vendor read-only two-axis review
-                pre_rev_remote = get_remote_branch_sha(worktree, branch) if not no_push else ""
-                pre_rev_linear = client.get_issue_updated_at(issue["id"]) if not no_push else ""
+                pre_rev_refs = get_remote_refs_snapshot(worktree) if not no_push else {}
                 last_review_res = run_two_axis_review(
                     reviewer,
                     worktree,
@@ -3009,30 +3654,34 @@ def execute_ticket(
                     base_sha,
                     candidate_sha,
                     auth_brief_path,
-                    auth_brief_content,
+                    auth_brief_sha256,
                     baseline_std_dir,
-                    baseline_std_contents,
+                    baseline_std_hashes,
                     attempt,
                     prior_findings=prior_review_findings,
                     pr_feedback=pr_feedback,
                     trace_sink=sessions,
+                    review_timeout=review_timeout,
                 )
                 if not no_push:
                     _assert_no_external_tampering(
-                        client, worktree, branch, issue["id"], pre_rev_remote, pre_rev_linear, f"review attempt {attempt}"
+                        client, worktree, issue["id"], pre_rev_refs, expected_ownership, f"review attempt {attempt}"
                     )
 
                 if last_review_res["passed"]:
+                    safe_summary = redact_secrets(w_res["summary"])
+                    safe_tests_run = [redact_secrets(t) for t in (w_res.get("tests_run") or [])]
                     pr_body = build_pr_body(
                         issue,
                         candidate_sha,
                         worker,
                         reviewer,
-                        w_res["summary"],
-                        w_res["tests_run"],
+                        safe_summary,
+                        safe_tests_run,
                         last_verify_res,
                         last_review_res,
                         all_discovered,
+                        gate_authorizations=gate_authorizations,
                     )
                     state.update(
                         {
@@ -3040,13 +3689,14 @@ def execute_ticket(
                             "attempt": attempt,
                             "max_attempts": max_attempts,
                             "candidate_sha": candidate_sha,
-                            "worker_summary": w_res["summary"],
-                            "tests_run": w_res["tests_run"],
-                            "verify": {"command": last_verify_res.get("command"), "ran": last_verify_res.get("ran"), "passed": True},
+                            "worker_summary": safe_summary,
+                            "tests_run": safe_tests_run,
+                            "verify": {"command": redact_secrets(str(last_verify_res.get("command") or "")), "ran": last_verify_res.get("ran"), "passed": True},
                             "review": last_review_res,
                             "discovered_issues": all_discovered,
                             "sessions": sessions,
                             "pr_body": pr_body,
+                            "push_attempted": False,
                             "pushed": False,
                             "pr_url": "",
                             "linear_state_synced": False,
@@ -3086,6 +3736,7 @@ def execute_ticket(
                             "issue": issue["identifier"],
                             "status": "publish_incomplete",
                             "stage": state["stage"],
+                            "push_attempted": bool(state.get("push_attempted")),
                             "pushed": bool(state.get("pushed")),
                             "pr_url": state.get("pr_url", ""),
                             "error": redact_secrets(str(pub_exc)),
@@ -3099,13 +3750,14 @@ def execute_ticket(
                     terminal_ok = True
                     return {
                         "issue": issue["identifier"],
-                        "status": "passed",
+                        "status": "passed" if state.get("stage") == "completed" else "passed_branch_only",
+                        "delivery_mode": state.get("delivery_mode", "draft_pr"),
                         "attempt": attempt,
                         "branch": branch,
                         "commit": candidate_sha,
                         "worktree": str(worktree),
                         "run_dir": str(run_dir),
-                        "pr_url": state["pr_url"],
+                        "pr_url": state.get("pr_url", ""),
                         "worker": worker.label,
                         "reviewer": reviewer.label,
                         "verify": state["verify"],
@@ -3154,7 +3806,9 @@ def execute_ticket(
             }
         except BaseException as exc:
             failure_reason = f"Unhandled orchestrator error ({type(exc).__name__}): {exc}"
-            state["stage"] = "error"
+            # CRITICAL: NEVER clobber a resumable publish stage on SIGTERM/SIGINT/SystemExit!
+            if not publish_started:
+                state["stage"] = "error"
             state["error"] = redact_secrets(str(exc))
             state["sessions"] = sessions
             try:
@@ -3166,32 +3820,68 @@ def execute_ticket(
             if moved_in_progress and not terminal_ok and not no_push:
                 try:
                     live_iss = client.get_issue(issue["id"])
-                    if publish_started and state.get("pushed"):
-                        # NEVER roll back to Todo once remote push/PR already succeeded!
-                        client.ensure_label_and_add(live_iss, "dispatch:publish-incomplete")
+                    live_st = live_iss.get("state") or {}
+                    live_st_type = str(live_st.get("type") or "")
+                    live_st_id = str(live_st.get("id") or "")
+                    human_took_over = (live_st_type in ("completed", "canceled")) or (
+                        bool(claimed_state_id) and live_st_id != claimed_state_id
+                    )
+
+                    # Best-effort remote fact check when push was attempted or publish started
+                    remote_touched = bool(state.get("pushed"))
+                    if not remote_touched and (publish_started or state.get("push_attempted")):
+                        try:
+                            if get_remote_branch_sha(worktree, branch) == state.get("candidate_sha"):
+                                remote_touched = True
+                                state["pushed"] = True
+                        except Exception:
+                            # Unknown remote state after push_attempted -> MUST treat conservatively as publish_incomplete!
+                            remote_touched = True
+
+                    if publish_started and (state.get("push_attempted") or remote_touched):
+                        # NEVER roll back to Todo or falsely claim "NOT pushed" once push was attempted!
+                        if live_st_type not in ("completed", "canceled"):
+                            client.ensure_label_and_add(live_iss, "dispatch:publish-incomplete")
                         client.add_comment(
                             live_iss["id"],
                             "\n".join(
                                 [
                                     f"### [agent-dispatch] Publish Interrupted at `{state.get('stage')}`",
                                     f"- **Branch / SHA**: `{branch}` (`{state.get('candidate_sha', '')[:8]}`)",
-                                    f"- **PR**: {state.get('pr_url') or 'not created yet'}",
+                                    f"- **Remote Push Status**: {'confirmed' if state.get('pushed') else 'attempted (verify via resume)'}",
+                                    f"- **PR**: {state.get('pr_url') or 'not confirmed yet'}",
                                     f"- **Resume**: `agent-dispatch resume {issue['identifier']}`",
                                     f"- **Run Logs**: `{run_dir}`",
                                     f"- **Reason**:\n{redact_secrets(failure_reason[:2500])}",
                                 ]
                             ),
                         )
+                    elif human_took_over:
+                        # Respect human decision (Done / Canceled / manually moved state): DO NOT overwrite Linear state!
+                        client.add_comment(
+                            live_iss["id"],
+                            "\n".join(
+                                [
+                                    f"### [agent-dispatch] Halted (Preserved Current State `{live_st.get('name', 'unknown')}`)",
+                                    f"- **Worktree**: `{worktree}` (`{branch}`)",
+                                    f"- **Run Logs**: `{run_dir}`",
+                                    f"- **Reason**:\n{redact_secrets(failure_reason[:2500])}",
+                                ]
+                            ),
+                        )
                     else:
-                        client.update_issue_state(live_iss, "Todo")
+                        if pre_claim_state_id:
+                            client.update_issue_state_by_id(live_iss, pre_claim_state_id, label_hint=pre_claim_state_name)
+                        else:
+                            client.update_issue_state(live_iss, "Todo")
                         client.ensure_label_and_add(live_iss, "dispatch:failed")
                         sess_lines = [
                             f"- `{s.get('role')}` ({s.get('harness')}): `{s.get('resume_cmd') or s.get('conversation_link') or s.get('stdout_log')}`"
                             for s in sessions
                         ]
                         comment_parts = [
-                            f"### [agent-dispatch] Halted -> Reverted to Todo (`dispatch:failed`)",
-                            f"- **Worktree (local, NOT pushed)**: `{worktree}` (`{branch}`)",
+                            f"### [agent-dispatch] Halted -> Reverted to `{pre_claim_state_name}` (`dispatch:failed`)",
+                            f"- **Worktree (local, NOT pushed by this run)**: `{worktree}` (`{branch}`)",
                             f"- **Run Logs**: `{run_dir}`",
                             f"- **Reason**:\n{redact_secrets(failure_reason[:2500])}",
                         ]
@@ -3226,6 +3916,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_rework=args.max_rework,
         verify_timeout=args.verify_timeout,
         setup_timeout=args.setup_timeout,
+        worker_timeout=args.worker_timeout,
+        review_timeout=args.review_timeout,
         no_push=args.no_push,
         allow_no_verify=args.allow_no_verify,
         allow_gate_edits=args.allow_gate_edits,
@@ -3237,13 +3929,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         fresh=args.fresh,
     )
     print(json.dumps(res, indent=2, ensure_ascii=False))
-    return 0 if res.get("status") in ("passed", "passed_local") else 1
+    return 0 if res.get("status") in ("passed", "passed_local", "passed_branch_only") else 1
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
-    """Acquire canonical ticket lock FIRST, then read checkpoint & live Linear issue and reconcile publish."""
+    """Acquire canonical ticket lock FIRST, verify repo/worktree identity, and reconcile (or read-only verify if completed)."""
     repo_root = get_repo_root(args.repo)
     rkey = repo_cache_key(repo_root)
+    cur_repo_identity = canonical_repo_identity(repo_root)
+    repo_common = get_git_common_dir(repo_root)
     client = LinearClient(resolve_linear_auth())
     repo_project = None if args.skip_project_check else resolve_project(client, repo_root, args.project)
 
@@ -3260,10 +3954,15 @@ def cmd_resume(args: argparse.Namespace) -> int:
         state = json.loads(latest_file.read_text(encoding="utf-8"))
         if state.get("issue_uuid") and state["issue_uuid"] != issue["id"]:
             raise RuntimeError(f"Checkpoint issue UUID mismatch ({state['issue_uuid']} != {issue['id']}).")
+        if state.get("repo_identity") and state["repo_identity"] != cur_repo_identity:
+            raise RuntimeError(
+                f"Checkpoint repo_identity mismatch ({state['repo_identity']} != {cur_repo_identity}); refusing cross-repo resume."
+            )
         if state.get("no_push"):
             raise RuntimeError(f"Latest run for {issue['identifier']} was `--no-push` local mode; rerun without `--no-push` to publish.")
-        valid_stages = ("verified_and_reviewed", "pushed", "pr_ready", "linear_state_synced", "completed")
-        if state.get("stage") not in valid_stages:
+        valid_stages = ("verified_and_reviewed", "pushing", "pushed", "pr_ready", "linear_state_synced", "completed", "completed_branch_only")
+        has_verified_review = bool(state.get("candidate_sha")) and bool((state.get("review") or {}).get("passed"))
+        if state.get("stage") not in valid_stages and not has_verified_review:
             raise RuntimeError(
                 f"Latest run for {issue['identifier']} is at stage '{state.get('stage')}' and has not passed verify+review; rerun with `run`."
             )
@@ -3273,19 +3972,28 @@ def cmd_resume(args: argparse.Namespace) -> int:
         worktree = Path(state["worktree"])
         if not (worktree / ".git").exists():
             raise RuntimeError(f"Worktree missing at {worktree}; cannot reconcile.")
+        if get_git_common_dir(worktree) != repo_common:
+            raise RuntimeError(f"Worktree {worktree} does not belong to repository {repo_root}.")
         live_issue = client.get_issue(issue["id"])
         if (live_issue.get("state") or {}).get("type") in ("completed", "canceled"):
             raise RuntimeError(f"{live_issue['identifier']} is already {live_issue['state']['name']}; nothing to resume.")
+
+        # Already completed -> READ-ONLY verification so we NEVER overwrite human-edited PR body or reopen human-closed PR!
+        if state.get("stage") in ("completed", "completed_branch_only"):
+            ro_out = verify_completed_publish_readonly(client, live_issue, worktree, state)
+            print(json.dumps(ro_out, indent=2, ensure_ascii=False))
+            return 0
+
         reconcile_publish(client, live_issue, worktree, run_dir, latest_file, state)
 
     print(
         json.dumps(
             {
                 "issue": issue["identifier"],
-                "status": "passed",
+                "status": "passed" if state.get("stage") == "completed" else "passed_branch_only",
                 "reconciled": True,
                 "commit": state["candidate_sha"],
-                "pr_url": state["pr_url"],
+                "pr_url": state.get("pr_url", ""),
                 "linear_state": (live_issue.get("state") or {}).get("name"),
                 "run_dir": str(run_dir),
                 "sessions": state.get("sessions", []),
@@ -3350,8 +4058,9 @@ def select_non_overlapping_wave(runnable: list[dict[str, Any]], *, limit: int | 
             else:
                 deferred.append({"id": iss["identifier"], "reason": "undeclared_touches_deferred"})
         else:
-            if has_unscoped or (t & claimed_touches):
-                deferred.append({"id": iss["identifier"], "reason": f"overlapping_touches:{sorted(t & claimed_touches) or ['unscoped']}"})
+            conflicts = touches_overlap(t, claimed_touches)
+            if has_unscoped or conflicts:
+                deferred.append({"id": iss["identifier"], "reason": f"overlapping_touches:{conflicts or ['unscoped']}"})
             else:
                 selected.append(iss)
                 claimed_touches |= t
@@ -3374,6 +4083,8 @@ def run_batch_safely(
     results: list[dict[str, Any]] = []
 
     def _safe_exec(ident: str) -> dict[str, Any]:
+        if _SHUTDOWN_EVENT.is_set():
+            return {"issue": ident, "status": "cancelled_by_signal"}
         try:
             return execute_ticket(
                 client,
@@ -3387,6 +4098,8 @@ def run_batch_safely(
                 max_rework=args.max_rework,
                 verify_timeout=args.verify_timeout,
                 setup_timeout=args.setup_timeout,
+                worker_timeout=args.worker_timeout,
+                review_timeout=args.review_timeout,
                 no_push=args.no_push,
                 allow_no_verify=args.allow_no_verify,
                 allow_gate_edits=args.allow_gate_edits,
@@ -3398,13 +4111,23 @@ def run_batch_safely(
                 fresh=args.fresh,
                 auto_claimed=True,
             )
+        except (KeyboardInterrupt, SystemExit):
+            return {"issue": ident, "status": "cancelled_by_signal"}
         except Exception as exc:
             return {"issue": ident, "status": "error", "error": redact_secrets(str(exc))}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.max_parallel)) as pool:
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.max_parallel))
+    try:
         futs = {pool.submit(_safe_exec, iss["identifier"]): iss["identifier"] for iss in wave}
         for fut in concurrent.futures.as_completed(futs):
             results.append(fut.result())
+    except (KeyboardInterrupt, SystemExit):
+        _SHUTDOWN_EVENT.set()
+        _kill_all_active_children(wait_sigkill=True)
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
     return results, deferred
 
 
@@ -3432,7 +4155,7 @@ def cmd_frontier(args: argparse.Namespace) -> int:
             ensure_ascii=False,
         )
     )
-    return 0 if all(r.get("status") in ("passed", "passed_local") for r in results) else 1
+    return 0 if all(r.get("status") in ("passed", "passed_local", "passed_branch_only") for r in results) else 1
 
 
 def cmd_spec(args: argparse.Namespace) -> int:
@@ -3470,39 +4193,41 @@ def cmd_spec(args: argparse.Namespace) -> int:
             ensure_ascii=False,
         )
     )
-    return 0 if all(r.get("status") in ("passed", "passed_local") for r in results) else 1
+    return 0 if all(r.get("status") in ("passed", "passed_local", "passed_branch_only") for r in results) else 1
 
 
 def cmd_review(args: argparse.Namespace) -> int:
+    assert_required_rubrics_loaded()
     repo_root = get_repo_root(args.repo)
     base_branch = detect_default_branch(repo_root)
-    if not args.base and run_cmd(["git", "remote", "get-url", "origin"], cwd=repo_root, env_role="orchestrator").returncode == 0:
-        run_cmd(["git", "fetch", "origin", base_branch], cwd=repo_root, env_role="orchestrator")
+    if not args.base and run_cmd(git_cmd("remote", "get-url", "origin"), cwd=repo_root, env_role="orchestrator").returncode == 0:
+        run_cmd(git_cmd("fetch", "origin", base_branch), cwd=repo_root, check=True, env_role="orchestrator")
         base_ref = f"origin/{base_branch}"
     else:
         base_ref = args.base or base_branch
 
-    base_sha = run_cmd(["git", "merge-base", base_ref, "HEAD"], cwd=repo_root, check=True, env_role="orchestrator").stdout.strip()
-    candidate_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo_root, check=True, env_role="orchestrator").stdout.strip()
-    if run_cmd(["git", "status", "--porcelain"], cwd=repo_root, env_role="orchestrator").stdout.strip():
+    base_sha = run_cmd(git_cmd("merge-base", base_ref, "HEAD"), cwd=repo_root, check=True, env_role="orchestrator").stdout.strip()
+    candidate_sha = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=repo_root, check=True, env_role="orchestrator").stdout.strip()
+    if run_cmd(git_cmd("status", "--porcelain"), cwd=repo_root, env_role="orchestrator").stdout.strip():
         raise RuntimeError("Working tree has uncommitted changes; commit or stash before running SHA-locked `review`.")
-    if not run_cmd(["git", "diff", "--name-only", f"{base_sha}..{candidate_sha}"], cwd=repo_root, check=True, env_role="orchestrator").stdout.strip():
+    if not run_cmd(git_cmd("diff", "-z", "--name-only", f"{base_sha}..{candidate_sha}"), cwd=repo_root, check=True, env_role="orchestrator").stdout.strip("\x00"):
         raise RuntimeError(f"Empty diff between {base_sha[:8]} and {candidate_sha[:8]}.")
 
     reviewer = parse_harness_spec(args.reviewer or "agy:neon")
     run_dir = _cache_root() / "reviews" / f"{repo_cache_key(repo_root)}-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
     run_dir.mkdir(parents=True, exist_ok=True)
     auth_brief: Path | None = None
-    auth_brief_content: str | None = None
+    auth_brief_sha256: str | None = None
     if args.issue:
         client = LinearClient(resolve_linear_auth())
         issue = client.get_issue(args.issue)
         auth_brief_content = render_issue_snapshot(issue)
         auth_brief = run_dir / "brief.md"
         atomic_write_text(auth_brief, auth_brief_content)
+        auth_brief_sha256 = sha256_file(auth_brief)
 
     std_dir = run_dir / "baseline-standards"
-    _, std_contents = snapshot_baseline_standards(repo_root, base_sha, std_dir)
+    _, std_hashes = snapshot_baseline_standards(repo_root, base_sha, std_dir)
     sessions: list[dict[str, Any]] = []
     res = run_two_axis_review(
         reviewer,
@@ -3511,11 +4236,12 @@ def cmd_review(args: argparse.Namespace) -> int:
         base_sha,
         candidate_sha,
         auth_brief,
-        auth_brief_content,
+        auth_brief_sha256,
         std_dir,
-        std_contents,
+        std_hashes,
         round_num=1,
         trace_sink=sessions,
+        review_timeout=args.review_timeout,
     )
     print(
         json.dumps(
@@ -3534,6 +4260,41 @@ def cmd_review(args: argparse.Namespace) -> int:
     return 0 if res["passed"] else 1
 
 
+def _read_worktree_lock_owner(repo_root: Path, rkey: str, wt: Path) -> tuple[str, dict[str, Any], str]:
+    """
+    Resolve (issue_uuid, latest_ckpt_dict, error_reason) from owner.json (authoritative, written inside repo lock)
+    and latest.json. Never crashes on corrupt JSON.
+    """
+    expected_repo_id = canonical_repo_identity(repo_root)
+    owner_uuid = ""
+    owner_f = wt / ".dispatch" / "owner.json"
+    if owner_f.is_file():
+        try:
+            owner_data = json.loads(owner_f.read_text(encoding="utf-8"))
+            if owner_data.get("repo_identity") and owner_data["repo_identity"] != expected_repo_id:
+                return "", {}, "owner_repo_identity_mismatch"
+            owner_uuid = str(owner_data.get("issue_uuid") or "")
+        except Exception:
+            return "", {}, "corrupt_owner_json"
+
+    ckpt: dict[str, Any] = {}
+    ckpt_err = ""
+    latest_f = _cache_root() / "runs" / rkey / wt.name / "latest.json"
+    if latest_f.is_file():
+        try:
+            ckpt = json.loads(latest_f.read_text(encoding="utf-8"))
+        except Exception:
+            ckpt_err = "corrupt_latest_json"
+
+    ckpt_uuid = str(ckpt.get("issue_uuid") or "")
+    if owner_uuid and ckpt_uuid and owner_uuid != ckpt_uuid:
+        return "", ckpt, "owner_checkpoint_uuid_mismatch"
+    resolved_uuid = owner_uuid or ckpt_uuid
+    if not resolved_uuid:
+        return "", ckpt, ckpt_err or "missing_lock_owner_metadata"
+    return resolved_uuid, ckpt, ""
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     repo_root = get_repo_root(args.repo)
     rkey = repo_cache_key(repo_root)
@@ -3547,22 +4308,27 @@ def cmd_status(args: argparse.Namespace) -> int:
     active_wts: list[dict[str, Any]] = []
     if wt_root.is_dir():
         for p in sorted(wt_root.iterdir()):
-            if not p.is_dir():
+            if not p.is_dir() or p.name.startswith(".baseline-"):
                 continue
-            latest_f = _cache_root() / "runs" / rkey / p.name / "latest.json"
-            ckpt = json.loads(latest_f.read_text(encoding="utf-8")) if latest_f.is_file() else {}
-            issue_uuid = ckpt.get("issue_uuid", "")
-            locked = is_locked(ticket_lock_path(repo_root, issue_uuid)) if issue_uuid else False
-            active_wts.append(
-                {
-                    "id": p.name,
-                    "path": str(p),
-                    "locked": locked,
-                    "last_stage": ckpt.get("stage"),
-                    "pr_url": ckpt.get("pr_url"),
-                    "run_dir": ckpt.get("run_dir"),
-                }
-            )
+            issue_uuid, ckpt, owner_err = _read_worktree_lock_owner(repo_root, rkey, p)
+            if issue_uuid:
+                locked_bool = is_locked(ticket_lock_path(repo_root, issue_uuid))
+                lock_state = "locked" if locked_bool else "unlocked"
+            else:
+                locked_bool = None
+                lock_state = "unknown"
+            entry: dict[str, Any] = {
+                "id": p.name,
+                "path": str(p),
+                "locked": locked_bool,
+                "lock_state": lock_state,
+                "last_stage": ckpt.get("stage"),
+                "pr_url": ckpt.get("pr_url"),
+                "run_dir": ckpt.get("run_dir"),
+            }
+            if owner_err:
+                entry["owner_warning"] = owner_err
+            active_wts.append(entry)
 
     in_prog_list: list[dict[str, Any]] = []
     for i in started:
@@ -3605,6 +4371,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     checks: dict[str, Any] = {}
     ok_all = True
 
+    missing_rubrics = [k for k in ("tdd", "standards", "spec") if not PRELOADED_REFS.get(k, "").strip()]
+    checks["rubrics"] = {"ok": not missing_rubrics, "skills_root": str(SKILLS_ROOT), "missing": missing_rubrics}
+    if missing_rubrics:
+        ok_all = False
+
     try:
         client = LinearClient(resolve_linear_auth())
         teams, projects = client.list_teams_and_projects()
@@ -3615,11 +4386,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         checks["linear_auth"] = {"ok": False, "error": redact_secrets(str(exc))}
         client = None
 
-    gh_res = run_cmd(["gh", "auth", "status"], env_role="orchestrator")
-    gh_text = redact_secrets((gh_res.stdout + "\n" + gh_res.stderr).strip())
-    checks["gh_auth"] = {"ok": gh_res.returncode == 0, "detail": gh_text.splitlines()[:3] if gh_text else []}
-    if gh_res.returncode != 0:
+    try:
+        gh_res = run_cmd(["gh", "auth", "status"], env_role="orchestrator")
+        gh_text = redact_secrets((gh_res.stdout + "\n" + gh_res.stderr).strip())
+        checks["gh_auth"] = {"ok": gh_res.returncode == 0, "detail": gh_text.splitlines()[:3] if gh_text else []}
+        if gh_res.returncode != 0:
+            ok_all = False
+    except FileNotFoundError:
         ok_all = False
+        checks["gh_auth"] = {"ok": False, "error": "`gh` CLI binary not found in PATH."}
 
     harnesses: dict[str, Any] = {}
     for name in ("codex", "agy", "opencode", "pi"):
@@ -3669,59 +4444,52 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     rkey = repo_cache_key(repo_root)
     base_branch = detect_default_branch(repo_root)
     gh_repo = parse_github_owner_repo(repo_root)
+    use_gh = bool(gh_repo or os.environ.get("AGENT_DISPATCH_FORCE_GH") == "1")
     wt_root = _cache_root() / "worktrees" / rkey
     removed: list[str] = []
     skipped: list[str] = []
 
     with file_lock(_cache_root() / "locks" / f"repo-{rkey}.lock", blocking=True):
-        if run_cmd(["git", "remote", "get-url", "origin"], cwd=repo_root, env_role="orchestrator").returncode == 0:
-            run_cmd(["git", "fetch", "origin", base_branch], cwd=repo_root, env_role="orchestrator")
+        if run_cmd(git_cmd("remote", "get-url", "origin"), cwd=repo_root, env_role="orchestrator").returncode == 0:
+            run_cmd(git_cmd("fetch", "origin", base_branch), cwd=repo_root, check=True, env_role="orchestrator")
             base_ref = f"origin/{base_branch}"
         else:
             base_ref = base_branch
 
-        base_sha = run_cmd(["git", "rev-parse", base_ref], cwd=repo_root, check=True, env_role="orchestrator").stdout.strip()
+        base_sha = run_cmd(git_cmd("rev-parse", base_ref), cwd=repo_root, check=True, env_role="orchestrator").stdout.strip()
 
         if wt_root.is_dir():
             for wt in sorted(wt_root.iterdir()):
-                if not wt.is_dir():
+                if not wt.is_dir() or wt.name.startswith(".baseline-"):
                     continue
                 if not (wt / ".git").exists():
                     skipped.append(f"{wt.name} (not a git worktree)")
                     continue
-                latest_f = _cache_root() / "runs" / rkey / wt.name / "latest.json"
-                issue_uuid = ""
-                if latest_f.is_file():
-                    try:
-                        issue_uuid = json.loads(latest_f.read_text(encoding="utf-8")).get("issue_uuid", "")
-                    except Exception:
-                        pass
+                issue_uuid, _, owner_err = _read_worktree_lock_owner(repo_root, rkey, wt)
+                if not issue_uuid:
+                    # NEVER fall back to nullcontext(): fail closed even under --all!
+                    skipped.append(f"{wt.name} ({owner_err or 'missing_lock_owner_metadata'}; refusing unsafe delete)")
+                    continue
 
-                lock_ctx = (
-                    file_lock(ticket_lock_path(repo_root, issue_uuid), blocking=False)
-                    if issue_uuid
-                    else contextlib.nullcontext()
-                )
                 try:
-                    with lock_ctx:
-                        dirty = run_cmd(["git", "status", "--porcelain"], cwd=wt, env_role="orchestrator").stdout.strip()
+                    with file_lock(ticket_lock_path(repo_root, issue_uuid), blocking=False):
+                        dirty = run_cmd(git_cmd("status", "--porcelain"), cwd=wt, env_role="orchestrator").stdout.strip()
                         if dirty and not args.all:
                             skipped.append(f"{wt.name} (uncommitted changes)")
                             continue
-                        br = run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=wt, env_role="orchestrator").stdout.strip()
-                        head_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=wt, env_role="orchestrator").stdout.strip()
+                        br = run_cmd(git_cmd("rev-parse", "--abbrev-ref", "HEAD"), cwd=wt, env_role="orchestrator").stdout.strip()
+                        head_sha = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=wt, env_role="orchestrator").stdout.strip()
 
                         is_merged = False
                         if args.all:
                             is_merged = True
                         else:
                             # Verify merged PR specifically matches THIS worktree's current headRefOid!
-                            if gh_repo and br:
-                                pr_m = run_cmd(
-                                    ["gh", "pr", "list", "--repo", gh_repo, "--head", br, "--state", "merged", "--json", "number,headRefOid"],
-                                    cwd=repo_root,
-                                    env_role="orchestrator",
-                                )
+                            if use_gh and br:
+                                pr_cmd = ["gh", "pr", "list", "--head", br, "--state", "merged", "--json", "number,headRefOid"]
+                                if gh_repo:
+                                    pr_cmd += ["--repo", gh_repo]
+                                pr_m = run_cmd(pr_cmd, cwd=repo_root, env_role="orchestrator")
                                 if pr_m.returncode == 0:
                                     for mpr in json.loads(pr_m.stdout or "[]"):
                                         if mpr.get("headRefOid") == head_sha:
@@ -3729,17 +4497,17 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                                             break
                             # Or exact git ancestry (only when branch has commits != base_sha)
                             if not is_merged and head_sha and head_sha != base_sha:
-                                if run_cmd(["git", "merge-base", "--is-ancestor", head_sha, base_sha], cwd=repo_root, env_role="orchestrator").returncode == 0:
+                                if run_cmd(git_cmd("merge-base", "--is-ancestor", head_sha, base_sha), cwd=repo_root, env_role="orchestrator").returncode == 0:
                                     is_merged = True
 
                         if is_merged:
-                            rm_cmd = ["git", "worktree", "remove"] + (["--force"] if args.all else []) + [str(wt)]
+                            rm_cmd = git_cmd("worktree", "remove", *(["--force"] if args.all else []), str(wt))
                             rm_res = run_cmd(rm_cmd, cwd=repo_root, env_role="orchestrator")
                             if rm_res.returncode != 0:
                                 skipped.append(f"{wt.name} (remove failed: {rm_res.stderr.strip()[:120]})")
                                 continue
                             if br and br not in (base_branch, "HEAD"):
-                                del_res = run_cmd(["git", "branch", "-D", br], cwd=repo_root, env_role="orchestrator")
+                                del_res = run_cmd(git_cmd("branch", "-D", br), cwd=repo_root, env_role="orchestrator")
                                 if del_res.returncode != 0:
                                     skipped.append(f"{wt.name} (worktree removed, branch delete failed: {del_res.stderr.strip()[:100]})")
                                     continue
@@ -3748,7 +4516,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                             skipped.append(f"{wt.name} ({br}@{head_sha[:8]}, unmerged or newer local commits)")
                 except RuntimeError:
                     skipped.append(f"{wt.name} (active lock)")
-        run_cmd(["git", "worktree", "prune"], cwd=repo_root, env_role="orchestrator")
+        run_cmd(git_cmd("worktree", "prune"), cwd=repo_root, env_role="orchestrator")
 
     print(json.dumps({"removed": removed, "skipped": skipped}, indent=2, ensure_ascii=False))
     return 0
@@ -3758,6 +4526,13 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
 # CLI Entrypoint
 # ---------------------------------------------------------------------------
 
+def _positive_int(raw: str) -> int:
+    val = int(raw)
+    if val <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer (got {val})")
+    return val
+
+
 def add_exec_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--repo", help="Target git repo path (default: current directory)")
     p.add_argument("--project", default=None, help="Explicit Linear project name or ID")
@@ -3766,8 +4541,10 @@ def add_exec_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--verify-cmd", default=None, help="Override deterministic verification command")
     p.add_argument("--setup-cmd", default=None, help="Override dependency bootstrap command for fresh worktree")
     p.add_argument("--max-rework", type=int, default=2, help="Max rework rounds after initial attempt (default: 2 => 3 total)")
-    p.add_argument("--verify-timeout", type=int, default=900, help="Verify timeout seconds (default: 900)")
-    p.add_argument("--setup-timeout", type=int, default=600, help="Bootstrap timeout seconds (default: 600)")
+    p.add_argument("--verify-timeout", type=_positive_int, default=900, help="Verify timeout seconds (default: 900)")
+    p.add_argument("--setup-timeout", type=_positive_int, default=600, help="Bootstrap timeout seconds (default: 600)")
+    p.add_argument("--worker-timeout", type=_positive_int, default=1800, help="Worker harness timeout seconds (default: 1800)")
+    p.add_argument("--review-timeout", type=_positive_int, default=900, help="Review harness timeout seconds (default: 900)")
     p.add_argument("--no-push", action="store_true", help="Local dry run: skip Linear mutations, push, and PR")
     p.add_argument("--allow-no-verify", action="store_true", help="Allow passing when no verify command is detected")
     p.add_argument("--allow-gate-edits", action="store_true", help="Allow worker edits to protected gate/policy files")
@@ -3808,23 +4585,24 @@ def main() -> int:
     p_resume.set_defaults(func=cmd_resume)
 
     p_front = sub.add_parser("frontier", help="Dispatch non-overlapping wave of ready Todo tickets")
-    p_front.add_argument("--max-parallel", type=int, default=2, help="Max parallel worktrees (default: 2)")
-    p_front.add_argument("--limit", type=int, default=None, help="Max tickets to dispatch in this wave")
+    p_front.add_argument("--max-parallel", type=_positive_int, default=2, help="Max parallel worktrees (default: 2)")
+    p_front.add_argument("--limit", type=_positive_int, default=None, help="Max tickets to dispatch in this wave")
     add_exec_flags(p_front)
     p_front.set_defaults(func=cmd_frontier)
 
     p_spec = sub.add_parser("spec", help="Dispatch current ready unblocked wave of a parent Spec issue")
     p_spec.add_argument("parent_issue", help="Parent Linear Spec identifier (e.g., K1N-10)")
-    p_spec.add_argument("--max-parallel", type=int, default=2, help="Max parallel worktrees (default: 2)")
-    p_spec.add_argument("--limit", type=int, default=None, help="Max tickets to dispatch in this wave")
+    p_spec.add_argument("--max-parallel", type=_positive_int, default=2, help="Max parallel worktrees (default: 2)")
+    p_spec.add_argument("--limit", type=_positive_int, default=None, help="Max tickets to dispatch in this wave")
     add_exec_flags(p_spec)
     p_spec.set_defaults(func=cmd_spec)
 
-    p_rev = sub.add_parser("review", help="Run standalone SHA-locked heterogeneous Two-Axis Review")
+    p_rev = sub.add_parser("review", help="Run standalone SHA-locked heterogeneous review (Standards + optional Spec)")
     p_rev.add_argument("--repo", default=None, help="Target git repo path")
     p_rev.add_argument("--base", default=None, help="Base ref to diff against (default: origin/<default>)")
     p_rev.add_argument("--issue", default=None, help="Optional Linear issue ID for Spec axis")
     p_rev.add_argument("--reviewer", default="agy:neon", help="Reviewer harness spec (default: agy:neon)")
+    p_rev.add_argument("--review-timeout", type=_positive_int, default=900, help="Review harness timeout seconds (default: 900)")
     p_rev.set_defaults(func=cmd_review)
 
     p_stat = sub.add_parser("status", help="Inspect Linear frontier, zombie runs, locks, and worktrees")
