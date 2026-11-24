@@ -1,6 +1,6 @@
 # Domain Docs: GLOSSARY.md & ADRs
 
-Create files lazily—only when the first domain term or ADR is needed. Commit and push accepted doc changes before running `/dispatch` so isolated worktrees see the current rules.
+Create files lazily—only when the first domain term or ADR is needed. Ensure approved doc changes have landed on the dispatch target base branch via your normal authorized commit/PR flow before running `/dispatch`.
 
 ## GLOSSARY.md
 Location: repo root `GLOSSARY.md` (or `GLOSSARY-MAP.md` pointing to per-context `GLOSSARY.md` in multi-context monorepos).
@@ -44,4 +44,4 @@ When a new architectural decision invalidates an older ADR:
 1. Change the old ADR's frontmatter `status:` to `superseded by ADR-NNNN` and add a 1-line pointer at the top.
 2. Write the new ADR referencing the old one.
 3. Update `GLOSSARY.md` if domain boundaries changed.
-4. Commit and merge/push these doc changes before starting downstream implementation slices (reverting a cancelled architecture is then a clean `git revert`).
+4. Land these doc updates on the target base branch before starting downstream implementation slices (reverting a cancelled architecture is then a clean `git revert`).

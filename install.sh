@@ -2,32 +2,56 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TS="$(date +%Y%m%d-%H%M%S)"
 
-mkdir -p /root/.agent/skills /root/.codex/skills /usr/local/bin
+AGENT_SKILLS_DIR="${AGENT_SKILLS_DIR:-/root/.agent/skills}"
+CODEX_SKILLS_DIR="${CODEX_SKILLS_DIR:-/root/.codex/skills}"
+CODEX_AGENTS_MD="${CODEX_AGENTS_MD:-/root/.codex/AGENTS.md}"
+BIN_TARGET="${BIN_TARGET:-/usr/local/bin/agent-dispatch}"
 
-# Remove stale symlinks/dirs in /root/.agent/skills not in our workflow roster
-ROSTER=(grill spec slice dispatch diagnose research retro)
-for existing in /root/.agent/skills/*; do
-  [ -e "$existing" ] || [ -L "$existing" ] || continue
-  base="$(basename "$existing")"
-  keep=0
-  for s in "${ROSTER[@]}"; do
-    if [ "$base" = "$s" ]; then keep=1; break; fi
-  done
-  if [ "$keep" -eq 0 ]; then
-    rm -rf "$existing"
+mkdir -p "$AGENT_SKILLS_DIR" "$CODEX_SKILLS_DIR" "$(dirname "$CODEX_AGENTS_MD")" "$(dirname "$BIN_TARGET")"
+
+# Full designer roster for Antigravity
+AGENT_ROSTER=(grill spec slice dispatch diagnose research retro)
+# Execution/interactive roster for Codex (deliberately excludes orchestrator skills: dispatch, slice, spec)
+CODEX_ROSTER=(grill diagnose research retro)
+
+link_managed() {
+  local src="$1"
+  local dst="$2"
+  if [ -L "$dst" ]; then
+    rm -f "$dst"
+  elif [ -e "$dst" ]; then
+    local bak="${dst}.bak.${TS}"
+    mv "$dst" "$bak"
+    echo "Backed up existing non-symlink $dst -> $bak"
   fi
+  ln -s "$src" "$dst"
+}
+
+# Clean ONLY stale symlinks that previously pointed into this workflow repo
+for dir in "$AGENT_SKILLS_DIR" "$CODEX_SKILLS_DIR"; do
+  for entry in "$dir"/*; do
+    [ -L "$entry" ] || continue
+    target="$(readlink "$entry" || true)"
+    case "$target" in
+      "$ROOT"/skills/*)
+        rm -f "$entry"
+        ;;
+    esac
+  done
 done
 
-for s in "${ROSTER[@]}"; do
-  rm -rf "/root/.agent/skills/$s" "/root/.codex/skills/$s"
-  ln -s "$ROOT/skills/$s" "/root/.agent/skills/$s"
-  ln -s "$ROOT/skills/$s" "/root/.codex/skills/$s"
+for s in "${AGENT_ROSTER[@]}"; do
+  link_managed "$ROOT/skills/$s" "$AGENT_SKILLS_DIR/$s"
 done
 
-rm -f /root/.codex/AGENTS.md /usr/local/bin/agent-dispatch
-ln -s "$ROOT/codex/AGENTS.md" /root/.codex/AGENTS.md
+for s in "${CODEX_ROSTER[@]}"; do
+  link_managed "$ROOT/skills/$s" "$CODEX_SKILLS_DIR/$s"
+done
+
+link_managed "$ROOT/codex/AGENTS.md" "$CODEX_AGENTS_MD"
 chmod 755 "$ROOT/bin/agent-dispatch"
-ln -s "$ROOT/bin/agent-dispatch" /usr/local/bin/agent-dispatch
+link_managed "$ROOT/bin/agent-dispatch" "$BIN_TARGET"
 
-echo "Installed workflow from $ROOT -> ~/.agent/skills, ~/.codex/skills, ~/.codex/AGENTS.md, /usr/local/bin/agent-dispatch"
+echo "Installed workflow from $ROOT (non-destructive, preserving unrelated skills/files)"

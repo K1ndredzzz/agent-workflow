@@ -16,7 +16,7 @@ Read `GLOSSARY.md` (or `GLOSSARY-MAP.md`), active files in `docs/adr/`, and rele
 Whenever the proposed direction contradicts an existing ADR or glossary term, surface the conflict immediately. Once the user approves the new direction:
 - Draft the updated `GLOSSARY.md` and ADR changes (marking superseded ADRs with frontmatter `status: superseded by ADR-NNNN`).
 - See [references/domain-docs.md](references/domain-docs.md) for exact formats and the 3-criteria ADR bar.
-- **Important handoff rule**: Downstream `/dispatch` worktrees branch from `origin/<default>`. Commit and push approved `GLOSSARY.md` / `docs/adr/` changes (or merge a dedicated docs PR) **before** running `/dispatch`, otherwise headless workers and reviewers will read stale rules.
+- **Base-branch handoff rule**: Downstream `/dispatch` worktrees branch from `origin/<default>`. Ensure approved `GLOSSARY.md` / `docs/adr/` updates have landed on the target base branch via your repository's normal authorized commit/PR flow before running `/dispatch`.
 
 ### 3. Work the design tree in anti-fatigue rounds
 Split open decisions into two buckets:
@@ -36,8 +36,8 @@ When designing a high-leverage module interface or testing seam, consult [refere
 - Cross-reference user claims against actual code; surface contradictions immediately.
 
 ### 5. Completion & Next-Step Router
-Stop when the high-risk frontier is empty and the user confirms shared understanding. Output a concise **Consensus Summary** (decisions, pending doc commits, open assumptions) and recommend the single best next step:
+Stop when the high-risk frontier is empty and the user confirms shared understanding. Output a concise **Consensus Summary** (decisions, pending doc updates, open assumptions) and recommend the single best next step:
 - Multi-ticket feature -> **`/spec`**
 - Small, clear multi-slice change -> **`/slice`**
-- Single-slice task -> create one Linear `Todo` issue using [dispatch/references/agent-brief.md](../dispatch/references/agent-brief.md) and run **`/dispatch <ID>`**
+- Single-slice task -> create one Linear `Todo` issue (`agent-ready`) using [dispatch/references/agent-brief.md](../dispatch/references/agent-brief.md) and run **`/dispatch <ID>`**
 - Still too ambiguous to grill -> switch to **`/research`** (Wayfinder mode)

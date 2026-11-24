@@ -5,18 +5,16 @@ description: Conduct a retrospective on recent sessions, agent-dispatch runs, or
 
 # Retro (Environment & Guardrail Improvement)
 
-Inspect recent session transcripts, `~/.cache/agent-dispatch/runs/` logs, git history, or PR review findings and upgrade the engineering environment based on failure frequency, miss cost, and false-positive risk.
+Inspect recent session transcripts, `~/.cache/agent-dispatch/runs/` logs (`sessions.jsonl`, `*.log`, `state.json`), git history, or PR review findings and upgrade the engineering environment based on failure frequency, miss cost, and false-positive risk.
 
 ## Hierarchy of Fixes
 1. **Deterministic Guardrails FIRST (for recurring mechanical errors)**: Turn repeated mechanical failures (banned API, broken wiring, missing format/lint/typecheck/test command) into linter rules, pre-commit hooks, or repo verify scripts—weighing maintenance and false-positive cost rather than automating one-off flukes.
-2. **`CODING_STANDARDS.md` SECOND (judgement calls)**: Document conventions linters cannot check (architectural boundaries, naming craft, domain consistency). Keep high-priority repo rules discoverable via a short pointer in `AGENTS.md` so implementation workers do not get blindsided during review.
-3. **Lean `AGENTS.md` & Skills THIRD**: Keep `AGENTS.md` minimal—navigation pointers and non-obvious gotchas only. Since custom skills and `agent-dispatch` live under version control (`/root/.agent/workflow`), review diffs cleanly and commit changes after verification.
+2. **`CODING_STANDARDS.md` SECOND (judgement calls)**: Document conventions linters cannot check (architectural boundaries, naming craft, domain consistency). Keep high-priority repo rules discoverable via `AGENTS.md` so implementation workers do not get blindsided during review.
+3. **Lean `AGENTS.md` & Skills THIRD**: Keep `AGENTS.md` minimal—navigation pointers and non-obvious gotchas only.
 
-## Audit Checklist
-- **Automated checks**: missing/unwired verify scripts, flaky tests, slow bootstrap.
-- **Review misses & false positives**: patterns where reviewers missed real bugs or rejected valid changes.
-- **Navigation & context waste**: places agents burned turns hunting for files, commands, or logs.
-- **Doc hygiene**: stale ADRs missing `superseded` status, duplicated rules across global/repo docs, no-op instructions.
+## Applying Approved Governance Changes
+- Because verify scripts, linters, `CODING_STANDARDS.md`, and `docs/adr/*` are **protected paths** under `/dispatch`, apply approved repo-governance edits directly in the Designer session (or on a dedicated ticket with explicit `## Authorized Gate/Test Changes` / `--allow-gate-edits`).
+- Global skill and `agent-dispatch` updates live in `/root/.agent/workflow` (git-tracked with unit & E2E tests): run `python3 -m unittest discover -s /root/.agent/workflow/tests -v` before committing.
 
 ## Agent-Doc Writing Rules
 - **Single source of truth**: keep each rule in one file and link via sharp pointers (`what it is` + `when to open it`).

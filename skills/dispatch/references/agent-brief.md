@@ -12,13 +12,16 @@ End-to-end observable behavior this ticket delivers from the caller/user perspec
 - Public types, function signatures, schemas, invariants, and error modes.
 
 ## Touches
-- Module or shared-resource areas likely modified (e.g., `auth`, `migrations`, `routes`, `package.json`). Used to serialize overlapping parallel slices.
+- Module or shared-resource areas likely modified (e.g., `auth`, `migrations`, `src/routes`, `package.json`). Used to serialize overlapping parallel slices.
 
 ## Testing Seam & Acceptance Criteria
 - **Seam**: <agreed public boundary>
 - **Verify**: <repo check command if non-default, otherwise "repo default">
 - [ ] Concrete, independently verifiable criterion 1
 - [ ] Concrete, independently verifiable criterion 2
+
+## Authorized Gate/Test Changes
+- None (list explicitly only if this ticket is authorized to edit gate/config files or migrate/remove legacy tests)
 
 ## Out of Scope
 - Explicit non-goals to prevent scope creep

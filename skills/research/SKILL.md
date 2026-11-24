@@ -17,7 +17,7 @@ Use for library evaluation, API/protocol investigation, or technical writing:
 Use **only** when the user explicitly wants to map a large ambiguous effort before grilling:
 1. Define the **destination** first.
 2. Propose a Linear **Map Parent Issue** (`Backlog`, label `spec`) + child **Decision Tickets** (`Backlog`, titled `[Research] ...`, `[Prototype] ...`, `[Grill] ...`, or `[Task] ...`) linked via native `blockedBy` edges. Wait for confirmation before writing to Linear.
-3. Because decision tickets stay in `Backlog` with explicit prefixes, `agent-dispatch frontier` will never mis-dispatch them.
+3. Because decision tickets stay in `Backlog` with explicit prefixes (`[Research]`/`[Prototype]`/`[Grill]`/`[Task]`/`[Map]`), `agent-dispatch frontier` will never mis-dispatch them.
 4. Resolve ready decision tickets sequentially in the same session (recording settled conclusions and ADRs) until fog clears, then convert settled areas via `/spec` -> `/slice` -> `/dispatch`.
 
 ## Branch C — Architecture Deepening Audit (Read-Only)

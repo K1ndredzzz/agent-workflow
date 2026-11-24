@@ -17,7 +17,8 @@ Synthesize already-settled design consensus into a durable Parent Spec on **Line
 2. **Verify testing seams**: Reuse seams already agreed during `/grill`. Only pause for a single confirmation if seams were not yet settled or if independent persistence/compatibility contracts need an additional seam.
 3. **Draft the Spec** using the template below. Keep it behavioral and durable (no fragile line numbers; include a prototype type/schema snippet only when it expresses an invariant more precisely than prose).
 4. **Publish to Linear as a Parent Container**:
-   - Create (or update if re-running for the same feature) the Parent Issue in the matched Project with state **`Backlog`** and label **`spec`** (so `agent-dispatch frontier` never mis-dispatches an unsliced Spec as a coding ticket).
+   - Check existing `Backlog` / `spec`-labeled issues in the Project before creating to avoid duplicates; update by ID when revising an existing Spec.
+   - Set state **`Backlog`** and label **`spec`** (`agent-dispatch` refuses `spec`-labeled issues in both `frontier` and direct `run`).
 5. **Next-Step Router**: Print the Linear Spec ID + URL and recommend: **`/slice <ID>`**.
 
 ## Spec Template
