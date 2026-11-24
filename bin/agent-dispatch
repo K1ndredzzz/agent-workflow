@@ -461,7 +461,10 @@ def redact_secrets(text: str) -> str:
 
 def redact_data(value: Any) -> Any:
     if isinstance(value, dict):
-        return {redact_secrets(k): redact_data(v) for k, v in value.items()}
+        return {
+            redact_secrets(k): _REDACTED if str(k).lower() in {"authorization", "proxy-authorization"} else redact_data(v)
+            for k, v in value.items()
+        }
     if isinstance(value, list):
         return [redact_data(v) for v in value]
     if isinstance(value, str):
@@ -593,44 +596,85 @@ def build_child_env(*, role: str = "child") -> dict[str, str]:
 
 class _RedactedLog:
     """Buffer partial lines so a token split across pipe reads never reaches disk."""
-    def __init__(self, path: Path, stack: contextlib.ExitStack) -> None:
+    line_limit = 2 * 1024 * 1024
+
+    def __init__(self, path: Path, stack: contextlib.ExitStack, capture: _BoundedBuffer | None = None) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.file = stack.enter_context(path.open("w", encoding="utf-8"))
+        self.capture = capture
         self.pending = bytearray()
         self.in_pem = False
+        self.discarding = False
+        self.discarding_json = False
+        self.marker_tail = ""
+
+    def _emit(self, line: str) -> None:
+        self.file.write(line)
+        if self.capture is not None:
+            self.capture.append(line.encode("utf-8"))
+
+    def _discard_fragment(self, part: bytes) -> None:
+        if self.discarding_json:
+            return
+        # An omitted plain-text line can start/end a multiline PRIVATE KEY PEM across pipe reads.
+        text = self.marker_tail + part.decode("ascii", errors="replace")
+        starts = list(_PEM_START.finditer(text))
+        if starts:
+            self.in_pem = True
+            after = starts[-1].end()
+        else:
+            after = 0
+        if self.in_pem and _PEM_END.search(text, after):
+            self.in_pem = False
+        self.marker_tail = text[-128:]
 
     def write(self, chunk: bytes) -> None:
-        self.pending.extend(chunk)
-        end = self.pending.rfind(b"\n") + 1 if chunk else len(self.pending)
-        if not end:
-            return
-        complete = self.pending[:end].decode("utf-8", errors="replace")
-        del self.pending[:end]
-        for line in re.findall(r"[^\n]*\n|[^\n]+$", complete):
-            if not self.in_pem:
-                # Parse self-contained JSON dicts first so a truncated PEM header inside JSON
-                # cannot poison multiline plain-text PEM state for subsequent log lines.
-                try:
-                    event = json.loads(line) if line.lstrip().startswith("{") else None
-                except ValueError:
-                    event = None
-                if isinstance(event, dict):
-                    if event.get("type") in ("message_update", "item.updated"):
-                        # Deltas can split the same credential across multiple JSON events.
-                        event = {"type": event["type"]}
-                    self.file.write(safe_json(event, ensure_ascii=False) + "\n")
-                    continue
-            if self.in_pem:
-                match = _PEM_END.search(line)
-                if not match:
-                    continue
-                line = line[match.end():]
-                self.in_pem = False
-            starts = list(_PEM_START.finditer(line))
-            if starts and not _PEM_END.search(line, starts[-1].end()):
-                self.in_pem = True
-            self.file.write(redact_secrets(line))
+        for part in chunk.splitlines(keepends=True) if chunk else [b""]:
+            complete = part.endswith(b"\n") or not chunk
+            if not self.discarding and len(self.pending) + len(part) > self.line_limit:
+                self.discarding = True
+                prefix = bytes(self.pending) or part
+                self.discarding_json = (not self.in_pem) and prefix.lstrip().startswith(b"{")
+                self._discard_fragment(bytes(self.pending))
+                self.pending.clear()
+                self._emit("...[oversized diagnostic line omitted]...\n")
+            if self.discarding:
+                self._discard_fragment(part)
+            else:
+                self.pending.extend(part)
+            if complete:
+                if self.pending:
+                    self._write_line(self.pending.decode("utf-8", errors="replace"))
+                    self.pending.clear()
+                self.discarding = False
+                self.discarding_json = False
+                self.marker_tail = ""
         self.file.flush()
+
+    def _write_line(self, line: str) -> None:
+        if not self.in_pem:
+            # Parse self-contained JSON dicts first so a truncated PEM header inside JSON
+            # cannot poison multiline plain-text PEM state for subsequent log lines.
+            try:
+                event = json.loads(line) if line.lstrip().startswith("{") else None
+            except ValueError:
+                event = None
+            if isinstance(event, dict):
+                if event.get("type") in ("message_update", "item.updated"):
+                    # Deltas can split the same credential across multiple JSON events.
+                    event = {"type": event["type"]}
+                self._emit(safe_json(event, ensure_ascii=False) + "\n")
+                return
+        if self.in_pem:
+            match = _PEM_END.search(line)
+            if not match:
+                return
+            line = line[match.end():]
+            self.in_pem = False
+        starts = list(_PEM_START.finditer(line))
+        if starts and not _PEM_END.search(line, starts[-1].end()):
+            self.in_pem = True
+        self._emit(redact_secrets(line))
 
 
 class _BoundedBuffer:
@@ -662,9 +706,12 @@ class _BoundedBuffer:
         if len(self.tail) > self.tail_limit * 2:
             del self.tail[: len(self.tail) - self.tail_limit]
 
-    def decode(self) -> str:
+    def decode(self, *, redacted: bool) -> str:
         if not self.truncated:
             return self.head.decode("utf-8", errors="replace")
+        if not redacted:
+            # Raw protocol bytes at a truncation boundary can contain a credential fragment.
+            return "...[truncated]..."
         head_s = self.head.decode("utf-8", errors="replace")
         tail_s = self.tail[-self.tail_limit :].decode("utf-8", errors="replace")
         if "\n" in head_s:
@@ -706,9 +753,10 @@ def run_cmd(
             pass
 
     with contextlib.ExitStack() as stack:
-        logs = {name: _RedactedLog(path, stack) for name, path in (
-            ("stdout", stdout_path), ("stderr", stderr_path),
-        ) if path is not None}
+        cap_bytes = DISPLAY_OUTPUT_CAP if cap_output else None
+        buffers = {name: _BoundedBuffer(cap_bytes) for name in ("stdout", "stderr")}
+        logs = {name: _RedactedLog(path, stack, buffers[name] if cap_output else None)
+                for name, path in (("stdout", stdout_path), ("stderr", stderr_path)) if path is not None}
         proc = subprocess.Popen(
             cmd, cwd=cwd, shell=shell, env=env, start_new_session=True,
             stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
@@ -718,8 +766,6 @@ def run_cmd(
         try:
             selector = stack.enter_context(selectors.DefaultSelector())
             assert proc.stdout is not None and proc.stderr is not None
-            cap_bytes = DISPLAY_OUTPUT_CAP if cap_output else None
-            buffers = {"stdout": _BoundedBuffer(cap_bytes), "stderr": _BoundedBuffer(cap_bytes)}
             for name, pipe in (("stdout", proc.stdout), ("stderr", proc.stderr)):
                 stack.enter_context(pipe)
                 os.set_blocking(pipe.fileno(), False)
@@ -763,7 +809,8 @@ def run_cmd(
                         chunk = os.read(key.fd, 65536)
                     except BlockingIOError:
                         continue
-                    buffers[key.data].append(chunk)
+                    if not cap_output or key.data not in logs:
+                        buffers[key.data].append(chunk)
                     if key.data in logs:
                         logs[key.data].write(chunk)
                     if not chunk:
@@ -791,8 +838,8 @@ def run_cmd(
             raise
         finally:
             _unregister_active_pgid(proc.pid)
-        stdout = buffers["stdout"].decode()
-        stderr = buffers["stderr"].decode()
+        stdout = buffers["stdout"].decode(redacted="stdout" in logs)
+        stderr = buffers["stderr"].decode(redacted="stderr" in logs)
 
     result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
     if check and result.returncode != 0:
@@ -1344,13 +1391,14 @@ def _normalize_touch_token(raw: str) -> str | None:
     while tok.startswith("./"):
         tok = tok[2:]
     tok = re.sub(r"/{2,}", "/", tok).strip("/")
-    while tok.endswith("/**") or tok.endswith("/*"):
-        tok = tok.rsplit("/", 1)[0].strip("/")
     if not tok or tok in (".", "*", "**", "all"):
         return None
     parts = [p for p in tok.split("/") if p and p != "."]
     if not parts or any(p == ".." for p in parts):
         return None
+    for i, part in enumerate(parts):
+        if any(char in part for char in "*?["):
+            return "/".join(parts[:i]) or None
     return "/".join(parts)
 
 
@@ -1376,7 +1424,7 @@ def parse_touches(description: str) -> set[str]:
             continue
         if not in_section or not stripped or stripped.startswith(">"):
             continue
-        cleaned = re.sub(r"^[\s\-*`]+|[\s`]+$", "", stripped).strip()
+        cleaned = re.sub(r"^[-*+]\s+", "", stripped, count=1)
         if not cleaned or cleaned.lower() in ("none", "n/a", "nil"):
             continue
         for part in re.split(r"[,;]+", cleaned):
@@ -1747,8 +1795,7 @@ def prepare_worktree(
                 ensure_dispatch_excluded(wt_dir)
                 if issue_uuid:
                     write_worktree_owner(wt_dir, identifier, issue_uuid, repo_id, branch)
-                mb = run_cmd(git_cmd("merge-base", base_sha, "HEAD"), cwd=wt_dir, check=True, env_role="orchestrator").stdout.strip()
-                return wt_dir, branch, mb
+                return wt_dir, branch, base_sha
 
         branch_exists = run_cmd(git_cmd("rev-parse", "--verify", f"refs/heads/{branch}"), cwd=repo_root, env_role="orchestrator").returncode == 0
         if branch_exists and fresh:
@@ -1757,11 +1804,10 @@ def prepare_worktree(
 
         if branch_exists:
             run_cmd(git_cmd("worktree", "add", str(wt_dir), branch), cwd=repo_root, check=True, env_role="orchestrator")
-            mb = run_cmd(git_cmd("merge-base", base_sha, "HEAD"), cwd=wt_dir, check=True, env_role="orchestrator").stdout.strip()
             ensure_dispatch_excluded(wt_dir)
             if issue_uuid:
                 write_worktree_owner(wt_dir, identifier, issue_uuid, repo_id, branch)
-            return wt_dir, branch, mb
+            return wt_dir, branch, base_sha
 
         run_cmd(git_cmd("worktree", "add", "-b", branch, str(wt_dir), base_sha), cwd=repo_root, check=True, env_role="orchestrator")
         ensure_dispatch_excluded(wt_dir)
@@ -1951,8 +1997,21 @@ def _unittest_can_discover(tests_dir: Path, files: list[Path]) -> bool:
 
 
 def _repo_has_js_tests(worktree: Path) -> bool:
-    return (any((worktree / d).is_dir() for d in ("tests", "test", "__tests__"))
-            or any(p.suffix != ".py" for p in _test_source_files(worktree)))
+    if any(p.suffix != ".py" for p in _test_source_files(worktree)):
+        return True
+    for d in ("tests", "test", "__tests__"):
+        root = worktree / d
+        if not root.is_dir():
+            continue
+        files = [
+            p for p in root.rglob("*")
+            if p.is_file() and "__pycache__" not in p.parts
+        ]
+        # Empty test dir or any non-Python file signals possible JS tests;
+        # a tests/ dir containing exclusively Python files belongs to Python.
+        if not files or any(p.suffix not in (".py", ".pyc") for p in files):
+            return True
+    return False
 
 
 def detect_verify_command(worktree: Path, explicit_cmd: str | None) -> str | None:
@@ -1974,6 +2033,7 @@ def detect_verify_command(worktree: Path, explicit_cmd: str | None) -> str | Non
             if re.search(rf"^{target}\s*:(?!=)", txt, re.M):
                 return f"make {target}"
 
+    commands: list[str] = []
     pkg = worktree / "package.json"
     if pkg.is_file():
         try:
@@ -1986,56 +2046,77 @@ def detect_verify_command(worktree: Path, explicit_cmd: str | None) -> str | Non
                 pm = "yarn"
             else:
                 pm = "npm run"
-            cmds = [f"{pm} {s}" for s in ("typecheck", "lint", "test") if s in scripts]
+            js_cmds = [f"{pm} {s}" for s in ("typecheck", "lint", "test") if s in scripts]
             # Never pass lint-only JS repo if JS test files/dirs exist without a `test` script!
             if "test" not in scripts and _repo_has_js_tests(worktree):
                 return None
-            if cmds:
-                return " && ".join(cmds)
-        except Exception:
-            pass
+            commands.extend(js_cmds)
+        except (OSError, ValueError, AttributeError, TypeError):
+            return None
 
     if (worktree / "Cargo.toml").is_file():
-        return "cargo clippy --all-targets && cargo test"
+        commands.extend(["cargo clippy --all-targets", "cargo test"])
 
     python_config = (worktree / "pyproject.toml").is_file() or (worktree / "pytest.ini").is_file()
     py_tests = [p for p in _test_source_files(worktree) if p.suffix == ".py"]
     if python_config or py_tests:
-        cmds: list[str] = []
         if python_config and shutil.which("ruff"):
-            cmds.append("ruff check .")
+            commands.append("ruff check .")
         if (worktree / ".venv" / "bin" / "pytest").is_file():
-            cmds.append(".venv/bin/pytest")
+            commands.append(".venv/bin/pytest")
         elif (worktree / "uv.lock").is_file() and shutil.which("uv"):
-            cmds.append("uv run pytest")
+            commands.append("uv run pytest")
         elif not python_config and _unittest_can_discover(worktree / "tests", py_tests):
-            cmds.append("python3 -m unittest discover -s tests")
+            commands.append("python3 -m unittest discover -s tests")
         elif shutil.which("pytest"):
-            cmds.append("pytest")
+            commands.append("pytest")
         elif _unittest_can_discover(worktree / "tests", py_tests):
-            cmds.append("python3 -m unittest discover -s tests")
+            commands.append("python3 -m unittest discover -s tests")
         elif py_tests or (worktree / "tests").is_dir() or (worktree / "pytest.ini").is_file():
             return None
-        if cmds:
-            return " && ".join(cmds)
 
     if (worktree / "go.mod").is_file():
-        return "go vet ./... && go test ./..."
+        commands.extend(["go vet ./...", "go test ./..."])
 
-    return None
+    return " && ".join(commands) or None
 
 
-def _clean_benign_tool_caches(worktree: Path) -> None:
-    """Prune Python/tool caches without traversing .git/.venv/node_modules."""
-    skip_dirs = {".git", ".venv", "venv", "node_modules"}
-    targets = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
-    for root, dirs, _ in os.walk(worktree):
-        for d in list(dirs):
-            if d in skip_dirs:
-                dirs.remove(d)
-            elif d in targets:
-                shutil.rmtree(Path(root) / d, ignore_errors=True)
-                dirs.remove(d)
+def _untracked_files(worktree: Path, *, ignore_shutdown: bool = False) -> set[str]:
+    listing = run_cmd(git_cmd("ls-files", "--others", "--exclude-standard", "-z"),
+                      cwd=worktree, check=True, env_role="orchestrator", cap_output=False, ignore_shutdown=ignore_shutdown)
+    return set(listing.stdout.split("\0")) - {""}
+
+
+def _file_identity(path: Path) -> tuple[int, int, int, int]:
+    st = path.lstat()
+    return st.st_dev, st.st_ino, st.st_ctime_ns, st.st_size
+
+
+def _active_setup_files(worktree: Path, files: dict[str, tuple[int, int, int, int]]) -> dict[str, tuple[int, int, int, int]]:
+    active: dict[str, tuple[int, int, int, int]] = {}
+    for name, ident in files.items():
+        path = worktree / name
+        if os.path.lexists(path):
+            try:
+                if _file_identity(path) == ident:
+                    active[name] = ident
+            except OSError:
+                continue
+    return active
+
+
+def _release_setup_files(worktree: Path, files: dict[str, tuple[int, int, int, int]]) -> None:
+    if not files:
+        return
+    try:
+        wt_resolved = worktree.resolve()
+        for name in files.keys() & _untracked_files(worktree, ignore_shutdown=True):
+            path = worktree / name
+            if path.parent.resolve().is_relative_to(wt_resolved) and (path.is_file() or path.is_symlink()):
+                if _file_identity(path) == files[name]:
+                    path.unlink()
+    except (OSError, RuntimeError) as exc:
+        log(f"Could not release setup output: {redact_secrets(str(exc))}")
 
 
 def run_verify_gate(
@@ -2058,65 +2139,47 @@ def run_verify_gate(
             "output": "No verification command detected. Pass --verify-cmd or configure a repo check script (or --allow-no-verify).",
         }
     log(f"Running verification gate: {verify_cmd}")
-    def branch_and_head() -> tuple[str, ...]:
-        status = run_cmd(
-            git_cmd("status", "--porcelain=v2", "-z", "--branch", "--untracked-files=no"),
-            cwd=worktree, check=True, env_role="orchestrator",
-        ).stdout
-        return tuple(s for s in status.split("\0") if s.startswith(("# branch.head ", "# branch.oid ")))
+    def tracked_status() -> tuple[list[str], list[str]]:
+        status = run_cmd(git_cmd("status", "--porcelain=v2", "--branch", "--untracked-files=no",
+                                 "--no-renames", "-z"),
+                         cwd=worktree, check=True, env_role="orchestrator", cap_output=False)
+        records = list(filter(None, status.stdout.split("\0")))
+        return [r for r in records if r.startswith("# branch.")], [r for r in records if not r.startswith("# ")]
 
     with file_lock(_cache_root() / "locks" / f"verify-{repo_key}.lock", blocking=True):
-        original = branch_and_head()
+        original, dirty_before = tracked_status()
+        if dirty_before:
+            raise RuntimeError("Verification requires tracked files to match the candidate commit. Existing edits were preserved.")
+        prior_files = _untracked_files(worktree)
         try:
             res = run_cmd(
-                verify_cmd,
-                cwd=worktree,
-                shell=True,
-                timeout=timeout,
-                env_role="child",
-                stdout_path=log_file,
-                stderr_path=log_file.with_suffix(".stderr.log"),
+                verify_cmd, cwd=worktree, shell=True, timeout=timeout, env_role="child",
+                stdout_path=log_file, stderr_path=log_file.with_suffix(".stderr.log"),
             )
+            rc = res.returncode
+            output = (res.stdout + "\n" + res.stderr).strip()
         except subprocess.TimeoutExpired:
-            return {
-                "ran": True,
-                "passed": False,
-                "command": verify_cmd,
-                "returncode": 124,
-                "output": f"Verification timed out after {timeout}s (see {log_file}).",
-            }
-        finally:
-            if not _is_shutdown_requested() and branch_and_head() != original:
-                raise RuntimeError("Verification changed the worktree branch or HEAD. Inspect the worktree before rerunning.")
-    combined = (res.stdout + "\n" + res.stderr).strip()
-    if (res.returncode == 0 and "unittest discover" in verify_cmd
-            and re.search(r"^Ran 0 tests? in ", combined, re.M)):
-        return {"ran": True, "passed": False, "command": verify_cmd, "returncode": 0,
-                "output": "unittest discovery collected zero tests."}
-    _clean_benign_tool_caches(worktree)
-    tracked_dirty = run_cmd(
-        git_cmd("status", "--porcelain", "--untracked-files=no"), cwd=worktree, env_role="orchestrator"
-    ).stdout.strip()
-    if res.returncode == 0 and tracked_dirty:
-        return {
-            "ran": True,
-            "passed": False,
-            "command": verify_cmd,
-            "returncode": 0,
-            "output": f"Verification mutated tracked files (uncommitted changes left behind):\n{tracked_dirty}",
-        }
-    # Clean untracked verify artifacts (e.g., coverage.xml, junit.xml) so they never pollute next commit or review!
-    untracked_dirty = run_cmd(git_cmd("status", "--porcelain"), cwd=worktree, env_role="orchestrator").stdout.strip()
-    if res.returncode == 0 and untracked_dirty:
-        log(f"Cleaning untracked artifacts generated by verify command: {untracked_dirty.splitlines()[:5]}")
-        run_cmd(git_cmd("clean", "-fd", "-e", ".dispatch"), cwd=worktree, env_role="orchestrator")
-    return {
-        "ran": True,
-        "passed": res.returncode == 0,
-        "command": verify_cmd,
-        "returncode": res.returncode,
-        "output": redact_secrets(combined)[-4000:],
-    }
+            rc = 124
+            output = f"Verification timed out after {timeout}s (see {log_file})."
+
+        branch, dirty_after = tracked_status()
+        if branch != original:
+            raise RuntimeError("Verification changed the worktree branch or HEAD. Inspect the worktree before rerunning.")
+        passed = rc == 0
+        if dirty_after:
+            run_cmd(git_cmd("reset", "--hard", "HEAD"), cwd=worktree, check=True, env_role="orchestrator")
+            if passed:
+                passed = False
+                output = "Verification mutated tracked files: " + repr(dirty_after[:5])
+        added = sorted(_untracked_files(worktree) - prior_files)
+        for offset in range(0, len(added), 100):
+            run_cmd(git_cmd("--literal-pathspecs", "clean", "-fd", "-e", ".dispatch", "--", *added[offset:offset + 100]),
+                    cwd=worktree, check=True, env_role="orchestrator")
+        if passed and "unittest discover" in verify_cmd and re.search(r"^Ran 0 tests? in ", output, re.M):
+            passed = False
+            output = "unittest discovery collected zero tests."
+        return {"ran": True, "passed": passed, "command": verify_cmd, "returncode": rc,
+                "output": redact_secrets(output)[-4000:]}
 
 
 def check_base_baseline(
@@ -2129,10 +2192,9 @@ def check_base_baseline(
     *,
     setup_cmd_override: str | None = None,
     setup_timeout: int = 600,
+    allow_no_verify: bool = False,
     timeout: int = 900,
 ) -> dict[str, Any]:
-    if not verify_cmd:
-        return {"checked": False, "passed": True}
     baselines_file = _cache_root() / "baselines.json"
     baselines_lock = _cache_root() / "locks" / "baselines.lock"
     cache_key = sha256_text(json.dumps([repo_key, base_sha, verify_cmd, setup_cmd_override]))
@@ -2167,11 +2229,12 @@ def check_base_baseline(
             head_before = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=target_wt, check=True, env_role="orchestrator").stdout.strip()
             if head_before != base_sha:
                 raise RuntimeError("Bootstrap changed the baseline HEAD before verification")
+            verify_cmd = detect_verify_command(target_wt, verify_cmd)
             log(f"Checking clean base baseline ({base_sha[:8]}): {verify_cmd}")
             res = run_verify_gate(
                 target_wt,
                 verify_cmd,
-                allow_no_verify=False,
+                allow_no_verify=allow_no_verify,
                 log_file=run_dir / "baseline-verify.log",
                 repo_key=repo_key,
                 timeout=timeout,
@@ -2185,7 +2248,7 @@ def check_base_baseline(
                     else:
                         log(f"Baseline worktree still registered for cleanup: {temp_wt}")
 
-        if res["passed"]:
+        if res["passed"] and res["ran"]:
             with file_lock(baselines_lock, blocking=True):
                 cache = {}
                 if baselines_file.is_file():
@@ -2195,10 +2258,6 @@ def check_base_baseline(
                         cache = {}
                 cache[cache_key] = True
                 atomic_write_text(baselines_file, json.dumps(cache, indent=2))
-        elif temp_wt is None:
-            # Leave reused fresh worktree clean if baseline verification failed and dirtied it.
-            run_cmd(git_cmd("reset", "--hard", base_sha), cwd=worktree, env_role="orchestrator", ignore_shutdown=True)
-            run_cmd(git_cmd("clean", "-fd", "-e", ".dispatch"), cwd=worktree, env_role="orchestrator", ignore_shutdown=True)
         return {"checked": True, "cached": False, **res}
 
 
@@ -2374,7 +2433,12 @@ def scan_staged_for_secrets(worktree: Path) -> list[str]:
     return _scan_git_changes_for_secrets(worktree, ["diff", "--cached"])
 
 
-def _scan_before_git_write(worktree: Path, *, for_stash: bool = False) -> list[str]:
+def _scan_before_git_write(
+    worktree: Path,
+    *,
+    for_stash: bool = False,
+    exclude_paths: set[str] | frozenset[str] = frozenset(),
+) -> list[str]:
     # stash -u records three trees: index, tracked working copy, and untracked files.
     findings = _scan_git_changes_for_secrets(worktree, ["diff", "HEAD"], ignore_shutdown=for_stash)
     if for_stash:
@@ -2384,6 +2448,8 @@ def _scan_before_git_write(worktree: Path, *, for_stash: bool = False) -> list[s
         cwd=worktree, check=True, env_role="orchestrator", cap_output=False, ignore_shutdown=for_stash,
     ).stdout
     for name in filter(None, untracked.split("\0")):
+        if name in exclude_paths:
+            continue
         findings.extend(scan_text_for_secrets(name, "untracked file name"))
         if _is_secret_filename(name):
             findings.append(f"Potential secret file: {redact_secrets(name)}")
@@ -2424,7 +2490,7 @@ def verify_worktree_branch_integrity(worktree: Path, expected_common_dir: Path, 
         raise RuntimeError(f"Worker rewrote git history so base_sha {base_sha[:8]} is no longer an ancestor of HEAD.")
 
 
-def orchestrator_commit(worktree: Path, identifier: str, title: str, attempt: int) -> tuple[str, list[str]]:
+def orchestrator_commit(worktree: Path, identifier: str, title: str, attempt: int, *, setup_paths: tuple[str, ...] = ()) -> tuple[str, list[str]]:
     """Stage & commit changes safely (hooks/fsmonitor disabled; scans commit msg + staged diff). Returns (head_sha, violations)."""
     ensure_dispatch_excluded(worktree)
     commit_msg = f"{identifier}: {title} (attempt {attempt})"
@@ -2434,11 +2500,19 @@ def orchestrator_commit(worktree: Path, identifier: str, title: str, attempt: in
         return head, msg_secret_hits
     status = run_cmd(git_cmd("status", "--porcelain"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
     if status:
-        secret_hits = _scan_before_git_write(worktree)
+        secret_hits = _scan_before_git_write(worktree, exclude_paths=frozenset(setup_paths))
         if secret_hits:
             head = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
             return head, secret_hits
-        run_cmd(git_cmd("add", "-A"), cwd=worktree, check=True, env_role="orchestrator")
+        if setup_paths:
+            # Explicit literal excludes work for names containing whitespace, glob or pathspec characters.
+            pathspec = "\0".join([".", *(f":(top,exclude,literal){p}" for p in setup_paths)]) + "\0"
+            run_cmd(git_cmd("add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"), cwd=worktree,
+                    stdin_text=pathspec, check=True, env_role="orchestrator")
+            run_cmd(git_cmd("--literal-pathspecs", "reset", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"),
+                    cwd=worktree, stdin_text="\0".join(setup_paths) + "\0", check=True, env_role="orchestrator")
+        else:
+            run_cmd(git_cmd("add", "-A"), cwd=worktree, check=True, env_role="orchestrator")
         run_cmd(git_cmd("reset", "-q", "--", ".dispatch"), cwd=worktree, env_role="orchestrator")
         staged = run_cmd(git_cmd("diff", "--cached", "-z", "--name-only"), cwd=worktree, check=True, env_role="orchestrator").stdout
         if staged.strip("\x00"):
@@ -2564,8 +2638,7 @@ def parse_codex_ndjson(stdout: str) -> str:
             item = event.get("item")
             if isinstance(item, dict) and item.get("type") == "agent_message":
                 msg_text = item.get("text", "")
-                if isinstance(msg_text, str):
-                    text = msg_text
+                text = msg_text if isinstance(msg_text, str) else ""
         elif kind == "turn.completed":
             completed = True
     if not text or not completed:
@@ -2989,11 +3062,11 @@ def invoke_harness(
 
 def build_worker_prompt(
     identifier: str,
-    worktree_brief_rel: str,
+    brief_path: Path,
     verify_cmd: str | None,
     *,
     allow_gate_edits: bool,
-    baseline_std_dir: Path,
+    standard_paths: list[Path],
     authorized_gate_patterns: list[str] | None = None,
     feedback: str | None = None,
 ) -> str:
@@ -3014,8 +3087,9 @@ def build_worker_prompt(
         f"You are implementing Linear ticket {identifier} inside an isolated git worktree.",
         "",
         "## Required Reading First",
-        f"1. Read `{worktree_brief_rel}` (authoritative ticket specification; treat Parent Spec section as background context only).",
-        f"2. Read the redacted baseline standards, glossary, and active ADR snapshots under `{baseline_std_dir}`.",
+        f"1. Read `{brief_path}` (authoritative ticket specification; treat Parent Spec section as background context only).",
+        "2. Read the redacted baseline standards, glossary, and active ADR snapshots listed here:",
+        *([f"- `{path}`" for path in standard_paths] or ["- (none present in baseline)"]),
         "",
         "## Execution Rules",
         "- Minimal complete change: satisfy ONLY the ticket's acceptance criteria.",
@@ -3050,13 +3124,8 @@ def run_two_axis_review(
     trace_sink: list[dict[str, Any]] | None = None,
     review_timeout: int = 900,
     block_added_secrets: bool = False,
+    setup_files: dict[str, tuple[int, int, int, int]] | None = None,
 ) -> dict[str, Any]:
-    # Verify orchestrator-owned immutable artifacts via SHA-256 BEFORE review
-    if auth_brief_path is not None and auth_brief_sha256 is not None:
-        assert_sha256_intact(auth_brief_path, auth_brief_sha256, "brief.md")
-    for rel, digest in baseline_std_hashes.items():
-        assert_sha256_intact(baseline_std_dir / rel, digest, f"baseline-standards/{rel}")
-
     # Pre-generate immutable diff.patch; block added secrets (for standalone `review`) and redact deleted secret lines before any LLM sees them!
     diff_patch_path = run_dir / f"diff-r{round_num}.patch"
     raw_diff_text = run_cmd(
@@ -3077,6 +3146,14 @@ def run_two_axis_review(
     diff_redacted_for_review = diff_text != raw_diff_text
     atomic_write_text(diff_patch_path, diff_text)
     diff_patch_sha256 = sha256_file(diff_patch_path)
+    artifact_hashes = {baseline_std_dir / rel: digest for rel, digest in baseline_std_hashes.items()}
+    artifact_hashes[diff_patch_path] = diff_patch_sha256
+    if auth_brief_path is not None:
+        if auth_brief_sha256 is None:
+            raise RuntimeError("Missing digest for the authoritative review brief.")
+        artifact_hashes[auth_brief_path] = auth_brief_sha256
+    for path, digest in artifact_hashes.items():
+        assert_sha256_intact(path, digest, path.name)
 
     commits = run_cmd(
         git_cmd("log", f"{base_sha}..{candidate_sha}", "--oneline"), cwd=worktree, check=True, env_role="orchestrator"
@@ -3132,6 +3209,8 @@ def run_two_axis_review(
         last_err: Exception | None = None
         for axis_try in (1, 2):
             _check_shutdown()
+            for path in axis_attach:
+                assert_sha256_intact(path, artifact_hashes[path], path.name)
             suffix = "" if axis_try == 1 else f"-retry{axis_try}"
             log(f"Running {axis} review via {reviewer.label} (attempt {round_num}{suffix})...")
             try:
@@ -3163,6 +3242,14 @@ def run_two_axis_review(
         assert last_err is not None
         raise last_err
 
+    pre_review_untracked: dict[str, tuple[int, int, int, int]] = {}
+    if setup_files:
+        cur_untracked = _untracked_files(worktree)
+        unexpected = cur_untracked - set(setup_files)
+        if unexpected:
+            raise RuntimeError(f"Unexpected untracked files present before review: {sorted(unexpected)[:5]}")
+        pre_review_untracked = {name: _file_identity(worktree / name) for name in cur_untracked}
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         f_std = pool.submit(_run_axis, "standards", redact_secrets("\n".join(std_lines) + "\n"), std_attach)
         f_spec = pool.submit(_run_axis, "spec", redact_secrets("\n".join(spec_lines) + "\n"), spec_attach) if auth_brief_path else None
@@ -3182,16 +3269,23 @@ def run_two_axis_review(
 
     # Post-review immutability checks on worktree AND ALL orchestrator-owned artifacts (SHA-256 verified!)
     head_after = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
-    dirty_after = run_cmd(git_cmd("status", "--porcelain"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
+    if setup_files:
+        dirty_after = run_cmd(git_cmd("status", "--porcelain", "--untracked-files=no"), cwd=worktree,
+                              check=True, env_role="orchestrator").stdout.strip()
+        post_untracked = _untracked_files(worktree)
+        if post_untracked != set(pre_review_untracked) or any(
+            not os.path.lexists(worktree / name) or _file_identity(worktree / name) != original
+            for name, original in pre_review_untracked.items()
+        ):
+            dirty_after += " untracked files changed during review"
+    else:
+        dirty_after = run_cmd(git_cmd("status", "--porcelain"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
     if head_after != candidate_sha or dirty_after:
         raise RuntimeError(
             f"Reviewer mutated worktree! expected HEAD={candidate_sha}, got {head_after}; dirty={dirty_after!r}"
         )
-    if auth_brief_path is not None and auth_brief_sha256 is not None:
-        assert_sha256_intact(auth_brief_path, auth_brief_sha256, "brief.md")
-    assert_sha256_intact(diff_patch_path, diff_patch_sha256, diff_patch_path.name)
-    for rel, digest in baseline_std_hashes.items():
-        assert_sha256_intact(baseline_std_dir / rel, digest, f"baseline-standards/{rel}")
+    for path, digest in artifact_hashes.items():
+        assert_sha256_intact(path, digest, path.name)
 
     spec_ok = (spec_res["verdict"] == "pass") if auth_brief_path else True
     passed = (
@@ -3309,12 +3403,9 @@ def fetch_open_pr_for_branch(worktree: Path, gh_repo: str | None, branch: str) -
     return prs[0] if prs else None
 
 
-def fetch_open_pr_feedback(worktree: Path, gh_repo: str | None, branch: str) -> str | None:
+def fetch_open_pr_feedback(worktree: Path, gh_repo: str | None, pr_number: int) -> str | None:
     """Fetch PR comments, reviews, and paginated inline review threads ONLY from explicitly trusted authors."""
-    pr = fetch_open_pr_for_branch(worktree, gh_repo, branch)
-    if not pr:
-        return None
-    cmd = ["gh", "pr", "view", str(pr["number"]), "--json", "comments,reviews"]
+    cmd = ["gh", "pr", "view", str(pr_number), "--json", "comments,reviews"]
     if gh_repo:
         cmd += ["--repo", gh_repo]
     res = run_cmd(cmd, cwd=worktree, env_role="orchestrator")
@@ -3342,13 +3433,13 @@ def fetch_open_pr_feedback(worktree: Path, gh_repo: str | None, branch: str) -> 
     # Paginated inline code review comments via REST API
     if gh_repo:
         inline = run_cmd(
-            ["gh", "api", "--paginate", "--slurp", f"repos/{gh_repo}/pulls/{pr['number']}/comments"],
+            ["gh", "api", "--paginate", "--slurp", f"repos/{gh_repo}/pulls/{pr_number}/comments"],
             cwd=worktree,
             env_role="orchestrator",
             cap_output=False,
         )
         if inline.returncode != 0:
-            log(f"Warning: failed fetching inline PR comments for #{pr['number']}: {redact_secrets(inline.stderr)[:300]}")
+            log(f"Warning: failed fetching inline PR comments for #{pr_number}: {redact_secrets(inline.stderr)[:300]}")
         elif inline.stdout.strip():
             try:
                 parsed = json.loads(inline.stdout)
@@ -3371,7 +3462,7 @@ def fetch_open_pr_feedback(worktree: Path, gh_repo: str | None, branch: str) -> 
                         line = ic.get("line") or ic.get("original_line") or ""
                         notes.append(f"- [Inline PR Comment by @{author} on `{path}:{line}`]: {redact_secrets(body)}")
             except json.JSONDecodeError as exc:
-                log(f"Warning: could not parse inline PR comments JSON for #{pr['number']}: {exc}")
+                log(f"Warning: could not parse inline PR comments JSON for #{pr_number}: {exc}")
     return redact_secrets("\n".join(notes)) if notes else None
 
 
@@ -3444,6 +3535,8 @@ def reconcile_publish(
     base_branch = state["base_branch"]
     candidate_sha = state["candidate_sha"]
     remote_kind, gh_repo, raw_remote_url = classify_origin_remote(worktree)
+    if remote_kind == "none":
+        raise RuntimeError("Publishing requires an origin remote.")
     if state.get("publish_destination") and sha256_text(gh_repo.lower() if gh_repo else raw_remote_url) != state["publish_destination"]:
         raise RuntimeError("Origin destination changed since preflight; refusing to publish.")
     force_gh = os.environ.get("AGENT_DISPATCH_FORCE_GH") == "1"
@@ -3771,6 +3864,8 @@ def execute_ticket(
     publish_destination = ""
     if not no_push:
         remote_kind, remote_repo, raw_remote_url = classify_origin_remote(repo_root)
+        if remote_kind == "none":
+            raise RuntimeError("Publishing requires an origin remote. Configure origin or use --no-push.")
         publish_destination = sha256_text(remote_repo.lower() if remote_repo else raw_remote_url)
         if remote_kind == "unknown_remote" and not allow_branch_only and os.environ.get("AGENT_DISPATCH_FORCE_GH") != "1":
             raise RuntimeError(
@@ -3831,7 +3926,7 @@ def execute_ticket(
                     raise RuntimeError(f"Required Linear workflow state '{req_state}' missing in team {iss_obj['team']['key']}.")
         return None
 
-    with file_lock(t_lock, blocking=False):
+    with file_lock(t_lock, blocking=False), contextlib.ExitStack() as run_cleanup:
         latest_file = _cache_root() / "runs" / rkey / issue["identifier"] / ("latest-local.json" if no_push else "latest.json")
         if not no_push and not force_rerun and latest_file.is_file():
             try:
@@ -3869,13 +3964,25 @@ def execute_ticket(
         run_dir.mkdir(parents=True, exist_ok=True)
 
         # 2. Prepare worktree (writes owner.json INSIDE repo lock!), remote FF, bootstrap, verify detect & base baseline ALL BEFORE claiming Linear!
-        worktree, branch, base_sha = prepare_worktree(
+        worktree, branch, target_sha = prepare_worktree(
             repo_root, issue["identifier"], base_branch, fresh=fresh, issue_uuid=issue["id"]
         )
+        base_sha = run_cmd(git_cmd("merge-base", target_sha, "HEAD"), cwd=worktree,
+                           check=True, env_role="orchestrator").stdout.strip()
+        preflight_pr = None
+        gh_repo = parse_github_owner_repo(worktree)
         if not no_push:
             check_remote_fast_forward_ready(worktree, branch)
+            if gh_repo or os.environ.get("AGENT_DISPATCH_FORCE_GH") == "1":
+                preflight_pr = fetch_open_pr_for_branch(worktree, gh_repo, branch)
+                if preflight_pr:
+                    _validate_open_draft_pr(preflight_pr, base_branch=base_branch, context="preflight PR check")
 
+        before_setup = _untracked_files(worktree)
         bootstrap_worktree(worktree, setup_cmd_override, timeout=setup_timeout)
+        setup_files = {name: _file_identity(worktree / name) for name in _untracked_files(worktree) - before_setup}
+        if setup_files:
+            run_cleanup.callback(_release_setup_files, worktree, setup_files)
         verify_cmd = detect_verify_command(worktree, verify_cmd_override)
         if not verify_cmd and not allow_no_verify:
             return {
@@ -3890,18 +3997,19 @@ def execute_ticket(
                 repo_root,
                 rkey,
                 worktree,
-                base_sha,
-                verify_cmd,
+                target_sha,
+                verify_cmd_override,
                 run_dir,
                 setup_cmd_override=setup_cmd_override,
                 setup_timeout=setup_timeout,
+                allow_no_verify=allow_no_verify,
                 timeout=verify_timeout,
             )
             if not base_check["passed"]:
                 return {
                     "issue": issue["identifier"],
                     "status": "base_branch_red",
-                    "base_sha": base_sha,
+                    "base_sha": target_sha,
                     "verify": base_check,
                     "run_dir": str(run_dir),
                 }
@@ -3936,10 +4044,12 @@ def execute_ticket(
         wt_brief_path = worktree / ".dispatch" / f"{issue['identifier']}.md"
         wt_brief_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(wt_brief_path, auth_brief_content)
-        wt_brief_rel = f".dispatch/{issue['identifier']}.md"
 
         baseline_std_dir = run_dir / "baseline-standards"
         _, baseline_std_hashes = snapshot_baseline_standards(worktree, base_sha, baseline_std_dir)
+        worker_artifacts = {baseline_std_dir / rel: digest for rel, digest in baseline_std_hashes.items()}
+        standard_paths = list(worker_artifacts)
+        worker_artifacts[auth_brief_path] = auth_brief_sha256
 
         brief_gate_pats, brief_test_pats = parse_authorized_changes(issue.get("description") or "")
         gate_authorizations = {
@@ -3990,6 +4100,11 @@ def execute_ticket(
                 # Persist claim_pending BEFORE sending mutation so lost ACK never strands an untracked In Progress ticket!
                 state["stage"] = "claim_pending"
                 save_checkpoint(run_dir, latest_file, state)
+                before_claim = client.get_issue_ownership_snapshot(issue["id"])
+                if (before_claim["state_id"] != pre_claim_state_id
+                        or before_claim["updated_at"] != str(issue.get("updatedAt") or "")
+                        or any(before_claim[key] != value for key, value in state["claimed_ownership"].items())):
+                    raise RuntimeError("Linear issue changed while preparing claim. Rerun with its current brief and state.")
                 _check_shutdown()
                 claim_attempted = True
                 claimed_st = client.update_issue_state(issue, "In Progress")
@@ -4010,8 +4125,18 @@ def execute_ticket(
             pre_base_sha = get_remote_branch_sha(worktree, base_branch) if not no_push else ""
             pre_git_cfg = snapshot_local_git_config(worktree)
 
-            gh_repo = parse_github_owner_repo(worktree)
-            pr_feedback: str | None = fetch_open_pr_feedback(worktree, gh_repo, branch) if (gh_repo and not no_push) else None
+            pr_feedback = None
+            if not no_push and (gh_repo or os.environ.get("AGENT_DISPATCH_FORCE_GH") == "1"):
+                observed_pr = fetch_open_pr_for_branch(worktree, gh_repo, branch)
+                if preflight_pr and (not observed_pr or observed_pr["number"] != preflight_pr["number"]):
+                    raise RuntimeError(
+                        f"Open PR #{preflight_pr['number']} changed during preflight (human action preserved)."
+                    )
+                if observed_pr:
+                    _validate_open_draft_pr(observed_pr, base_branch=base_branch, context="pre-worker PR check")
+                    state["pr_number"] = observed_pr["number"]
+                    save_checkpoint(run_dir, latest_file, state)
+                    pr_feedback = fetch_open_pr_feedback(worktree, gh_repo, observed_pr["number"])
             feedback: str | None = pr_feedback
             prior_review_findings: dict[str, list[str]] | None = None
             discovered_seen: set[str] = set()
@@ -4024,12 +4149,14 @@ def execute_ticket(
                 _check_shutdown()
                 log(f"=== {issue['identifier']} Attempt {attempt}/{max_attempts} | worker={worker.label} ===")
 
+                for path, digest in worker_artifacts.items():
+                    assert_sha256_intact(path, digest, path.name)
                 w_prompt = build_worker_prompt(
                     issue["identifier"],
-                    wt_brief_rel,
+                    auth_brief_path,
                     verify_cmd,
                     allow_gate_edits=allow_gate_edits,
-                    baseline_std_dir=baseline_std_dir,
+                    standard_paths=standard_paths,
                     authorized_gate_patterns=brief_gate_pats,
                     feedback=feedback,
                 )
@@ -4046,7 +4173,7 @@ def execute_ticket(
                         read_only=False,
                         session_label=f"{issue['identifier']}-worker-r{attempt}",
                         trace_sink=sessions,
-                        attach_files=[auth_brief_path, *(baseline_std_dir / rel for rel in baseline_std_hashes)],
+                        attach_files=[auth_brief_path, *standard_paths],
                         timeout=worker_timeout,
                     )
                 except subprocess.TimeoutExpired:
@@ -4080,6 +4207,7 @@ def execute_ticket(
                         all_discovered.append(f"[attempt {attempt}] {redact_secrets(raw_item.strip())}")
 
                 if w_res["status"] == "blocked":
+                    _release_setup_files(worktree, setup_files)
                     _stash_dirty_worktree_for_safe_rerun(worktree, f"{run_id}-blocked")
                     failure_reason = f"Worker reported blocked: {redact_secrets(w_res['blockers'])}"
                     state["stage"] = "worker_blocked"
@@ -4099,9 +4227,13 @@ def execute_ticket(
                     }
 
                 verify_worktree_branch_integrity(worktree, repo_common, branch, base_sha)
-                candidate_sha, staged_secret_hits = orchestrator_commit(worktree, issue["identifier"], issue["title"], attempt)
+                active_setup_paths = tuple(_active_setup_files(worktree, setup_files))
+                candidate_sha, staged_secret_hits = orchestrator_commit(
+                    worktree, issue["identifier"], issue["title"], attempt, setup_paths=active_setup_paths,
+                )
                 if staged_secret_hits:
                     if any("ticket title" in h for h in staged_secret_hits):
+                        _release_setup_files(worktree, setup_files)
                         _stash_dirty_worktree_for_safe_rerun(worktree, f"{run_id}-title-secret")
                         failure_reason = "Secret detected in ticket title / commit message:\n" + "\n".join(f"- {s}" for s in staged_secret_hits)
                         state["stage"] = "secret_in_metadata"
@@ -4191,8 +4323,6 @@ def execute_ticket(
                     timeout=verify_timeout,
                 )
                 if not last_verify_res["passed"]:
-                    run_cmd(git_cmd("reset", "--hard", candidate_sha), cwd=worktree, env_role="orchestrator")
-                    run_cmd(git_cmd("clean", "-fd", "-e", ".dispatch"), cwd=worktree, env_role="orchestrator")
                     feedback = (
                         f"Deterministic verification failed (`{last_verify_res['command']}`, exit {last_verify_res.get('returncode')}):\n"
                         f"```\n{last_verify_res['output'][-2500:]}\n```"
@@ -4223,6 +4353,7 @@ def execute_ticket(
                     pr_feedback=pr_feedback,
                     trace_sink=sessions,
                     review_timeout=review_timeout,
+                    setup_files=setup_files,
                 )
                 if not no_push:
                     _assert_no_external_tampering(
@@ -4349,6 +4480,7 @@ def execute_ticket(
                 feedback = "\n".join(fb_lines) or "Review failed; address all review feedback."
                 log(f"{issue['identifier']} review FAILED on attempt {attempt}.")
 
+            _release_setup_files(worktree, setup_files)
             _stash_dirty_worktree_for_safe_rerun(worktree, f"{run_id}-max-rework")
             failure_reason = f"Exhausted {max_attempts} attempts ({max_rework} rework rounds). Last feedback:\n{feedback or 'unknown'}"
             state["stage"] = "failed_max_rework"
@@ -4370,11 +4502,12 @@ def execute_ticket(
             }
         except BaseException as exc:
             failure_reason = f"Unhandled orchestrator error ({type(exc).__name__}): {exc}"
-            if not publish_started and state["stage"] != "claim_pending":
+            if not publish_started and (state["stage"] != "claim_pending" or not claim_attempted):
                 state["stage"] = "error"
                 if (worktree / ".git").exists() and pre_git_cfg and not _is_shutdown_requested():
                     if (snapshot_local_git_config(worktree) == pre_git_cfg and
                             run_cmd(git_cmd("branch", "--show-current"), cwd=worktree, env_role="orchestrator").stdout.strip() == branch):
+                        _release_setup_files(worktree, setup_files)
                         _stash_dirty_worktree_for_safe_rerun(worktree, f"{run_id}-error")
             state["error"] = redact_secrets(str(exc))
             state["sessions"] = sessions

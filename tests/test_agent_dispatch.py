@@ -255,6 +255,75 @@ class IsolatedDispatchCase(unittest.TestCase):
 
 
 class TestUnitGatesAndParsing(IsolatedDispatchCase):
+    def test_nested_authorization_headers_are_redacted_in_structured_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            token = "syntheticopaque"
+            event = {"request": {"AUTHORIZATION": "Bearer " + token,
+                                 "Proxy-Authorization": "Basic " + token},
+                     "description": "Support bearer authentication"}
+            log = folder / "log"
+            with contextlib.ExitStack() as stack:
+                writer = ad._RedactedLog(log, stack)
+                writer.write((json.dumps(event) + "\n").encode())
+            ad.append_session_trace(folder, event, None)
+            for path in (log, folder / "sessions.jsonl"):
+                saved = json.loads(path.read_text())
+                self.assertNotIn(token, json.dumps(saved))
+                self.assertEqual(saved["description"], event["description"])
+
+    def test_codex_rejects_malformed_final_assistant_after_valid_verdict(self) -> None:
+        for bad_text in (None, {"verdict": "pass"}, ["text"]):
+            with self.subTest(bad_text=bad_text):
+                items = [{"type": "item.completed", "item": {"type": "agent_message", "text": val}}
+                         for val in ('{"verdict":"pass"}', bad_text)]
+                with self.assertRaises(ValueError):
+                    ad.parse_codex_ndjson("\n".join(map(json.dumps, [*items, {"type": "turn.completed"}])))
+
+    def test_review_rechecks_diff_before_retrying_transient_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            _git(d, "init", "-b", "main")
+            _git(d, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                 "commit", "--allow-empty", "-m", "test")
+            head = _git(d, "rev-parse", "HEAD")
+            run_dir = Path(os.environ["AGENT_DISPATCH_CACHE_ROOT"]) / "review"
+            def change_diff_and_fail(*args, **kwargs):
+                (run_dir / "diff-r1.patch").write_text("modified after first review")
+                raise ValueError("incomplete verdict")
+            with mock.patch.object(ad, "invoke_harness", side_effect=change_diff_and_fail) as harness:
+                with mock.patch.dict(os.environ, {"AGENT_DISPATCH_REVIEW_RETRY_SLEEP": "0"}):
+                    with self.assertRaisesRegex(RuntimeError, "integrity violation.*diff-r1"):
+                        ad.run_two_axis_review(ad.parse_harness_spec("agy"), d, run_dir, head, head,
+                                               None, None, run_dir / "standards", {}, 1)
+                self.assertEqual(harness.call_count, 1)
+
+    def test_worker_rechecks_immutable_brief_before_timeout_rework(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            _git(repo, "init", "-b", "main")
+            _git(repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                 "commit", "--allow-empty", "-m", "base")
+            linear = FakeLinearState("test")
+            linear.add_issue("TST-1", "Implement task", "## What to Build\nFeature")
+            srv, url = start_fake_linear(linear)
+            self.addCleanup(srv.server_close)
+            self.addCleanup(srv.shutdown)
+            def change_brief_and_timeout(spec, prompt, **kwargs):
+                brief = kwargs["run_dir"] / "brief.md"
+                self.assertIn(str(brief), prompt)
+                brief.write_text("changed during first worker")
+                raise subprocess.TimeoutExpired("fake worker", 1)
+            with mock.patch.object(ad, "invoke_harness", side_effect=change_brief_and_timeout) as harness:
+                with self.assertRaisesRegex(RuntimeError, "integrity violation.*brief.md"):
+                    ad.execute_ticket(ad.LinearClient("synthetic", url=url), repo, None, "TST-1",
+                                      ad.parse_harness_spec("codex"), ad.parse_harness_spec("agy"),
+                                      verify_cmd_override="true", setup_cmd_override=None, max_rework=1,
+                                      verify_timeout=5, setup_timeout=5, no_push=True, allow_no_verify=False,
+                                      allow_gate_edits=False, allow_test_edits=False, allow_dirty_docs=True,
+                                      skip_baseline=True, skip_project_check=True, force_rerun=False, fresh=False)
+                self.assertEqual(harness.call_count, 1)
+
     def test_harness_model_policy_rejects_unlisted_names_and_tiers(self) -> None:
         for spec in ("agy:opus", "agy:claude-sonnet", "agy:gemini-3", "agy:neon@bogus",
                      "codex:6.1-sol", "opencode:sub2api/custom", "pi:other/gpt-6.2-astra"):
@@ -489,6 +558,54 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
             "# Out of scope\n- gate: Cargo.toml\n"
         )
         self.assertEqual(ad.parse_authorized_changes(brief), (["src/Makefile"], []))
+
+    def test_polyglot_verify_runs_python_after_javascript(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tests = root / "tests"
+            tests.mkdir()
+            (tests / "test_backend.py").write_text(
+                "import unittest\nclass TestBackend(unittest.TestCase):\n    def test_fail(self): self.fail('backend check')\n"
+            )
+            (root / "package.json").write_text('{"scripts":{"test":"node js-test.js"}}')
+            _write_exec(root / "npm", "#!/bin/sh\ntouch js-ran\n")
+            (root / "Cargo.toml").touch()
+            (root / "go.mod").touch()
+            with mock.patch.dict(os.environ, {"PATH": str(root) + os.pathsep + os.environ["PATH"]}):
+                command = ad.detect_verify_command(root, None)
+                self.assertIn("go test ./...", command)
+                self.assertIn("cargo test", command)
+                (root / "Cargo.toml").unlink()
+                (root / "go.mod").unlink()
+                result = subprocess.run(ad.detect_verify_command(root, None), cwd=root, shell=True, capture_output=True)
+            self.assertTrue((root / "js-ran").exists())
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b"backend check", result.stderr)
+
+    def test_verify_cleanup_preserves_existing_files_on_success_and_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "repo"
+            repo.mkdir()
+            _git(repo, "init", "-b", "main")
+            _git(repo, "config", "user.name", "Test")
+            _git(repo, "config", "user.email", "test@example.invalid")
+            tracked = repo / "__pycache__" / "fixture"
+            tracked.parent.mkdir()
+            tracked.write_text("keep")
+            _git(repo, "add", "-f", "__pycache__/fixture")
+            _git(repo, "commit", "-m", "fixture")
+            existing = repo / "setup-input"
+            existing.write_text("keep")
+            for suffix, success in [("", True), ("; echo bad > __pycache__/fixture; exit 2", False)]:
+                result = ad.run_verify_gate(
+                    repo, "test -f setup-input && touch generated.log" + suffix,
+                    allow_no_verify=False, log_file=root / "verify.log", repo_key="verify-clean",
+                )
+                self.assertEqual(result["passed"], success, result)
+                self.assertFalse((repo / "generated.log").exists())
+                self.assertEqual(tracked.read_text(), "keep")
+                self.assertEqual(existing.read_text(), "keep")
 
     def test_mixed_and_zero_collection_cannot_pass_verify(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -958,7 +1075,9 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                 raise AssertionError(f"Unexpected cmd: {cmd}")
 
             with mock.patch.object(ad, "run_cmd", side_effect=fake_gh):
-                fb = ad.fetch_open_pr_feedback(d, "test/repo", "feat/x") or ""
+                issue_pr = ad.fetch_open_pr_for_branch(d, "test/repo", "feat/x")
+                self.assertEqual(issue_pr["number"], 7)
+                fb = ad.fetch_open_pr_feedback(d, "test/repo", issue_pr["number"]) or ""
             self.assertIn("fix null check", fb)
             self.assertIn("good inline", fb)
             self.assertNotIn("untrusted empty", fb)
@@ -1560,6 +1679,108 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
             self.assertEqual(len(lines), 2)
             self.assertEqual(lines[1]["id"], "m1")
 
+    def test_truncation_preserves_pem_redaction_and_bounds_unterminated_lines(self) -> None:
+        # Make the opening delimiter land in the discarded middle of the raw display buffer.
+        padding = "ordinary diagnostic\n" * 20
+        payload = padding + "-----BEGIN PRIVATE KEY-----\n" + "synthetic-pem-body\n" * 20 + "-----END PRIVATE KEY-----\nfinished\n"
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "verify.log"
+            with mock.patch.object(ad, "DISPLAY_OUTPUT_CAP", 256):
+                result = ad.run_cmd([sys.executable, "-B", "-c", "import sys; sys.stdout.write(sys.stdin.read())"],
+                                    stdin_text=payload, stdout_path=path)
+            for output in (path.read_text(), result.stdout):
+                self.assertNotIn("synthetic-pem-body", output)
+                self.assertIn("finished", output)
+            with contextlib.ExitStack() as stack, mock.patch.object(ad._RedactedLog, "line_limit", 64):
+                sink = ad._RedactedLog(path, stack)
+                for _ in range(100):
+                    sink.write(b"x" * 32)
+                    self.assertLessEqual(len(sink.pending), 64)
+                sink.write(b"-----BE")
+                sink.write(b"GIN PRIVATE KEY-----\nsynthetic-pem-body\n-----END PRIVATE KEY-----\nfinished\n")
+                sink.write(b"")
+            self.assertNotIn("synthetic-pem-body", path.read_text())
+            self.assertIn("oversized diagnostic line omitted", path.read_text())
+            self.assertIn("finished", path.read_text())
+
+            # Oversized CERTIFICATE block or oversized JSON containing a truncated PRIVATE KEY header
+            # must NOT permanently poison in_pem and drop subsequent lines!
+            with contextlib.ExitStack() as stack, mock.patch.object(ad._RedactedLog, "line_limit", 64):
+                sink = ad._RedactedLog(path, stack)
+                sink.write(b"x" * 70 + b"-----BEGIN CERTIFICATE-----\nkept after cert\n")
+                sink.write(b'{"type":"tool","out":"' + b"y" * 70 + b'-----BEGIN PRIVATE KEY-----\\nsecret"}\n')
+                sink.write(b'{"type":"thread.started","thread_id":"aaaa-bbbb"}\n')
+                sink.write(b"")
+            logged = path.read_text()
+            self.assertIn("kept after cert", logged)
+            self.assertIn("aaaa-bbbb", logged)
+
+    def test_polyglot_python_tests_dir_does_not_block_frontend_lint_and_setup_files_edge_cases(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            # 1. Polyglot repo: frontend package.json has lint (no JS tests) + Python tests/test_api.py
+            (root / "package.json").write_text('{"scripts":{"lint":"eslint ."}}', encoding="utf-8")
+            (root / "tests").mkdir()
+            (root / "tests" / "test_api.py").write_text(
+                "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            cmd = ad.detect_verify_command(root, None)
+            self.assertEqual(cmd, "npm run lint && python3 -m unittest discover -s tests")
+
+            # 2. Setup-generated .pem (e.g. non-gitignored venv/cacert.pem) excluded from secret scan/commit,
+            #    and worker/verify deleting or touching setup files does not crash or falsely blame reviewer.
+            repo = root / "repo"
+            repo.mkdir()
+            _git(repo, "init", "-b", "main")
+            _git(repo, "config", "user.name", "Test")
+            _git(repo, "config", "user.email", "test@example.invalid")
+            (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+            _git(repo, "add", "app.py")
+            _git(repo, "commit", "-m", "init")
+            base = _git(repo, "rev-parse", "HEAD")
+
+            (repo / "venv_cacert.pem").write_text("bundle\n", encoding="utf-8")
+            (repo / "cache.tmp").write_text("v1\n", encoding="utf-8")
+            setup_files = {
+                "venv_cacert.pem": ad._file_identity(repo / "venv_cacert.pem"),
+                "cache.tmp": ad._file_identity(repo / "cache.tmp"),
+            }
+            (repo / "app.py").write_text("x = 2\n", encoding="utf-8")
+            # Simulate verify/worker deleting cache.tmp before review while venv_cacert.pem remains
+            (repo / "cache.tmp").unlink()
+            active = tuple(ad._active_setup_files(repo, setup_files))
+            self.assertEqual(active, ("venv_cacert.pem",))
+            cand, hits = ad.orchestrator_commit(repo, "TST-SET", "Work", 1, setup_paths=active)
+            self.assertEqual(hits, [])
+            self.assertNotIn("venv_cacert.pem", _git(repo, "ls-tree", "-r", "--name-only", cand).splitlines())
+
+            def clean_reviewer(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                return {
+                    "axis": kwargs["expected_axis"],
+                    "verdict": "pass",
+                    "hard_findings": [],
+                    "suggestions": [],
+                    "test_integrity_violation": False,
+                    "summary": "ok",
+                }
+            with mock.patch.object(ad, "invoke_harness", side_effect=clean_reviewer):
+                rev = ad.run_two_axis_review(
+                    ad.parse_harness_spec("agy:neon"), repo, root / "r1", base, cand,
+                    None, None, root / "std", {}, 1, setup_files=setup_files,
+                )
+            self.assertTrue(rev["passed"])
+
+            def mutating_reviewer(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                (repo / "venv_cacert.pem").write_text("tampered\n", encoding="utf-8")
+                return clean_reviewer(*args, **kwargs)
+            with mock.patch.object(ad, "invoke_harness", side_effect=mutating_reviewer):
+                with self.assertRaisesRegex(RuntimeError, "Reviewer mutated worktree"):
+                    ad.run_two_axis_review(
+                        ad.parse_harness_spec("agy:neon"), repo, root / "r2", base, cand,
+                        None, None, root / "std", {}, 1, setup_files=setup_files,
+                    )
+
     def test_run_cmd_bounded_buffer_caps_memory_while_streaming_full_log(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
@@ -1579,6 +1800,19 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
             self.assertLessEqual(len(res.stdout), 2500)
             # Full un-truncated output still streamed to disk log
             self.assertEqual(len(out_log.read_text(encoding="utf-8").splitlines()), 400)
+
+    def test_wildcard_touches_reserve_all_matching_descendants(self) -> None:
+        for pattern, expected in [("**/shared", set()), ("*.ts", set()), ("src/*/utils", {"src"}),
+                                  ("src/api/[av]*.py", {"src/api"}), ("src/user?.py", {"src"})]:
+            with self.subTest(pattern=pattern):
+                self.assertEqual(ad.parse_touches(f"## Touches\n- {pattern}"), expected)
+        for root in ("*", "**", "`*`"):
+            self.assertEqual(ad.parse_touches(f"## Touches\n- {root}\n- docs"), set())
+        candidates = [{"identifier": "A", "description": "## Touches\n- src/*.py"},
+                      {"identifier": "B", "description": "## Touches\n- src/core.py"}]
+        selected, deferred = ad.select_non_overlapping_wave(candidates)
+        self.assertEqual(selected, candidates[:1])
+        self.assertEqual([entry["id"] for entry in deferred], ["B"])
 
     def test_touches_normalization_fences_headings_wildcards_and_symlink_and_pkg_guards(self) -> None:
         brief = (
@@ -1871,6 +2105,19 @@ sys.exit(1)
             env=env,
         )
 
+    def test_missing_origin_fails_preflight_before_claim_but_permits_local_run(self) -> None:
+        self.linear_state.add_issue("TST-O", "Work", "## Touches\n- src", labels=["agent-ready"])
+        _git(self.repo, "remote", "remove", "origin")
+        result = self._run_cli(["run", "TST-O", "--allow-branch-only", "--skip-baseline"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires an origin", result.stderr)
+        self.assertFalse(self.linear_state.mutation_log)
+        self.assertFalse((self.root / "codex_calls.count").exists())
+        local = self._run_cli(["run", "TST-O", "--no-push", "--skip-baseline"])
+        self.assertEqual(local.returncode, 0, local.stderr + local.stdout)
+        self.assertEqual(json.loads(local.stdout)["status"], "passed_local")
+        self.assertFalse(self.linear_state.mutation_log)
+
     def test_mismatched_push_destination_aborts_before_claim(self) -> None:
         self.linear_state.add_issue("TST-DEST", "Destination", "hello")
         unrelated = self.root / "other.git"
@@ -1881,6 +2128,70 @@ sys.exit(1)
         self.assertIn("destinations", run.stderr)
         self.assertEqual(self.linear_state.mutation_log, [])
         self.assertEqual(_git(unrelated, "for-each-ref"), "")
+
+    def test_claim_respects_cancellation_during_standards_snapshot(self) -> None:
+        issue = self.linear_state.add_issue("TST-LATECLAIM", "Work", "Implement a change")
+        real_git = shutil.which("git")
+        marker = self.root / "standards-read"
+        _write_exec(self.fake_bin / "git", (
+            "#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\n"
+            f"if 'ls-tree' in sys.argv: Path({str(marker)!r}).touch()\n"
+            f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n"
+        ))
+        handle = self.linear_state.handle
+
+        def cancel_after_snapshot(query, variables):
+            if marker.exists():
+                marker.unlink()
+                issue["state"] = next(s for s in self.linear_state.states if s["name"] == "Canceled")
+            return handle(query, variables)
+
+        with mock.patch.object(self.linear_state, "handle", side_effect=cancel_after_snapshot):
+            result = self._run_cli(["run", issue["identifier"], "--skip-baseline"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(issue["state"]["name"], "Canceled")
+        self.assertEqual(self.linear_state.mutation_log, [])
+        latest = self.cache_dir / "runs" / ad.repo_cache_key(self.repo) / issue["identifier"] / "latest.json"
+        self.assertNotEqual(json.loads(latest.read_text())["stage"], "claim_pending")
+
+    def test_existing_pr_closed_during_worker_is_preserved_before_push(self) -> None:
+        issue = self.linear_state.add_issue("TST-CLOSE", "Work", "Implement a change")
+        head = _git(self.repo, "rev-parse", "HEAD")
+        branch = "feat/tst-close"
+        _git(self.repo, "push", "origin", f"HEAD:refs/heads/{branch}")
+        pr = {"number": 7, "url": "https://example.invalid/pr/7", "head": branch, "headRefName": branch,
+              "isCrossRepository": False, "headRefOid": head, "baseRefName": "main", "state": "OPEN",
+              "isDraft": True, "body": "Human notes"}
+        self.gh_state_file.write_text(json.dumps([pr]))
+        codex = self.fake_bin / "codex"
+        worker = codex.rename(self.fake_bin / "original-codex")
+        _write_exec(codex, (
+            "#!/usr/bin/env python3\nimport json, os, sys\nfrom pathlib import Path\n"
+            f"db = Path({str(self.gh_state_file)!r})\nprs = json.loads(db.read_text())\n"
+            "prs[0]['state'] = 'CLOSED'\ndb.write_text(json.dumps(prs))\n"
+            f"os.execv({str(worker)!r}, [{str(worker)!r}, *sys.argv[1:]])\n"
+        ))
+        result = self._run_cli(["run", issue["identifier"], "--skip-baseline"])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)["status"], "publish_incomplete")
+        self.assertEqual(_git(self.bare, "rev-parse", branch), head)
+        self.assertEqual(json.loads(self.gh_state_file.read_text()), [{**pr, "state": "CLOSED"}])
+        self.assertNotIn("pr create", self.gh_calls_log.read_text())
+
+    def test_existing_non_draft_pr_fails_preflight_before_claim_or_worker(self) -> None:
+        issue = self.linear_state.add_issue("TST-READY", "Work", "Implement a change")
+        head = _git(self.repo, "rev-parse", "HEAD")
+        branch = "feat/tst-ready"
+        _git(self.repo, "push", "origin", f"HEAD:refs/heads/{branch}")
+        pr = {"number": 9, "url": "https://example.invalid/pr/9", "head": branch, "headRefName": branch,
+              "isCrossRepository": False, "headRefOid": head, "baseRefName": "main", "state": "OPEN",
+              "isDraft": False, "body": "Ready PR"}
+        self.gh_state_file.write_text(json.dumps([pr]))
+        result = self._run_cli(["run", issue["identifier"], "--skip-baseline"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a Draft PR", result.stderr)
+        self.assertEqual(self.linear_state.mutation_log, [])
+        self.assertFalse((self.root / "codex_calls.count").exists())
 
     def test_resume_interrupted_claim_only_restores_owned_state(self) -> None:
         issue = self.linear_state.add_issue("TST-CLAIM", "Claim", "scope", state_name="In Progress")
@@ -2244,6 +2555,36 @@ sys.exit(1)
         self.assertNotEqual(missing.returncode, 0)
         self.assertFalse(json.loads(missing.stdout)["ok"])
 
+    def test_setup_helper_available_during_checks_and_excluded_from_candidate(self) -> None:
+        self.linear_state.add_issue("TST-HELP", "feature", "## Touches\n- app", labels=["agent-ready"])
+        result = self._run_cli([
+            "run", "TST-HELP", "--no-push", "--setup-cmd", "echo setup > 'helper[*]'",
+            "--verify-cmd", "test -f 'helper[*]' && make verify",
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        out = json.loads(result.stdout)
+        wt = Path(out["worktree"])
+        self.assertNotIn("helper[*]", _git(wt, "ls-tree", "-r", "--name-only", out["commit"]).splitlines())
+        self.assertEqual(_git(wt, "status", "--porcelain"), "")
+
+    def test_reused_feature_checks_current_base_with_base_verify_recipe(self) -> None:
+        issue = self.linear_state.add_issue("TST-FORK", "feature", "## Touches\n- app", labels=["agent-ready"])
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CACHE_ROOT": str(self.cache_dir)}):
+            wt, _, _ = ad.prepare_worktree(self.repo, issue["identifier"], "main", issue_uuid=issue["id"])
+        _git(wt, "commit", "--allow-empty", "-m", "feature before base moved")
+        (self.repo / "Makefile").write_text("check:\n\t@echo current-base-red\n\t@false\n")
+        _git(self.repo, "commit", "-am", "base now fails check")
+        _git(self.repo, "push", "origin", "main")
+        target = _git(self.repo, "rev-parse", "HEAD")
+        result = self._run_cli(["run", issue["identifier"]])
+        self.assertNotEqual(result.returncode, 0)
+        out = json.loads(result.stdout)
+        self.assertEqual(out["status"], "base_branch_red")
+        self.assertEqual(out["base_sha"], target)
+        self.assertEqual(out["verify"]["command"], "make check")
+        self.assertIn("current-base-red", out["verify"]["output"])
+        self.assertFalse(self.linear_state.mutation_log)
+
     def test_cleanup_requires_owner_and_checkpoint_agreement(self) -> None:
         self.linear_state.add_issue("TST-OWN", "Work", "## Touches\n- src", labels=["agent-ready"])
         result = self._run_cli(["run", "TST-OWN", "--no-push", "--skip-baseline"])
@@ -2332,7 +2673,7 @@ sys.exit(res.returncode)
             ["run", "TST-TERM", "--repo", str(self.repo), "--skip-baseline"],
             extra_env={"PATH": f"{sig_bin}:{self.fake_bin}:{os.environ['PATH']}"},
         )
-        self.assertTrue(sig_marker.exists(), "git push wrapper did not fire SIGTERM!")
+        self.assertTrue(sig_marker.exists(), f"Push did not reach SIGTERM injection (exit {res1.returncode}): {res1.stdout} {res1.stderr}")
         self.assertEqual(res1.returncode, 128 + signal.SIGTERM, res1.stderr + res1.stdout)
         # Checkpoint MUST keep resumable stage (pushing/pushed), NOT 'error'!
         rkey = ad.repo_cache_key(self.repo)
