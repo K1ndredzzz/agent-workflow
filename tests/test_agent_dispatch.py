@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Unit, security/false-positive, end-to-end CLI fault-injection, and opt-in live Linear contract tests
-for agent-dispatch v3 and install.sh.
+Unit, security/false-positive, end-to-end CLI fault-injection, parallel frontier, real-signal,
+and opt-in live Linear contract tests for agent-dispatch v5 and install.sh.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import http.server
 import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -20,6 +23,9 @@ import unittest
 from pathlib import Path
 from typing import Any
 from unittest import mock
+
+# Prevent SourceFileLoader from leaving .pyc artifacts inside bin/__pycache__
+sys.dont_write_bytecode = True
 
 WORKFLOW_ROOT = Path(__file__).resolve().parent.parent
 BIN_PATH = WORKFLOW_ROOT / "bin" / "agent-dispatch"
@@ -902,49 +908,243 @@ class TestUnitGatesAndParsing(unittest.TestCase):
                         return {"status": "completed", "summary": "done", "tests_run": ["unittest"], "discovered_issues": [], "blockers": ""}
                     return {"axis": kw["expected_axis"], "verdict": "pass", "hard_findings": [], "suggestions": [], "test_integrity_violation": False, "summary": "ok"}
 
-                def interrupt_during_publish(c: Any, i: Any, wt: Path, rd: Path, lf: Path, st: dict[str, Any]) -> None:
+                def interrupt_during_publish(c: Any, i: Any, wt: Path, rd: Path, lf: Path, st: dict[str, Any], **kw: Any) -> None:
                     st["push_attempted"] = True
                     st["stage"] = "pushing"
                     ad.save_checkpoint(rd, lf, st)
+                    # Simulate REAL signal handler setting lock-free _SHUTDOWN_SIGNAL before raising!
+                    ad._SHUTDOWN_SIGNAL = signal.SIGINT
                     raise KeyboardInterrupt("Simulated SIGINT mid-push")
 
                 with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CACHE_ROOT": str(cache_dir)}):
                     with mock.patch.object(ad, "invoke_harness", side_effect=fake_worker_invoke):
                         with mock.patch.object(ad, "reconcile_publish", side_effect=interrupt_during_publish):
-                            with self.assertRaises(KeyboardInterrupt):
-                                ad.execute_ticket(
-                                    client,
-                                    repo,
-                                    None,
-                                    "TST-SIG",
-                                    ad.parse_harness_spec("codex:sol"),
-                                    ad.parse_harness_spec("agy:neon"),
-                                    verify_cmd_override=None,
-                                    setup_cmd_override=None,
-                                    max_rework=0,
-                                    verify_timeout=60,
-                                    setup_timeout=60,
-                                    no_push=False,
-                                    allow_no_verify=False,
-                                    allow_gate_edits=False,
-                                    allow_test_edits=False,
-                                    allow_dirty_docs=True,
-                                    skip_baseline=True,
-                                    skip_project_check=True,
-                                    force_rerun=False,
-                                    fresh=False,
-                                )
+                            try:
+                                with self.assertRaises(KeyboardInterrupt):
+                                    ad.execute_ticket(
+                                        client,
+                                        repo,
+                                        None,
+                                        "TST-SIG",
+                                        ad.parse_harness_spec("codex:sol"),
+                                        ad.parse_harness_spec("agy:neon"),
+                                        verify_cmd_override=None,
+                                        setup_cmd_override=None,
+                                        max_rework=0,
+                                        verify_timeout=60,
+                                        setup_timeout=60,
+                                        no_push=False,
+                                        allow_no_verify=False,
+                                        allow_gate_edits=False,
+                                        allow_test_edits=False,
+                                        allow_dirty_docs=True,
+                                        skip_baseline=True,
+                                        skip_project_check=True,
+                                        force_rerun=False,
+                                        fresh=False,
+                                    )
+                            finally:
+                                ad._SHUTDOWN_SIGNAL = 0
                 rkey = ad.repo_cache_key(repo)
                 ckpt = json.loads((cache_dir / "runs" / rkey / "TST-SIG" / "latest.json").read_text(encoding="utf-8"))
                 self.assertEqual(ckpt["stage"], "pushing", "Publish-phase signal MUST NOT overwrite stage to 'error'!")
                 self.assertTrue(ckpt["push_attempted"])
-                # Linear MUST NOT have been rolled back to Todo, and MUST carry dispatch:publish-incomplete!
+                # Even with REAL _SHUTDOWN_SIGNAL set, finally MUST write dispatch:publish-incomplete + comment!
                 self.assertEqual(iss["state"]["name"], "In Progress")
                 self.assertIn("dispatch:publish-incomplete", [l["name"] for l in iss["_labels"]])
                 self.assertNotIn("dispatch:failed", [l["name"] for l in iss["_labels"]])
+                self.assertTrue(any("Publish Interrupted" in c["body"] for c in ls_state.comments[iss["id"]]))
             finally:
                 srv.shutdown()
                 srv.server_close()
+
+    def test_v5_regressions_opus_removed_opencode_verdict_mixed_tests_globs_remotes_and_parallel_baseline(self) -> None:
+        # 1. Opus/Claude aliases completely removed from agy harness
+        self.assertNotIn("opus", ad.HARNESS_ALIASES["agy"])
+        self.assertNotIn("sonnet", ad.HARNESS_ALIASES["agy"])
+        self.assertEqual(ad.parse_harness_spec("agy:neon").vendor, "google")
+
+        # 2. OpenCode NDJSON: earlier fenced `pass` MUST NEVER override trailing bare `fail`!
+        oc_stream = "\n".join(
+            [
+                json.dumps({"type": "step_start", "sessionID": "ses_1"}),
+                json.dumps(
+                    {
+                        "type": "text",
+                        "sessionID": "ses_1",
+                        "part": {
+                            "messageID": "m1",
+                            "text": 'Draft check:\n```json\n{"axis":"standards","verdict":"pass","hard_findings":[],"suggestions":[],"test_integrity_violation":false,"summary":"looks ok"}\n```',
+                        },
+                    }
+                ),
+                json.dumps({"type": "step_start", "sessionID": "ses_1"}),
+                json.dumps(
+                    {
+                        "type": "text",
+                        "sessionID": "ses_1",
+                        "part": {
+                            "messageID": "m2",
+                            "text": 'Final verdict:\n{"axis":"standards","verdict":"fail","hard_findings":["Null deref"],"suggestions":[],"test_integrity_violation":false,"summary":"Found bug"}',
+                        },
+                    }
+                ),
+            ]
+        )
+        parsed_txt = ad.parse_opencode_ndjson(oc_stream)
+        verdict_obj = ad.validate_schema(ad.extract_json_object(parsed_txt), ad.REVIEW_SCHEMA, expected_axis="standards")
+        self.assertEqual(verdict_obj["verdict"], "fail")
+        # Also verify extract_json_object alone when BOTH fenced pass and trailing bare fail are in the same message!
+        same_msg = (
+            '```json\n{"axis":"spec","verdict":"pass","hard_findings":[],"suggestions":[],"test_integrity_violation":false,"summary":"early"}\n```\n'
+            'Actually failed:\n{"axis":"spec","verdict":"fail","hard_findings":["Missing AC"],"suggestions":[],"test_integrity_violation":false,"summary":"final"}'
+        )
+        self.assertEqual(ad.extract_json_object(same_msg)["verdict"], "fail")
+
+        # 3. Path-segment globs & fenced code blocks in Authorized Gate/Test Changes
+        fenced_brief = (
+            "## Authorized Gate/Test Changes\n"
+            "Example:\n"
+            "```markdown\n"
+            "- gate: Makefile\n"
+            "```\n"
+            "> - gate: pyproject.toml\n"
+            "- gate: ?*\n"
+            "- gate: */*\n"
+            "- test: tests/*.py\n"
+        )
+        g_pats, t_pats = ad.parse_authorized_changes(fenced_brief)
+        self.assertEqual(g_pats, [], "Fenced/quoted/wildcard gate patterns MUST be rejected!")
+        self.assertEqual(t_pats, ["tests/*.py"])
+        self.assertTrue(ad.path_matches_any_pattern("tests/test_a.py", t_pats))
+        self.assertFalse(ad.path_matches_any_pattern("tests/nested/test_a.py", t_pats), "Single * MUST NOT cross /!")
+
+        # 4. Frontier MUST reject custom non-Todo unstarted states like 'Awaiting approval'
+        custom_unstarted = {
+            "identifier": "TST-WAIT",
+            "title": "Needs approval",
+            "state": {"name": "Awaiting approval", "type": "unstarted"},
+            "assignee": None,
+            "labels": {"nodes": [{"name": "agent-ready"}]},
+            "children": {"nodes": []},
+        }
+        self.assertFalse(ad.is_ready_for_frontier(custom_unstarted)[0])
+
+        # 5. GitHub URL parser handles SSH-over-443 & trailing .git/, and unknown remote fails closed
+        self.assertEqual(
+            ad.parse_github_owner_repo_url("ssh://git@ssh.github.com:443/K1ndredzzz/agent-workflow.git/"),
+            "K1ndredzzz/agent-workflow",
+        )
+        self.assertEqual(
+            ad.parse_github_owner_repo_url("https://github.com/K1ndredzzz/agent-workflow.git/"),
+            "K1ndredzzz/agent-workflow",
+        )
+        self.assertIsNone(ad.parse_github_owner_repo_url("git@github-work:org/repo.git"))
+
+        # 6. Mixed Python unittest+pytest repo MUST NOT silently fall back to unittest discover; JS lint-only with tests/ returns None!
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            py_repo = d / "py_mixed"
+            (py_repo / "tests").mkdir(parents=True)
+            (py_repo / "tests" / "test_mix.py").write_text(
+                "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self): self.assertEqual(1,1)\n"
+                "def test_pytest_fail():\n    assert False\n",
+                encoding="utf-8",
+            )
+            self.assertIsNone(ad.detect_verify_command(py_repo, None))
+
+            js_repo = d / "js_lint_only"
+            (js_repo / "tests").mkdir(parents=True)
+            (js_repo / "package.json").write_text('{"scripts": {"lint": "eslint ."}}', encoding="utf-8")
+            self.assertIsNone(ad.detect_verify_command(js_repo, None))
+
+            # 7. Standalone review blocks added secret BEFORE calling reviewer harness (0 LLM calls!)
+            s_repo = d / "sec_rev"
+            s_repo.mkdir()
+            _git(s_repo, "init", "-b", "main")
+            _git(s_repo, "config", "user.email", "t@example.com")
+            _git(s_repo, "config", "user.name", "T")
+            (s_repo / "a.py").write_text("OLD = 'lin_api_OLDSECRET1234567890'\n", encoding="utf-8")
+            _git(s_repo, "add", "-A")
+            _git(s_repo, "commit", "-m", "init")
+            b_sha = _git(s_repo, "rev-parse", "HEAD")
+            (s_repo / "a.py").write_text("NEW = 'github_pat_11ABCDEFG01234567890_abcdefghijklmnop'\n", encoding="utf-8")
+            _git(s_repo, "add", "-A")
+            _git(s_repo, "commit", "-m", "add secret")
+            c_sha = _git(s_repo, "rev-parse", "HEAD")
+            rev_calls = {"n": 0}
+            def count_invoke(*a: Any, **kw: Any) -> dict[str, Any]:
+                rev_calls["n"] += 1
+                return {"axis": kw["expected_axis"], "verdict": "pass", "hard_findings": [], "suggestions": [], "test_integrity_violation": False, "summary": "ok"}
+            with mock.patch.object(ad, "invoke_harness", side_effect=count_invoke):
+                with self.assertRaisesRegex(RuntimeError, "added secrets"):
+                    ad.run_two_axis_review(
+                        ad.parse_harness_spec("agy:neon"), s_repo, d / "r_sec", b_sha, c_sha, None, None, d / "std", {}, 1, block_added_secrets=True
+                    )
+            self.assertEqual(rev_calls["n"], 0, "Reviewer harness MUST NOT be invoked when added secrets detected!")
+
+            # Removing old secret redacts deleted secret line from diff-r1.patch before reviewer sees it!
+            (s_repo / "a.py").write_text("CLEAN = 'ok'\n", encoding="utf-8")
+            _git(s_repo, "add", "-A")
+            _git(s_repo, "commit", "-m", "remove secret")
+            clean_sha = _git(s_repo, "rev-parse", "HEAD")
+            with mock.patch.object(ad, "invoke_harness", side_effect=count_invoke):
+                res_cln = ad.run_two_axis_review(
+                    ad.parse_harness_spec("agy:neon"), s_repo, d / "r_cln", b_sha, clean_sha, None, None, d / "std2", {}, 1, block_added_secrets=True
+                )
+            self.assertTrue(res_cln["diff_redacted_for_review"])
+            self.assertNotIn("lin_api_OLDSECRET", (d / "r_cln" / "diff-r1.patch").read_text(encoding="utf-8"))
+
+            # 8. Reviewer transient RuntimeError auto-retries once!
+            flaky_n = {"n": 0}
+            def flaky_rt(*a: Any, **kw: Any) -> dict[str, Any]:
+                flaky_n["n"] += 1
+                if flaky_n["n"] == 1:
+                    raise RuntimeError("transient 503")
+                return {"axis": kw["expected_axis"], "verdict": "pass", "hard_findings": [], "suggestions": [], "test_integrity_violation": False, "summary": "ok"}
+            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_REVIEW_RETRY_SLEEP": "0"}):
+                with mock.patch.object(ad, "invoke_harness", side_effect=flaky_rt):
+                    r_ok = ad.run_two_axis_review(
+                        ad.parse_harness_spec("agy:neon"), s_repo, d / "r_flk", b_sha, clean_sha, None, None, d / "std3", {}, 1
+                    )
+            self.assertTrue(r_ok["passed"])
+            self.assertEqual(flaky_n["n"], 2)
+
+            # 9. Parallel 2-thread check_base_baseline on reused branch (cache miss, same base) MUST NOT delete each other's temp worktree!
+            bare = d / "par.git"
+            prepo = d / "par"
+            _git(d, "init", "--bare", "-b", "main", str(bare))
+            _git(d, "clone", str(bare), str(prepo))
+            _git(prepo, "config", "user.email", "t@example.com")
+            _git(prepo, "config", "user.name", "T")
+            (prepo / "test_ok.py").write_text("import unittest\nclass T(unittest.TestCase):\n    def test_ok(self): self.assertEqual(1,1)\n", encoding="utf-8")
+            _git(prepo, "add", "-A")
+            _git(prepo, "commit", "-m", "init")
+            _git(prepo, "push", "-u", "origin", "main")
+            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CACHE_ROOT": str(d / "par_cache")}):
+                wt1, _, base_sha = ad.prepare_worktree(prepo, "PAR-1", "main", issue_uuid="u1")
+                wt2, _, _ = ad.prepare_worktree(prepo, "PAR-2", "main", issue_uuid="u2")
+                for wt in (wt1, wt2):
+                    (wt / "f.txt").write_text("x\n", encoding="utf-8")
+                    _git(wt, "add", "f.txt")
+                    _git(wt, "commit", "-m", "ahead")
+                rkey = ad.repo_cache_key(prepo)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    f1 = pool.submit(ad.check_base_baseline, prepo, rkey, wt1, base_sha, "python3 -m unittest test_ok.py", d / "r1")
+                    f2 = pool.submit(ad.check_base_baseline, prepo, rkey, wt2, base_sha, "python3 -m unittest test_ok.py", d / "r2")
+                    res1, res2 = f1.result(), f2.result()
+                self.assertTrue(res1["passed"] and res2["passed"])
+                # One ran baseline, the other hit the exact baseline cache cleanly under per-key lock!
+                self.assertEqual(sorted([bool(res1.get("cached")), bool(res2.get("cached"))]), [False, True])
+
+            # 10. Multi-PR on same head fails closed BEFORE git push!
+            two_prs = [
+                {"number": 1, "url": "u1", "state": "OPEN", "isDraft": True, "baseRefName": "main", "headRefOid": "a" * 40},
+                {"number": 2, "url": "u2", "state": "OPEN", "isDraft": False, "baseRefName": "release", "headRefOid": "a" * 40},
+            ]
+            with mock.patch.object(ad, "fetch_open_prs_for_branch", return_value=two_prs):
+                with self.assertRaisesRegex(RuntimeError, "Multiple open PRs share head branch"):
+                    ad.fetch_open_pr_for_branch(prepo, "org/repo", "feat/x")
 
 
 # ---------------------------------------------------------------------------
@@ -1028,6 +1228,22 @@ elif mode == "tamper_gate_then_fix" and calls >= 2:
         "    def test_mul(self): self.assertEqual(mul(2,3), 6)\\n",
         encoding="utf-8",
     )
+elif mode == "blocked_dirty":
+    (cwd / "uncommitted_scratch.txt").write_text("partial work\\n", encoding="utf-8")
+    res = {{
+        "status": "blocked",
+        "summary": "Need clarification",
+        "tests_run": [],
+        "discovered_issues": [],
+        "blockers": "Missing API contract",
+    }}
+    out_file.write_text(json.dumps(res), encoding="utf-8")
+    sys.exit(0)
+elif mode == "parallel_safe":
+    import time as _t
+    if cwd.name.endswith("P2"):
+        _t.sleep(0.5)
+    (cwd / f"mod_{{cwd.name.lower()}}.py").write_text(f"VAL = '{{cwd.name}}'\\n", encoding="utf-8")
 elif mode == "crash":
     print("simulated codex crash", file=sys.stderr)
     sys.exit(1)
@@ -1145,12 +1361,16 @@ if args[:2] == ["pr", "edit"]:
 if args[:2] == ["auth", "status"]:
     print("Logged in as test")
     sys.exit(0)
-sys.exit(0)
+print(f"Unhandled fake gh command: {{args}}", file=sys.stderr)
+sys.exit(1)
 """,
         )
 
     def _run_cli(self, cli_args: list[str], *, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
+        # Isolate from parent AGENT_DISPATCH_CHILD and host ~/.gitconfig!
+        env.pop("AGENT_DISPATCH_CHILD", None)
+        env["GIT_CONFIG_GLOBAL"] = "/dev/null"
         env["PATH"] = f"{self.fake_bin}:{env['PATH']}"
         env["LINEAR_API_KEY"] = "lin_api_fake_e2e_key_1234567890"
         env["AGENT_DISPATCH_LINEAR_URL"] = self.linear_url
@@ -1310,7 +1530,8 @@ sys.exit(0)
         self.assertEqual(out_cov["status"], "passed_local")
         self.assertFalse((Path(out_cov["worktree"]) / "coverage.xml").exists())
 
-        # 2. Secret in Linear ticket title MUST be blocked BEFORE commit/push!
+        # 2. Secret in Linear ticket title MUST be blocked BEFORE calling any LLM harness (0 codex calls!)
+        codex_before_sec = int((self.root / "codex_calls.count").read_text()) if (self.root / "codex_calls.count").exists() else 0
         iss_sec = self.linear_state.add_issue(
             "TST-41",
             "Fix token github_pat_11ABCDEFG01234567890_abcdefghijklmnop leak",
@@ -1322,6 +1543,8 @@ sys.exit(0)
         out_sec = json.loads(res_sec.stdout)
         self.assertEqual(out_sec["status"], "secret_in_metadata")
         self.assertEqual(iss_sec["state"]["name"], "Todo")
+        codex_after_sec = int((self.root / "codex_calls.count").read_text()) if (self.root / "codex_calls.count").exists() else 0
+        self.assertEqual(codex_after_sec, codex_before_sec, "Title secret MUST fail BEFORE invoking worker harness!")
 
         # 3. Human cancels ticket mid-run -> finally MUST preserve Canceled (NEVER overwrite back to Todo)!
         iss_can = self.linear_state.add_issue(
@@ -1330,14 +1553,12 @@ sys.exit(0)
             "## What to Build\nAdd mul(a, b)\n\n## Testing Seam & Acceptance Criteria\n- [ ] mul(2, 3) == 6\n",
             labels=["agent-ready"],
         )
-        # Wait for claim -> flip state to Canceled before worker exits by hooking FakeLinearState via a quick in-process helper
         canceled_st = next(s for s in self.linear_state.states if s["name"] == "Canceled")
         orig_handle = self.linear_state.handle
 
         def cancel_after_claim(q: str, v: dict[str, Any]) -> dict[str, Any]:
             resp = orig_handle(q, v)
             if "mutation" in q and "issueUpdate" in q and v.get("id") == iss_can["id"] and v.get("stateId") == "st-prog":
-                # Simulate human canceling the ticket right after worker claims it!
                 iss_can["state"] = canceled_st
                 iss_can["updatedAt"] = "2026-11-24T23:59:59Z"
             return resp
@@ -1351,11 +1572,187 @@ sys.exit(0)
         self.assertEqual(iss_can["state"]["name"], "Canceled", "finally wrongly overwrote human Canceled state!")
         self.assertNotIn("dispatch:failed", [l["name"] for l in iss_can["_labels"]])
 
-        # 4. CLI rejects non-positive --max-parallel and --limit!
+        # 4. CLI rejects non-positive --max-parallel, --limit, and out-of-range --max-rework with exact error text!
         bad_par = self._run_cli(["frontier", "--max-parallel", "0", "--repo", str(self.repo)])
         self.assertEqual(bad_par.returncode, 2)
+        self.assertIn("--max-parallel", bad_par.stderr)
         bad_lim = self._run_cli(["frontier", "--limit", "-1", "--repo", str(self.repo)])
         self.assertEqual(bad_lim.returncode, 2)
+        self.assertIn("--limit", bad_lim.stderr)
+        bad_rw = self._run_cli(["frontier", "--max-rework", "9", "--repo", str(self.repo)])
+        self.assertEqual(bad_rw.returncode, 2)
+        self.assertIn("--max-rework", bad_rw.stderr)
+
+    def test_e2e_parallel_frontier_two_tickets_pass_and_cross_wave_touches_serialize(self) -> None:
+        """Directly tests Opus P0-1 & P1-6: 2 parallel tickets both pass without false tampering, and in-flight Touches block wave 2!"""
+        self.linear_state.add_issue(
+            "TST-P1",
+            "Parallel A",
+            "## What to Build\nMod A\n\n## Touches\n- mod_a\n\n## Testing Seam & Acceptance Criteria\n- [ ] ok\n",
+            labels=["agent-ready"],
+        )
+        self.linear_state.add_issue(
+            "TST-P2",
+            "Parallel B",
+            "## What to Build\nMod B\n\n## Touches\n- mod_b\n\n## Testing Seam & Acceptance Criteria\n- [ ] ok\n",
+            labels=["agent-ready"],
+        )
+        self.linear_state.add_issue(
+            "TST-P3",
+            "Overlaps A child path",
+            "## What to Build\nMod A sub\n\n## Touches\n- mod_a/sub\n\n## Testing Seam & Acceptance Criteria\n- [ ] ok\n",
+            labels=["agent-ready"],
+        )
+
+        res1 = self._run_cli(
+            ["frontier", "--max-parallel", "2", "--repo", str(self.repo), "--skip-baseline"],
+            extra_env={"FAKE_CODEX_MODE": "parallel_safe"},
+        )
+        self.assertEqual(res1.returncode, 0, res1.stderr + res1.stdout)
+        out1 = json.loads(res1.stdout)
+        self.assertEqual(out1["dispatched"], 2)
+        statuses = {r["issue"]: r["status"] for r in out1["results"]}
+        self.assertEqual(statuses, {"TST-P1": "passed", "TST-P2": "passed"}, out1)
+        self.assertEqual([d["id"] for d in out1["deferred_for_next_wave"]], ["TST-P3"])
+
+        # Second frontier while TST-P1 is still `In Review` MUST STILL defer TST-P3 across waves!
+        res2 = self._run_cli(
+            ["frontier", "--max-parallel", "2", "--repo", str(self.repo), "--skip-baseline"],
+            extra_env={"FAKE_CODEX_MODE": "parallel_safe"},
+        )
+        self.assertEqual(res2.returncode, 0, res2.stderr + res2.stdout)
+        out2 = json.loads(res2.stdout)
+        self.assertEqual(out2["dispatched"], 0)
+        self.assertEqual([d["id"] for d in out2["deferred_for_next_wave"]], ["TST-P3"])
+
+    def test_e2e_real_os_sigterm_during_push_records_publish_incomplete_and_resumes(self) -> None:
+        """Real OS SIGTERM sent to orchestrator during `git push`: MUST write dispatch:publish-incomplete + comment, then resume cleanly!"""
+        iss = self.linear_state.add_issue(
+            "TST-TERM",
+            "Real SIGTERM test",
+            "## What to Build\nAdd mul\n\n## Testing Seam & Acceptance Criteria\n- [ ] mul ok\n",
+            labels=["agent-ready"],
+        )
+        real_git = shutil.which("git")
+        assert real_git is not None
+        sig_marker = self.root / "sigterm_sent.flag"
+        sig_bin = self.root / "sigbin"
+        sig_bin.mkdir()
+        # Wrapper `git` that executes real push and sends real SIGTERM to parent orchestrator once!
+        _write_exec(
+            sig_bin / "git",
+            f"""#!/usr/bin/env python3
+import os, signal, subprocess, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+res = subprocess.run(["{real_git}", *args])
+marker = Path("{sig_marker}")
+if "push" in args and res.returncode == 0 and not marker.exists():
+    marker.write_text("1", encoding="utf-8")
+    os.kill(os.getppid(), signal.SIGTERM)
+sys.exit(res.returncode)
+""",
+        )
+        res1 = self._run_cli(
+            ["run", "TST-TERM", "--repo", str(self.repo), "--skip-baseline"],
+            extra_env={"PATH": f"{sig_bin}:{self.fake_bin}:{os.environ['PATH']}"},
+        )
+        self.assertTrue(sig_marker.exists(), "git push wrapper did not fire SIGTERM!")
+        self.assertEqual(res1.returncode, 128 + signal.SIGTERM, res1.stderr + res1.stdout)
+        # Checkpoint MUST keep resumable stage (pushing/pushed), NOT 'error'!
+        rkey = ad.repo_cache_key(self.repo)
+        ckpt = json.loads((self.cache_dir / "runs" / rkey / "TST-TERM" / "latest.json").read_text(encoding="utf-8"))
+        self.assertIn(ckpt["stage"], ("pushing", "pushed"))
+        # Linear MUST have dispatch:publish-incomplete + comment and MUST NOT have rolled back to Todo!
+        self.assertEqual(iss["state"]["name"], "In Progress")
+        self.assertIn("dispatch:publish-incomplete", [l["name"] for l in iss["_labels"]])
+        self.assertNotIn("dispatch:failed", [l["name"] for l in iss["_labels"]])
+        self.assertTrue(any("Publish Interrupted" in c["body"] for c in self.linear_state.comments[iss["id"]]))
+
+        # Now `resume` converges cleanly to passed!
+        res2 = self._run_cli(["resume", "TST-TERM", "--repo", str(self.repo)])
+        self.assertEqual(res2.returncode, 0, res2.stderr + res2.stdout)
+        out2 = json.loads(res2.stdout)
+        self.assertEqual(out2["status"], "passed")
+        self.assertEqual(iss["state"]["name"], "In Review")
+        self.assertNotIn("dispatch:publish-incomplete", [l["name"] for l in iss["_labels"]])
+
+    def test_e2e_resume_linear_state_synced_respects_closed_pr_and_human_todo_and_cleanup_branch_owner(self) -> None:
+        """Astra P0-1 & P0-6 + Opus P1-7 & P1-8: stage-aware resume, personal-branch cleanup protection, dirty blocked rerun, label-before-revert!"""
+        # 1. Stage-aware resume at linear_state_synced MUST NOT recreate a human-closed PR or overwrite human Todo!
+        iss = self.linear_state.add_issue(
+            "TST-SYNC",
+            "Stage aware resume",
+            "## What to Build\nAdd mul\n\n## Testing Seam & Acceptance Criteria\n- [ ] ok\n",
+            labels=["agent-ready"],
+        )
+        self.linear_state.fail_next_comment_create = True
+        res1 = self._run_cli(["run", "TST-SYNC", "--repo", str(self.repo), "--skip-baseline"])
+        self.assertEqual(res1.returncode, 1)
+        out1 = json.loads(res1.stdout)
+        self.assertEqual(out1["stage"], "linear_state_synced")
+
+        # Close PR #1 -> resume MUST refuse without creating PR #2!
+        prs = json.loads(self.gh_state_file.read_text())
+        prs[0]["state"] = "CLOSED"
+        self.gh_state_file.write_text(json.dumps(prs))
+        res_closed = self._run_cli(["resume", "TST-SYNC", "--repo", str(self.repo)])
+        self.assertEqual(res_closed.returncode, 2)
+        self.assertEqual(len(json.loads(self.gh_state_file.read_text())), 1, "resume MUST NOT recreate human-closed PR!")
+
+        # Reopen PR #1, move Linear back to Todo -> resume MUST refuse without forcing back to In Review!
+        prs[0]["state"] = "OPEN"
+        self.gh_state_file.write_text(json.dumps(prs))
+        todo_st = next(s for s in self.linear_state.states if s["name"] == "Todo")
+        iss["state"] = todo_st
+        res_todo = self._run_cli(["resume", "TST-SYNC", "--repo", str(self.repo)])
+        self.assertEqual(res_todo.returncode, 2)
+        self.assertEqual(iss["state"]["name"], "Todo")
+
+        # Restore In Review -> resume finishes ONLY Step 4 comment with ZERO `pr edit` calls!
+        rev_st = next(s for s in self.linear_state.states if s["name"] == "In Review")
+        iss["state"] = rev_st
+        gh_before = self.gh_calls_log.read_text(encoding="utf-8")
+        res_ok = self._run_cli(["resume", "TST-SYNC", "--repo", str(self.repo)])
+        self.assertEqual(res_ok.returncode, 0, res_ok.stderr + res_ok.stdout)
+        self.assertNotIn("pr edit", self.gh_calls_log.read_text(encoding="utf-8")[len(gh_before):])
+
+        # 2. Cleanup --all MUST NOT delete worktree switched by human to a personal branch!
+        wt = self.cache_dir / "worktrees" / ad.repo_cache_key(self.repo) / "TST-SYNC"
+        _git(wt, "checkout", "-b", "personal/wip")
+        clean_pers = self._run_cli(["cleanup", "--all", "--repo", str(self.repo)])
+        self.assertEqual(clean_pers.returncode, 0)
+        clean_pers_out = json.loads(clean_pers.stdout)
+        self.assertEqual(clean_pers_out["removed"], [])
+        self.assertTrue(any("branch ownership mismatch" in s for s in clean_pers_out["skipped"]), clean_pers_out)
+        self.assertTrue(wt.exists())
+
+        # 3. worker_blocked with uncommitted dirty file stashes cleanly so rerun succeeds WITHOUT --fresh, AND rollback adds label BEFORE state!
+        iss_blk = self.linear_state.add_issue(
+            "TST-BLK",
+            "Blocked then rerun",
+            "## What to Build\nAdd mul\n\n## Testing Seam & Acceptance Criteria\n- [ ] ok\n",
+            labels=["agent-ready"],
+        )
+        mut_before = len(self.linear_state.mutation_log)
+        res_blk = self._run_cli(
+            ["run", "TST-BLK", "--repo", str(self.repo), "--skip-baseline"],
+            extra_env={"FAKE_CODEX_MODE": "blocked_dirty"},
+        )
+        self.assertEqual(res_blk.returncode, 1)
+        self.assertEqual(json.loads(res_blk.stdout)["status"], "worker_blocked")
+        # Verify rollback added `dispatch:failed` BEFORE reverting state to `Todo`!
+        new_muts = self.linear_state.mutation_log[mut_before:]
+        lbl_idx = next(i for i, (k, d) in enumerate(new_muts) if k == "addLabels" and "dispatch:failed" in d["labels"])
+        todo_idx = next(i for i, (k, d) in enumerate(new_muts) if k == "state" and d["state"] == "Todo")
+        self.assertLess(lbl_idx, todo_idx, f"dispatch:failed MUST be added BEFORE reverting to Todo! log={new_muts}")
+
+        # Now rerun TST-BLK cleanly WITHOUT --fresh -> MUST succeed because blocked work was stashed!
+        iss_blk["_labels"] = [l for l in iss_blk["_labels"] if l["name"] != "dispatch:failed"]
+        res_rerun = self._run_cli(["run", "TST-BLK", "--repo", str(self.repo), "--skip-baseline"])
+        self.assertEqual(res_rerun.returncode, 0, res_rerun.stderr + res_rerun.stdout)
+        self.assertEqual(json.loads(res_rerun.stdout)["status"], "passed")
 
     def test_e2e_no_push_does_not_mutate_linear_and_crash_preserves_session_trace(self) -> None:
         iss = self.linear_state.add_issue(
@@ -1395,6 +1792,9 @@ sys.exit(0)
     def test_install_sh_preserves_unrelated_skills_and_backs_up_real_agents_md(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
+            # Copy install source into temp dir so the test NEVER mutates permissions in the live checkout!
+            src_copy = d / "workflow_src"
+            shutil.copytree(WORKFLOW_ROOT, src_copy, ignore=shutil.ignore_patterns(".git", "__pycache__"))
             ag_skills = d / "agent_skills"
             cx_skills = d / "codex_skills"
             cx_agents = d / "codex" / "AGENTS.md"
@@ -1413,7 +1813,7 @@ sys.exit(0)
                     "BIN_TARGET": str(bin_dst),
                 }
             )
-            subprocess.run([str(INSTALL_SH)], check=True, env=env, capture_output=True)
+            subprocess.run([str(src_copy / "install.sh")], check=True, env=env, capture_output=True)
             # Unrelated skill preserved!
             self.assertTrue((ag_skills / "my-custom-skill" / "SKILL.md").is_file())
             # Real AGENTS.md backed up, not destroyed!
