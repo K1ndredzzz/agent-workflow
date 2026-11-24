@@ -219,6 +219,37 @@ class TestLiveLinearReadOnlyContract(unittest.TestCase):
         issues = client.list_project_issues(projects[0]["id"], state_type="unstarted")
         self.assertIsInstance(issues, list)
 
+    def test_explicit_project_typo_fails_fast_without_fallback(self) -> None:
+        client = ad.LinearClient(ad.resolve_linear_auth())
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(RuntimeError):
+                ad.resolve_project(client, Path(td), explicit="definitely-nonexistent-project-xyz")
+
+    def test_update_issue_state_refreshes_in_memory_state(self) -> None:
+        class FakeClient(ad.LinearClient):
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def query(self, gql: str, variables=None, *, retry: bool = True):
+                sid = variables["stateId"]
+                self.calls.append(sid)
+                name = "In Progress" if sid == "s_prog" else "In Review"
+                return {"issueUpdate": {"success": True, "issue": {"id": "i1", "identifier": "K1N-1", "state": {"id": sid, "name": name, "type": "started"}}}}
+
+        fc = FakeClient()
+        issue = {
+            "id": "i1",
+            "identifier": "K1N-1",
+            "state": {"id": "s_rev", "name": "In Review", "type": "started"},
+            "team": {"states": {"nodes": [{"id": "s_prog", "name": "In Progress", "type": "started"}, {"id": "s_rev", "name": "In Review", "type": "started"}]}},
+        }
+        fc.update_issue_state(issue, "In Progress")
+        self.assertEqual(issue["state"]["id"], "s_prog")
+        # Rerun back to In Review MUST NOT skip mutation!
+        fc.update_issue_state(issue, "In Review")
+        self.assertEqual(fc.calls, ["s_prog", "s_rev"])
+        self.assertEqual(issue["state"]["id"], "s_rev")
+
 
 if __name__ == "__main__":
     unittest.main()

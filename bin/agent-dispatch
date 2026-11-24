@@ -2583,7 +2583,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     # 2. GitHub CLI auth
     gh_res = run_cmd(["gh", "auth", "status"], include_secrets=True)
-    checks["gh_auth"] = {"ok": gh_res.returncode == 0, "detail": redact_secrets((gh_res.stdout + gh_res.stderr).strip().splitlines()[:3] if (gh_res.stdout + gh_res.stderr).strip() else [])}
+    gh_text = redact_secrets((gh_res.stdout + "\n" + gh_res.stderr).strip())
+    checks["gh_auth"] = {"ok": gh_res.returncode == 0, "detail": gh_text.splitlines()[:3] if gh_text else []}
     if gh_res.returncode != 0:
         ok_all = False
 
