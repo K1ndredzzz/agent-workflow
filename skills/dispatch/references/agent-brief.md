@@ -12,7 +12,7 @@ End-to-end observable behavior this ticket delivers from the caller/user perspec
 - Public types, function signatures, schemas, invariants, and error modes.
 
 ## Touches
-- Module or shared-resource areas likely modified (e.g., `auth`, `migrations`, `src/routes`, `package.json`). Used to serialize overlapping parallel slices.
+- Module or shared-resource areas likely modified (e.g., `auth`, `migrations`, `src/routes`, `package.json`). List literal resource names or repository-relative paths. A parent path conflicts with all its descendants across batches.
 
 ## Testing Seam & Acceptance Criteria
 - **Seam**: <agreed public boundary>

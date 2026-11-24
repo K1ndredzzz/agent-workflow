@@ -6,5 +6,5 @@ Applies unless a repository-local `AGENTS.md` overrides a specific rule.
 - **No scope drift**: Record independent bugs or cleanup opportunities in your final report instead of fixing them inline.
 - **No defensive bloat**: Avoid speculative abstractions, unrequested config flags, or broad `try/catch` blocks that swallow errors.
 - **Behavior-first testing**: When changing runtime behavior, add or update tests at the public seam (Red -> Green) and preserve assertion strength.
-- **Read context safely**: Read `CODING_STANDARDS.md`, `CONTRIBUTING.md`, `GLOSSARY.md` (or `GLOSSARY-MAP.md`), active `docs/adr/` (ignore `superseded`/`deprecated` frontmatter status), and only the specific brief named in the current prompt. Never print or commit secrets.
+- **Read context safely**: Under `agent-dispatch`, use the brief and redacted standards snapshots named in the prompt. For interactive work, read `CODING_STANDARDS.md`, `CONTRIBUTING.md`, `GLOSSARY.md` (or `GLOSSARY-MAP.md`), active `docs/adr/` (ignore `superseded`/`deprecated` frontmatter status). Never print or commit secrets.
 - **Git boundary**: Never run `git push`, modify `main`/`master`, or deploy unless explicitly requested. Under `agent-dispatch`, leave committing to the orchestrator.

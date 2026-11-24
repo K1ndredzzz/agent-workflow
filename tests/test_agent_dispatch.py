@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -40,7 +41,7 @@ loader.exec_module(ad)
 
 
 def _git(cwd: Path, *args: str, check: bool = True) -> str:
-    return subprocess.run(["git", *args], cwd=str(cwd), text=True, capture_output=True, check=check).stdout.strip()
+    return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *args], cwd=str(cwd), text=True, capture_output=True, check=check).stdout.strip()
 
 
 def _write_exec(path: Path, body: str) -> None:
@@ -135,12 +136,26 @@ class FakeLinearState:
             nodes = [
                 {
                     **{k: v for k, v in i.items() if not k.startswith("_")},
-                    "labels": {"nodes": i["_labels"]},
+                    "labels": {"nodes": i["_labels"], "pageInfo": {"hasNextPage": False}},
                     "children": {"nodes": i["_children"]},
                 }
                 for i in uniq
             ]
             return {"data": {"project": {"id": self.project["id"], "name": self.project["name"], "issues": {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}
+        if "issueLabels(filter:" in query:
+            return {"data": {"issueLabels": {"nodes": []}}}
+        if "mutation" in query and ("issueAddLabel(" in query or "issueRemoveLabel(" in query):
+            iss = self.get_issue(variables["id"])
+            label = next(l for l in self.team_labels if l["id"] == variables["labelId"])
+            if "issueAddLabel(" in query:
+                if label not in iss["_labels"]:
+                    iss["_labels"].append(label)
+                operation, event = "issueAddLabel", "addLabels"
+            else:
+                iss["_labels"] = [l for l in iss["_labels"] if l["id"] != label["id"]]
+                operation, event = "issueRemoveLabel", "removeLabels"
+            self.mutation_log.append((event, {"id": iss["identifier"], "labels": [l["name"] for l in iss["_labels"]]}))
+            return {"data": {operation: {"success": True}}}
         if "mutation" in query and "issueLabelCreate" in query:
             name = variables["name"]
             ex = next((l for l in self.team_labels if l["name"].lower() == name.lower()), None)
@@ -162,28 +177,6 @@ class FakeLinearState:
                 iss["updatedAt"] = f"2026-11-24T00:00:{self._tick:02d}Z"
                 self.mutation_log.append(("state", {"id": iss["identifier"], "state": st["name"]}))
                 return {"data": {"issueUpdate": {"success": True, "issue": {"id": iss["id"], "identifier": iss["identifier"], "updatedAt": iss["updatedAt"], "state": st}}}}
-            if "addedLabelIds" in variables:
-                for lid in variables["addedLabelIds"]:
-                    lbl = next(l for l in self.team_labels if l["id"] == lid)
-                    if all(x["id"] != lid for x in iss["_labels"]):
-                        iss["_labels"].append(lbl)
-                self._tick += 1
-                iss["updatedAt"] = f"2026-11-24T00:00:{self._tick:02d}Z"
-                self.mutation_log.append(("addLabels", {"id": iss["identifier"], "labels": [l["name"] for l in iss["_labels"]]}))
-                return {"data": {"issueUpdate": {"success": True, "issue": {"updatedAt": iss["updatedAt"], "labels": {"nodes": iss["_labels"]}}}}}
-            if "removedLabelIds" in variables:
-                rem = set(variables["removedLabelIds"])
-                iss["_labels"] = [l for l in iss["_labels"] if l["id"] not in rem]
-                self._tick += 1
-                iss["updatedAt"] = f"2026-11-24T00:00:{self._tick:02d}Z"
-                self.mutation_log.append(("removeLabels", {"id": iss["identifier"], "labels": [l["name"] for l in iss["_labels"]]}))
-                return {"data": {"issueUpdate": {"success": True, "issue": {"updatedAt": iss["updatedAt"], "labels": {"nodes": iss["_labels"]}}}}}
-            if "labelIds" in variables:
-                iss["_labels"] = [l for l in self.team_labels if l["id"] in variables["labelIds"]]
-                self._tick += 1
-                iss["updatedAt"] = f"2026-11-24T00:00:{self._tick:02d}Z"
-                self.mutation_log.append(("setLabels", {"id": iss["identifier"], "labels": [l["name"] for l in iss["_labels"]]}))
-                return {"data": {"issueUpdate": {"success": True, "issue": {"updatedAt": iss["updatedAt"], "labels": {"nodes": iss["_labels"]}}}}}
         if "mutation" in query and "commentCreate" in query:
             if self.fail_next_comment_create:
                 self.fail_next_comment_create = False
@@ -212,12 +205,15 @@ class FakeLinearState:
 
 
 def start_fake_linear(state: FakeLinearState) -> tuple[http.server.ThreadingHTTPServer, str]:
+    lock = threading.Lock()
+
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length).decode("utf-8"))
-            resp = state.handle(body.get("query", ""), body.get("variables") or {})
-            data = json.dumps(resp).encode("utf-8")
+            with lock:
+                resp = state.handle(body.get("query", ""), body.get("variables") or {})
+                data = json.dumps(resp).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -238,7 +234,135 @@ def start_fake_linear(state: FakeLinearState) -> tuple[http.server.ThreadingHTTP
 # Unit Tests: Schemas, Regexes, False Positives, Gates & Touches
 # ---------------------------------------------------------------------------
 
-class TestUnitGatesAndParsing(unittest.TestCase):
+class IsolatedDispatchCase(unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        sandbox = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(sandbox),
+            "PATH": os.defpath + ":/usr/local/bin",
+            "LC_ALL": "C.UTF-8",
+            "AGENT_DISPATCH_CACHE_ROOT": str(sandbox / "cache"),
+            "AGENT_DISPATCH_LINEAR_URL": "http://127.0.0.1:1/graphql",
+            "LINEAR_API_KEY": "synthetic-test-credential",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_ALLOW_PROTOCOL": "file",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }, clear=True))
+        self.enterContext(mock.patch.object(ad, "MCP_CONFIG_PATH", sandbox / "unused-mcp.json"))
+
+
+class TestUnitGatesAndParsing(IsolatedDispatchCase):
+    def test_harness_model_policy_rejects_unlisted_names_and_tiers(self) -> None:
+        for spec in ("agy:opus", "agy:claude-sonnet", "agy:gemini-3", "agy:neon@bogus",
+                     "codex:6.1-sol", "opencode:sub2api/custom", "pi:other/gpt-6.2-astra"):
+            with self.subTest(spec=spec), self.assertRaises(ValueError):
+                ad.parse_harness_spec(spec)
+        for harness in ("codex", "opencode", "pi"):
+            for model in ("gpt-6.2-sol", "gpt-6.2-astra"):
+                self.assertTrue(ad.parse_harness_spec(f"{harness}:{model}").model.endswith(model))
+        for model in ("neon", "carbon", "argon", "hydrogen"):
+            self.assertTrue(ad.parse_harness_spec(f"agy:{model}").model.startswith("gemini-4-"))
+
+    def test_ndjson_incomplete_final_turn_cannot_reuse_prior_verdict(self) -> None:
+        text = '{"verdict":"pass"}'
+        previous = {"role": "assistant", "content": text, "stopReason": "stop"}
+        failed = {"role": "assistant", "content": [], "stopReason": "error"}
+        for final in ({"type": "message_update", "message": previous},
+                      {"type": "message_end", "message": failed},
+                      {"type": "agent_end", "messages": [previous, failed]}):
+            with self.subTest(event=final["type"]), self.assertRaises(ValueError):
+                ad.parse_pi_ndjson("\n".join(map(json.dumps, [{"type": "message_end", "message": previous}, final])))
+        oc = [{"type": "text", "part": {"text": text}}, {"type": "step_finish", "part": {"reason": "stop"}},
+              {"type": "step_start"}, {"type": "step_finish", "part": {"reason": "length"}}]
+        with self.assertRaises(ValueError):
+            ad.parse_opencode_ndjson("\n".join(map(json.dumps, oc)))
+        cx = [{"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+              {"type": "turn.completed"}, {"type": "turn.started"}]
+        with self.assertRaises(ValueError):
+            ad.parse_codex_ndjson("\n".join(map(json.dumps, cx)))
+
+    def test_streamed_logs_redact_credentials_before_persistence_and_on_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"UNIT_API_KEY": "synthetic-opaque-value"}):
+            d = Path(td)
+            payload = ("Bearer invented-only-example\n" + os.environ["UNIT_API_KEY"] + "\n"
+                       + "-----BEGIN " + "PRIVATE KEY-----\n" + "example-key-body\n"
+                       + "-----END " + "PRIVATE KEY-----\n")
+            code = ("import os,sys,time\nfor line in sys.stdin.buffer:\n"
+                    " for fd in (1,2):\n  os.write(fd,line[:5]); os.write(fd,line[5:])\n")
+            for timeout in (False, True):
+                args = [sys.executable, "-B", "-c", code + ("time.sleep(10)" if timeout else "")]
+                kw = dict(stdin_text=payload, cwd=d, stdout_path=d / "out", stderr_path=d / "err",
+                          timeout=0.5 if timeout else 5)
+                if timeout:
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        ad.run_cmd(args, **kw)
+                else:
+                    ad.run_cmd(args, **kw)
+                for file in (d / "out", d / "err"):
+                    body = file.read_text()
+                    self.assertIn("<REDACTED_SECRET>", body)
+                    for secret in ("invented-only-example", "example-key-body", os.environ["UNIT_API_KEY"]):
+                        self.assertNotIn(secret, body)
+
+    def test_review_prompt_result_trace_and_snapshots_are_redacted(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            secret = "lin_api_" + "syntheticvalue123456"
+            output = {"status": "completed", "summary": secret, "tests_run": [], "discovered_issues": [], "blockers": ""}
+            def codex_response(cmd, **kw):
+                self.assertNotIn(secret, kw["stdin_text"])
+                self.assertIn("--json", cmd)
+                self.assertNotIn("-o", cmd)
+                events = [{"type": "thread.started", "thread_id": "aaaa-bbbb"},
+                          {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(output)}},
+                          {"type": "turn.completed"}]
+                return subprocess.CompletedProcess(cmd, 0, "\n".join(map(json.dumps, events)), "")
+            with mock.patch.object(ad, "run_cmd", side_effect=codex_response):
+                result = ad.invoke_harness(ad.parse_harness_spec("codex"), secret, worktree=d, run_dir=d,
+                                           schema=ad.WORKER_SCHEMA, schema_file=d / "schema", prompt_file=d / "prompt",
+                                           out_file=d / "result", read_only=False, session_label=secret)
+                self.assertEqual(result["summary"], "<REDACTED_SECRET>")
+            for path in (d / "prompt", d / "result", d / "sessions.jsonl"):
+                self.assertNotIn(secret, path.read_text())
+            _git(d, "init", "-b", "main")
+            (d / "GLOSSARY.md").write_text(secret)
+            _git(d, "add", "GLOSSARY.md")
+            _git(d, "-c", "user.name=Test", "-c", "user.email=test@example.org", "commit", "-m", "baseline")
+            ad.snapshot_baseline_standards(d, "HEAD", d / "standards")
+            self.assertNotIn(secret, (d / "standards" / "GLOSSARY.md").read_text())
+
+    def test_child_git_config_cannot_inherit_auth_rewrites_or_env_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / ".gitconfig").write_text('[url "https://fictional-token@invalid.example/"]\n    insteadOf = local:!\n')
+            with mock.patch.dict(os.environ, {"HOME": td, "AGENT_DISPATCH_CACHE_ROOT": str(d / "cache"),
+                                               "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_VALUE_0": "fictional-token",
+                                               "GIT_CONFIG_KEY_0": "http.extraHeader", "GIT_TRACE": "1"}):
+                env = ad.build_child_env()
+            self.assertFalse({"GIT_CONFIG_COUNT", "GIT_CONFIG_VALUE_0", "GIT_TRACE"} & env.keys())
+            self.assertEqual(Path(env["GIT_CONFIG_GLOBAL"]).read_text(), "")
+            self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
+
+    def test_pi_session_replay_preserves_native_entries_and_redacts_on_interrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            archive = d / "session.jsonl"
+            secret = "lin_api_" + "syntheticpioutput12345"
+            entry = {"type": "message", "id": "a1", "parentId": None, "message": {"content": secret}}
+            with self.assertRaises(KeyboardInterrupt):
+                with ad._pi_session_archive(archive, "11111111-2222-3333-4444-555555555555", d) as native:
+                    subprocess.run([sys.executable, "-B", "-c",
+                                    "import sys; open(sys.argv[1], 'a').write(sys.stdin.read())", native],
+                                   input=json.dumps(entry) + "\n" + '{"type":', text=True, check=True)
+                    self.assertFalse(archive.exists())
+                    raise KeyboardInterrupt
+            header, message = map(json.loads, archive.read_text().splitlines())
+            self.assertEqual(header["version"], 3)
+            self.assertEqual(message["id"], "a1")
+            self.assertEqual(message["message"]["content"], "<REDACTED_SECRET>")
+
     def test_harness_aliases_and_heterogeneous_reviewer(self) -> None:
         w_codex = ad.parse_harness_spec("codex:sol@xhigh")
         self.assertEqual(w_codex.label, "codex:gpt-6.2-sol@xhigh")
@@ -325,7 +449,7 @@ class TestUnitGatesAndParsing(unittest.TestCase):
             "github_pat_11ABCDEFG01234567890_abcdefghijklmnop",
             "sk_live_1234567890abcdef12",
             "xoxb-1234567890-abcdef",
-            "AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGqeTA",
+            "AIza" + "X" * 35,
             "glpat-1234567890abcdefghij",
         ):
             self.assertEqual(ad.redact_secrets(f"key={sample}"), "key=<REDACTED_SECRET>", f"Missed redaction for {sample}")
@@ -356,6 +480,158 @@ class TestUnitGatesAndParsing(unittest.TestCase):
                 self.assertNotIn("GH_TOKEN", codex_env)
                 self.assertNotIn("SSH_AUTH_SOCK", codex_env)
 
+    def test_authorization_requires_real_heading_and_matching_fence(self) -> None:
+        brief = (
+            "````md\n## Authorized Gate/Test Changes\n- gate: Makefile\n```\n"
+            "- gate: pytest.ini\n````\n## Authorized Gate/Test Changes\n"
+            "    - gate: setup.py\n~~~\n```\n- gate: setup.cfg\n~~~\n- gate: src/Makefile\n"
+            "# Out of scope\n- gate: Cargo.toml\n"
+        )
+        self.assertEqual(ad.parse_authorized_changes(brief), (["src/Makefile"], []))
+
+    def test_mixed_and_zero_collection_cannot_pass_verify(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tests = root / "tests"
+            tests.mkdir()
+            case = tests / "test_case.py"
+            with mock.patch.object(ad.shutil, "which", return_value=None):
+                for source in ("class TestPlain:\n    def test_fail(self): assert False\n",
+                               "async def test_fail(): assert False\n"):
+                    case.write_text(source)
+                    self.assertIsNone(ad.detect_verify_command(root, None))
+                case.write_text("from unittest import TestCase as Case\nclass Base(Case): pass\nclass TestApp(Base): pass\n")
+                cmd = ad.detect_verify_command(root, None)
+                self.assertIsNotNone(cmd)
+                _git(root, "init", "-b", "main")
+                with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CACHE_ROOT": str(root / "cache")}):
+                    # Python versions before 3.12 exit successfully after collecting zero tests.
+                    result = ad.run_verify_gate(root, f"{cmd} || true", allow_no_verify=False, log_file=root / "cache/log",
+                                                repo_key="test-zero")
+                self.assertFalse(result["passed"])
+                self.assertIn("zero tests", result["output"])
+            case.unlink()
+            (root / "pyproject.toml").touch()
+            (root / "test_app.py").write_text("def test_fail(): assert False")
+            with mock.patch.object(ad.shutil, "which", side_effect=lambda name: "/mock/ruff" if name == "ruff" else None):
+                self.assertIsNone(ad.detect_verify_command(root, None))
+            tests.rmdir()
+            (root / "src").mkdir()
+            (root / "src" / "thing.spec.tsx").touch()
+            (root / "package.json").write_text('{"scripts":{"lint":"eslint ."}}')
+            self.assertIsNone(ad.detect_verify_command(root, None))
+
+    def test_git_secret_scan_covers_binary_added_text_names_and_intermediate_commits(self) -> None:
+        token = "lin_api_" + "SYNTHETICEXAMPLE012345"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _git(root, "init", "-b", "main")
+            _git(root, "config", "user.email", "test@example.invalid")
+            _git(root, "config", "user.name", "Test")
+            _git(root, "commit", "--allow-empty", "-m", "base")
+            base = _git(root, "rev-parse", "HEAD")
+            for name, content in [("asset.dat", b"\0 " + token.encode()), ("text", ("++ " + token).encode()),
+                                  (token, b"ordinary")]:
+                with self.subTest(file_kind="name" if name == token else name):
+                    path = root / name
+                    path.write_bytes(content)
+                    _git(root, "add", "--", name)
+                    hits = ad.scan_staged_for_secrets(root)
+                    self.assertTrue(hits)
+                    self.assertNotIn(token, str(hits))
+                    _git(root, "commit", "-m", "introduce fixture")
+                    head = _git(root, "rev-parse", "HEAD")
+                    self.assertTrue(ad.scan_range_for_secrets(root, base, head))
+                    path.unlink()
+                    _git(root, "commit", "-am", "remove fixture")
+                    cleaned = _git(root, "rev-parse", "HEAD")
+                    self.assertFalse(ad.scan_range_for_secrets(root, head, cleaned))
+                    self.assertTrue(ad.scan_range_for_secrets(root, base, cleaned))
+                    base = cleaned
+
+    def test_nested_protected_files_and_literal_test_pathspecs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _git(root, "init", "-b", "main")
+            _git(root, "config", "user.email", "test@example.invalid")
+            _git(root, "config", "user.name", "Test")
+            _git(root, "commit", "--allow-empty", "-m", "base")
+            files = {"packages/a/.cargo/config.toml": "", "packages/a/package.json": '{"scripts":{"test":"true"}}',
+                     "packages/a/docs/adr/decision.md": "doc", "tests/test_[fixture].py": "@unittest.skip('reason')"}
+            for name, content in files.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content)
+            _git(root, "add", "-A")
+            _git(root, "commit", "-m", "candidate")
+            protected = ad.check_protected_paths(root, "HEAD^", "HEAD")
+            self.assertTrue(all(any(path in hit for hit in protected) for path in list(files)[:3]))
+            self.assertTrue(ad.check_test_integrity_diff(root, "HEAD^", "HEAD"))
+
+    def test_secret_edits_remain_in_place_without_new_git_objects_or_stash(self) -> None:
+        token = "lin_api_" + "SYNTHETICWORKTREEEXAMPLE"
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            _git(repo, "init", "-b", "main")
+            _git(repo, "config", "user.email", "test@example.invalid")
+            _git(repo, "config", "user.name", "Test")
+            tracked = repo / "tracked.txt"
+            tracked.write_text("base")
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-m", "base")
+            for path in (tracked, repo / "new.dat"):
+                path.write_text(token)
+                digest = _git(repo, "hash-object", str(path))
+                index_before = _git(repo, "ls-files", "--stage")
+                _, hits = ad.orchestrator_commit(repo, "SYN-1", "local edits", 1)
+                self.assertTrue(hits)
+                ad._stash_dirty_worktree_for_safe_rerun(repo, "halt")
+                self.assertEqual(_git(repo, "stash", "list"), "")
+                self.assertEqual(_git(repo, "ls-files", "--stage"), index_before)
+                self.assertEqual(path.read_text(), token)
+                self.assertEqual(_git(repo, "cat-file", "-t", digest, check=False), "")
+                if path == tracked:
+                    path.write_text("base")
+                else:
+                    path.unlink()
+            # The stash index parent would contain this value even when the worktree is clean.
+            tracked.write_text(token)
+            _git(repo, "add", str(tracked))
+            tracked.write_text("base")
+            index_before = _git(repo, "ls-files", "--stage")
+            ad._stash_dirty_worktree_for_safe_rerun(repo, "halt")
+            self.assertEqual(_git(repo, "stash", "list"), "")
+            self.assertEqual(_git(repo, "ls-files", "--stage"), index_before)
+            self.assertEqual(tracked.read_text(), "base")
+            _git(repo, "reset", "--", "tracked.txt")
+            (repo / "safe.txt").write_text("save me")
+            with mock.patch.object(ad, "_SHUTDOWN_SIGNAL", signal.SIGHUP):
+                ad._stash_dirty_worktree_for_safe_rerun(repo, "halt")
+            self.assertIn("halt", _git(repo, "stash", "list"))
+            self.assertEqual(_git(repo, "show", "stash^3:safe.txt"), "save me")
+
+    def test_baseline_cache_distinguishes_setup_and_rejects_changed_head(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "repo"
+            repo.mkdir()
+            _git(repo, "init", "-b", "main")
+            _git(repo, "config", "user.email", "test@example.invalid")
+            _git(repo, "config", "user.name", "Test")
+            _git(repo, "commit", "--allow-empty", "-m", "base")
+            base = _git(repo, "rev-parse", "HEAD")
+            _git(repo, "commit", "--allow-empty", "-m", "ahead")
+            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CACHE_ROOT": str(root / "cache")}):
+                for setup, passed in [("touch marker", True), ("true", False)]:
+                    result = ad.check_base_baseline(repo, "r", repo, base, "test -f marker", root / "run", setup_cmd_override=setup)
+                    self.assertEqual(result["passed"], passed)
+                    self.assertFalse(result["cached"])
+                for verify in ("git commit --allow-empty -m change", "git switch -c other && false"):
+                    with self.assertRaisesRegex(RuntimeError, "changed the worktree branch or HEAD"):
+                        ad.check_base_baseline(repo, "r", repo, base, verify, root / "run")
+                self.assertFalse(list((root / "cache/worktrees/r").glob(".baseline-*")))
+                self.assertEqual(_git(repo, "worktree", "list", "--porcelain").count("worktree "), 1)
+
     def test_justfile_and_makefile_variable_assignments_not_misdetected(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
@@ -365,6 +641,63 @@ class TestUnitGatesAndParsing(unittest.TestCase):
             self.assertIsNone(ad.detect_verify_command(d, None))
             (d / "Justfile").write_text('verify := "nope"\nverify:\n    pytest\n', encoding="utf-8")
             self.assertEqual(ad.detect_verify_command(d, None), "just verify")
+
+    def test_linear_transient_reads_and_credential_redirect_policy(self) -> None:
+        from io import BytesIO
+        responses = [
+            {"errors": [{"extensions": {"code": "RATELIMITED"}}]},
+            {"data": {"ok": True}},
+        ]
+        def boundary(request, timeout):
+            self.assertEqual(request.get_header("Authorization"), "synthetic-test-credential")
+            self.assertNotIn("Authorization", request.headers)  # urllib only copies these headers on redirect
+            return BytesIO(json.dumps(responses.pop(0)).encode())
+        with mock.patch.object(ad.urllib.request, "urlopen", side_effect=boundary), mock.patch.object(ad.time, "sleep"):
+            self.assertEqual(ad.LinearClient("synthetic-test-credential").query("query { ok }"), {"ok": True})
+        self.assertFalse(responses)
+
+    def test_linear_auth_normalizes_personal_key_and_oauth(self) -> None:
+        key = "lin_api_" + "X" * 24
+        for value, expected in [(key, key), ("Bearer " + key, key), ("test-oauth", "Bearer test-oauth")]:
+            with mock.patch.dict(os.environ, {"LINEAR_API_KEY": value}):
+                self.assertEqual(ad.resolve_linear_auth(), expected)
+
+    def test_shutdown_interrupts_contended_file_lock(self) -> None:
+        path = Path(os.environ["AGENT_DISPATCH_CACHE_ROOT"]) / "verify.lock"
+        with ad.file_lock(path):
+            with mock.patch.object(ad, "_SHUTDOWN_SIGNAL", signal.SIGTERM):
+                with self.assertRaises(SystemExit):
+                    with ad.file_lock(path):
+                        self.fail("shutdown waiter acquired the lock")
+
+    def test_label_pagination_and_concurrent_human_labels(self) -> None:
+        client = ad.LinearClient("synthetic-test-credential")
+        rows = [{"id": "one", "labels": {"nodes": [], "pageInfo": {"hasNextPage": True}}}]
+        pages = [
+            {"issue": {"labels": {"nodes": [{"id": "a", "name": "A"}], "pageInfo": {"hasNextPage": True, "endCursor": "next"}}}},
+            {"issue": {"labels": {"nodes": [{"id": "b", "name": "B"}], "pageInfo": {"hasNextPage": False}}}},
+        ]
+        with mock.patch.object(client, "query", side_effect=pages) as query:
+            client._complete_issue_labels(rows)
+            self.assertEqual([x["id"] for x in rows[0]["labels"]["nodes"]], ["a", "b"])
+            self.assertEqual(query.call_args.args[1]["after"], "next")
+        labels = {"human-A"}
+        def boundary(query, variables, **_):
+            if "issueAddLabel(" in query:
+                labels.add("concurrent-human")
+                labels.add(variables["labelId"])
+                return {"issueAddLabel": {"success": True}}
+            if "issueRemoveLabel(" in query:
+                labels.remove(variables["labelId"])
+                return {"issueRemoveLabel": {"success": True}}
+            if "labels(first:" in query:
+                return {"issue": {"labels": {"nodes": [{"id": x, "name": x} for x in labels], "pageInfo": {"hasNextPage": False}}}}
+            self.fail("unexpected label operation")
+        issue = {"id": "one", "team": {"labels": {"nodes": [{"id": "dispatch:failed", "name": "dispatch:failed"}]}}}
+        with mock.patch.object(client, "query", side_effect=boundary):
+            client.ensure_label_and_add(issue, "dispatch:failed")
+            client.remove_labels_if_present(issue, {"dispatch:failed"})
+        self.assertEqual(labels, {"human-A", "concurrent-human"})
 
     def test_touches_wave_selection_frontier_label_and_fail_closed_authorization(self) -> None:
         self.assertEqual(ad.parse_touches("## Touches\n- n/a\n"), set())
@@ -490,6 +823,7 @@ class TestUnitGatesAndParsing(unittest.TestCase):
                                 },
                             }
                         ),
+                        json.dumps({"type": "step_finish", "part": {"reason": "stop"}}),
                     ]
                 )
                 return subprocess.CompletedProcess(cmd, 0, stdout=ndjson, stderr="")
@@ -601,7 +935,7 @@ class TestUnitGatesAndParsing(unittest.TestCase):
             # 1. PR feedback: empty authorAssociation & NONE MUST be rejected; OWNER accepted; paginated --slurp flattened!
             def fake_gh(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
                 if cmd[:3] == ["gh", "pr", "list"]:
-                    return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps([{"number": 7, "url": "u", "isDraft": True}]), stderr="")
+                    return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps([{"number": 7, "url": "u", "isDraft": True, "isCrossRepository": False, "headRefName": "feat/x"}, {"number": 8, "isCrossRepository": True, "headRefName": "feat/x"}]), stderr="")
                 if cmd[:3] == ["gh", "pr", "view"]:
                     payload = {
                         "reviews": [
@@ -748,7 +1082,7 @@ class TestUnitGatesAndParsing(unittest.TestCase):
                     "stage": "verified_and_reviewed",
                 }
                 # 1. Existing non-Draft PR MUST fail BEFORE git push!
-                non_draft = {"number": 5, "url": "u", "isDraft": False, "baseRefName": "main", "headRefOid": "0" * 40}
+                non_draft = {"state": "OPEN", "number": 5, "url": "u", "isDraft": False, "baseRefName": "main", "headRefOid": "0" * 40}
                 with mock.patch.dict(os.environ, {"AGENT_DISPATCH_FORCE_GH": "1", "AGENT_DISPATCH_CACHE_ROOT": str(d / "cache")}):
                     with mock.patch.object(ad, "fetch_open_pr_for_branch", return_value=non_draft):
                         with self.assertRaisesRegex(RuntimeError, "not a Draft PR"):
@@ -989,6 +1323,7 @@ class TestUnitGatesAndParsing(unittest.TestCase):
                         },
                     }
                 ),
+                json.dumps({"type": "step_finish", "part": {"reason": "stop"}}),
             ]
         )
         parsed_txt = ad.parse_opencode_ndjson(oc_stream)
@@ -1051,7 +1386,8 @@ class TestUnitGatesAndParsing(unittest.TestCase):
                 "def test_pytest_fail():\n    assert False\n",
                 encoding="utf-8",
             )
-            self.assertIsNone(ad.detect_verify_command(py_repo, None))
+            with mock.patch.object(ad.shutil, "which", return_value=None):
+                self.assertIsNone(ad.detect_verify_command(py_repo, None))
 
             js_repo = d / "js_lint_only"
             (js_repo / "tests").mkdir(parents=True)
@@ -1090,10 +1426,10 @@ class TestUnitGatesAndParsing(unittest.TestCase):
             clean_sha = _git(s_repo, "rev-parse", "HEAD")
             with mock.patch.object(ad, "invoke_harness", side_effect=count_invoke):
                 res_cln = ad.run_two_axis_review(
-                    ad.parse_harness_spec("agy:neon"), s_repo, d / "r_cln", b_sha, clean_sha, None, None, d / "std2", {}, 1, block_added_secrets=True
+                    ad.parse_harness_spec("agy:neon"), s_repo, d / "r_cln", c_sha, clean_sha, None, None, d / "std2", {}, 1, block_added_secrets=True
                 )
             self.assertTrue(res_cln["diff_redacted_for_review"])
-            self.assertNotIn("lin_api_OLDSECRET", (d / "r_cln" / "diff-r1.patch").read_text(encoding="utf-8"))
+            self.assertNotIn("github_pat_11ABC", (d / "r_cln" / "diff-r1.patch").read_text(encoding="utf-8"))
 
             # 8. Reviewer transient RuntimeError auto-retries once!
             flaky_n = {"n": 0}
@@ -1151,8 +1487,9 @@ class TestUnitGatesAndParsing(unittest.TestCase):
 # End-to-End Subprocess CLI Fault-Injection Suite
 # ---------------------------------------------------------------------------
 
-class TestEndToEndCLIFaultInjection(unittest.TestCase):
+class TestEndToEndCLIFaultInjection(IsolatedDispatchCase):
     def setUp(self) -> None:
+        super().setUp()
         self.td = tempfile.TemporaryDirectory()
         self.root = Path(self.td.name)
         self.cache_dir = self.root / "cache"
@@ -1195,7 +1532,7 @@ class TestEndToEndCLIFaultInjection(unittest.TestCase):
         _write_exec(
             self.fake_bin / "codex",
             f"""#!/usr/bin/env python3
-import json, os, sys
+import fcntl, json, os, sys
 from pathlib import Path
 
 assert os.environ.get("AGENT_DISPATCH_CHILD") == "1", "Missing anti-nesting env"
@@ -1204,16 +1541,25 @@ assert "GH_TOKEN" not in os.environ, "GH_TOKEN leaked to codex!"
 assert "--trust" not in sys.argv, "--trust must not be passed (mutates global config.toml)!"
 assert "mcp_servers.linear.enabled=false" in sys.argv, "Linear MCP must be disabled in headless codex!"
 
-# Parse -o <out_file> and -C <cwd>
+# Emit the actual Codex JSONL protocol and validate the working directory
 args = sys.argv[1:]
-out_file = Path(args[args.index("-o") + 1])
+assert "--json" in args and "-o" not in args
 cwd = Path(args[args.index("-C") + 1])
 mode = os.environ.get("FAKE_CODEX_MODE", "good")
 counter_file = Path("{self.root}/codex_calls.count")
-calls = int(counter_file.read_text()) + 1 if counter_file.exists() else 1
-counter_file.write_text(str(calls))
+with counter_file.open("a+") as counter:
+    fcntl.flock(counter, fcntl.LOCK_EX)
+    counter.seek(0)
+    calls = int(counter.read() or "0") + 1
+    counter.seek(0)
+    counter.truncate()
+    counter.write(str(calls))
 
-print(f"session id: 11111111-2222-3333-4444-{{calls:012d}}", file=sys.stderr)
+print(json.dumps({{"type": "thread.started", "thread_id": f"11111111-2222-3333-4444-{{calls:012d}}"}}), flush=True)
+print(json.dumps({{"type": "turn.started"}}))
+def finish(res):
+    print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", "text": json.dumps(res)}}}}))
+    print(json.dumps({{"type": "turn.completed"}}))
 
 if mode == "tamper_gate_then_fix" and calls == 1:
     (cwd / "Makefile").write_text("verify:\\n\\ttrue\\n", encoding="utf-8")
@@ -1237,7 +1583,7 @@ elif mode == "blocked_dirty":
         "discovered_issues": [],
         "blockers": "Missing API contract",
     }}
-    out_file.write_text(json.dumps(res), encoding="utf-8")
+    finish(res)
     sys.exit(0)
 elif mode == "parallel_safe":
     import time as _t
@@ -1263,7 +1609,7 @@ res = {{
     "discovered_issues": ["Consider adding div() later"],
     "blockers": "",
 }}
-out_file.write_text(json.dumps(res), encoding="utf-8")
+finish(res)
 """,
         )
 
@@ -1306,11 +1652,13 @@ print(json.dumps(wrapper))
         _write_exec(
             self.fake_bin / "gh",
             f"""#!/usr/bin/env python3
-import json, subprocess, sys
+import fcntl, json, subprocess, sys
 from pathlib import Path
 
 db = Path("{self.gh_state_file}")
 calls_log = Path("{self.gh_calls_log}")
+db_lock = db.with_suffix(".lock").open("a")
+fcntl.flock(db_lock, fcntl.LOCK_EX)
 prs = json.loads(db.read_text())
 args = sys.argv[1:]
 with calls_log.open("a", encoding="utf-8") as fh:
@@ -1319,7 +1667,7 @@ with calls_log.open("a", encoding="utf-8") as fh:
 if args[:2] == ["pr", "list"]:
     head = args[args.index("--head") + 1] if "--head" in args else ""
     state = args[args.index("--state") + 1] if "--state" in args else "open"
-    matched = [p for p in prs if p["head"] == head and p["state"].lower() == state.lower()]
+    matched = [p for p in prs if p["head"] == head and (state == "all" or p["state"].lower() == state.lower())]
     print(json.dumps(matched))
     sys.exit(0)
 if args[:2] == ["pr", "view"]:
@@ -1333,12 +1681,14 @@ if args[:2] == ["pr", "create"]:
     head = args[args.index("--head") + 1]
     base = args[args.index("--base") + 1]
     title = args[args.index("--title") + 1]
-    body = args[args.index("--body") + 1]
+    body = Path(args[args.index("--body-file") + 1]).read_text()
     sha = subprocess.run(["git", "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
     pr = {{
         "number": len(prs) + 1,
         "url": f"https://github.com/test/demo-repo/pull/{{len(prs)+1}}",
         "head": head,
+        "headRefName": head,
+        "isCrossRepository": False,
         "baseRefName": base,
         "title": title,
         "body": body,
@@ -1386,6 +1736,109 @@ sys.exit(1)
             capture_output=True,
             env=env,
         )
+
+    def test_mismatched_push_destination_aborts_before_claim(self) -> None:
+        self.linear_state.add_issue("TST-DEST", "Destination", "hello")
+        unrelated = self.root / "other.git"
+        _git(self.root, "init", "--bare", str(unrelated))
+        _git(self.repo, "remote", "set-url", "--push", "origin", str(unrelated))
+        run = self._run_cli(["run", "TST-DEST", "--repo", str(self.repo)])
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("destinations", run.stderr)
+        self.assertEqual(self.linear_state.mutation_log, [])
+        self.assertEqual(_git(unrelated, "for-each-ref"), "")
+
+    def test_resume_interrupted_claim_only_restores_owned_state(self) -> None:
+        issue = self.linear_state.add_issue("TST-CLAIM", "Claim", "scope", state_name="In Progress")
+        ticket_dir = self.cache_dir / "runs" / ad.repo_cache_key(self.repo) / issue["identifier"]
+        run_dir = ticket_dir / "claim-run"
+        run_dir.mkdir(parents=True)
+        state = {"stage": "claim_pending", "issue_uuid": issue["id"], "run_dir": str(run_dir),
+                 "pre_claim_state_id": "st-todo", "claimed_state_id": "st-prog",
+                 "claimed_ownership": {"description_sha": ad.sha256_text("scope"), "assignee_id": ""}}
+        ad.save_checkpoint(run_dir, ticket_dir / "latest.json", state)
+        args = ["resume", issue["identifier"], "--repo", str(self.repo)]
+        issue["assignee"] = {"id": "human", "name": "Human"}
+        self.assertNotEqual(self._run_cli(args).returncode, 0)
+        self.assertEqual(self.linear_state.mutation_log, [])
+        issue["assignee"] = None
+        restored = self._run_cli(args)
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertEqual(issue["state"]["name"], "Todo")
+        self.assertIn("dispatch:failed", [label["name"] for label in issue["_labels"]])
+        count = len(self.linear_state.mutation_log)
+        self.assertEqual(self._run_cli(args).returncode, 0)
+        self.assertEqual(len(self.linear_state.mutation_log), count)
+
+    def test_resume_preserves_human_changes_at_early_publish_stages(self) -> None:
+        issue = self.linear_state.add_issue("TST-PUB", "Publish", "Add multiply", labels=["agent-ready"])
+        self.linear_state.fail_next_comment_create = True
+        first = self._run_cli(["run", issue["identifier"], "--repo", str(self.repo), "--skip-baseline"])
+        self.assertEqual(first.returncode, 1, first.stderr)
+        run_dir = Path(json.loads(first.stdout)["run_dir"])
+        latest = run_dir.parent / "latest.json"
+        state = json.loads(latest.read_text())
+        self.assertEqual(state["stage"], "linear_state_synced")
+        args = ["resume", issue["identifier"], "--repo", str(self.repo)]
+        state["stage"] = "pr_ready"
+        ad.save_checkpoint(run_dir, latest, state)
+        issue["state"] = self.linear_state.states[1]  # Todo
+        count = len(self.linear_state.mutation_log)
+        self.assertNotEqual(self._run_cli(args).returncode, 0)
+        self.assertEqual(len(self.linear_state.mutation_log), count)
+        issue["state"] = self.linear_state.states[2]  # In Progress
+        state["stage"] = "pushed"
+        prs = json.loads(self.gh_state_file.read_text())
+        prs[0].update(body="Human notes", state="CLOSED")
+        self.gh_state_file.write_text(json.dumps(prs))
+        state.pop("pr_number")  # create succeeded but its response was lost
+        ad.save_checkpoint(run_dir, latest, state)
+        self.assertNotEqual(self._run_cli(args).returncode, 0)
+        self.assertEqual(json.loads(self.gh_state_file.read_text()), prs)
+        prs[0]["state"] = "OPEN"
+        self.gh_state_file.write_text(json.dumps(prs))
+        _git(self.bare, "update-ref", "-d", f"refs/heads/{state['branch']}")
+        self.assertNotEqual(self._run_cli(args).returncode, 0)
+        self.assertEqual(_git(self.bare, "for-each-ref", f"refs/heads/{state['branch']}"), "")
+        _git(self.bare, "update-ref", f"refs/heads/{state['branch']}", state["candidate_sha"])
+        state["review"]["passed"] = False
+        ad.save_checkpoint(run_dir, latest, state)
+        self.assertNotEqual(self._run_cli(args).returncode, 0)
+        self.assertEqual(len(self.linear_state.mutation_log), count)
+        state["review"]["passed"] = True
+        ad.save_checkpoint(run_dir, latest, state)
+        success = self._run_cli(args)
+        self.assertEqual(success.returncode, 0, success.stderr)
+        self.assertEqual(json.loads(self.gh_state_file.read_text())[0]["body"], "Human notes")
+
+    def test_all_shutdown_signals_during_child_registration_reap_the_process(self) -> None:
+        # Deliver the signal after Popen returns and before the child is visible in the registry.
+        probe = """
+import os, runpy, signal, sys
+m = runpy.run_path(sys.argv[1])
+m['_install_signal_handlers']()
+register = m['_register_active_pgid']
+pids = []
+def interrupt_registration(pid):
+    pids.append(pid)
+    os.kill(os.getpid(), int(sys.argv[2]))
+    register(pid)
+m['run_cmd'].__globals__['_register_active_pgid'] = interrupt_registration
+try:
+    m['run_cmd']([sys.executable, '-B', '-c', 'import time; time.sleep(4)'])
+except (SystemExit, KeyboardInterrupt):
+    assert m['_is_shutdown_requested']() and pids
+    try:
+        os.kill(pids[0], 0)
+    except ProcessLookupError:
+        sys.exit(0)
+sys.exit(1)
+"""
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(sig=sig):
+                child = subprocess.run([sys.executable, "-B", "-c", probe, str(BIN_PATH), str(sig.value)],
+                                       cwd=self.root, capture_output=True, text=True, timeout=6)
+                self.assertEqual(child.returncode, 0, child.stderr)
 
     def test_nested_dispatch_is_blocked(self) -> None:
         res = self._run_cli(["doctor"], extra_env={"AGENT_DISPATCH_CHILD": "1"})
@@ -1583,8 +2036,95 @@ sys.exit(1)
         self.assertEqual(bad_rw.returncode, 2)
         self.assertIn("--max-rework", bad_rw.stderr)
 
+    def test_overlapping_specs_reserve_touches_before_linear_claim(self) -> None:
+        for num, resource in ((1, "src/api"), (2, "src/api/v1")):
+            parent = self.linear_state.add_issue(f"SPEC-{num}", "Spec", "", state_name="Backlog")
+            child = self.linear_state.add_issue(f"LEAF-{num}", "Work", f"## Touches\n- {resource}\n", labels=["agent-ready"])
+            parent["_children"] = [{**child, "labels": {"nodes": child["_labels"], "pageInfo": {"hasNextPage": False}},
+                                    "children": {"nodes": []}}]
+        entered, release = self.root / "entered", self.root / "release"
+        barrier = self.root / "setup.py"
+        barrier.write_text(
+            f"from pathlib import Path\nimport time\nPath({str(entered)!r}).touch()\n"
+            f"while not Path({str(release)!r}).exists(): time.sleep(0.02)\n"
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(self._run_cli, ["spec", "SPEC-1", "--skip-baseline", "--setup-cmd", f"python3 {barrier}"])
+            try:
+                deadline = time.monotonic() + 10
+                while not entered.exists() and not first.done() and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertTrue(entered.exists(), "first ticket never reached pre-claim setup")
+                second = self._run_cli(["spec", "SPEC-2", "--skip-baseline"])
+                self.assertEqual(second.returncode, 0, second.stderr)
+                self.assertEqual(json.loads(second.stdout)["wave_dispatched"], 0)
+                self.assertEqual(self.linear_state.get_issue("LEAF-2")["state"]["name"], "Todo")
+            finally:
+                release.touch()
+            one = first.result(timeout=30)
+            self.assertEqual(one.returncode, 0, one.stderr + one.stdout)
+        # The local lock is released. The other parent's In Review ticket still owns this resource.
+        retry = self._run_cli(["spec", "SPEC-2", "--skip-baseline"])
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(retry.stdout)["wave_dispatched"], 0)
+
+    def test_cleanup_reclaims_abandoned_baseline_after_lock_release(self) -> None:
+        # Exit inside the baseline context without finally. Keep its lock live for the first cleanup.
+        base = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "commit", "--allow-empty", "-m", "ahead")
+        entered, release = self.root / "entered", self.root / "release"
+        runner = self.root / "baseline.py"
+        runner.write_text(
+            "import os, runpy, time\nfrom pathlib import Path\n"
+            f"ad=runpy.run_path({str(BIN_PATH)!r}); repo=Path({str(self.repo)!r})\n"
+            "def interrupt(*args, **kwargs):\n"
+            f"    Path({str(entered)!r}).touch()\n"
+            f"    while not Path({str(release)!r}).exists(): time.sleep(.02)\n"
+            "    os._exit(42)\n"
+            "ad['check_base_baseline'].__globals__['bootstrap_worktree']=interrupt\n"
+            f"ad['check_base_baseline'](repo, ad['repo_cache_key'](repo), repo, {base!r}, 'true', repo)\n"
+        )
+        env = {**os.environ, "AGENT_DISPATCH_CACHE_ROOT": str(self.cache_dir)}
+        with subprocess.Popen([sys.executable, "-B", str(runner)], env=env) as child:
+            try:
+                deadline = time.monotonic() + 10
+                while not entered.exists() and child.poll() is None and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertTrue(entered.exists())
+                self.assertFalse(json.loads(self._run_cli(["cleanup", "--all"]).stdout)["removed"])
+            finally:
+                release.touch()
+            self.assertEqual(child.wait(timeout=10), 42)
+        output = self._run_cli(["cleanup"])
+        self.assertEqual(output.returncode, 0, output.stderr)
+        removed = json.loads(output.stdout)["removed"]
+        self.assertEqual(len(removed), 1)
+        self.assertTrue(removed[0].startswith(".baseline-"))
+        self.assertNotIn(".baseline-", _git(self.repo, "worktree", "list"))
+
+    def test_doctor_checks_repo_and_linear_mapping(self) -> None:
+        ok = self._run_cli(["doctor"])
+        self.assertEqual(ok.returncode, 0, ok.stderr + ok.stdout)
+        self.assertTrue(json.loads(ok.stdout)["ok"])
+        missing = self._run_cli(["doctor", "--project", "missing-project"])
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertFalse(json.loads(missing.stdout)["ok"])
+
+    def test_cleanup_requires_owner_and_checkpoint_agreement(self) -> None:
+        self.linear_state.add_issue("TST-OWN", "Work", "## Touches\n- src", labels=["agent-ready"])
+        result = self._run_cli(["run", "TST-OWN", "--no-push", "--skip-baseline"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        wt = Path(json.loads(result.stdout)["worktree"])
+        owner_path = wt / ".dispatch" / "owner.json"
+        data = json.loads(owner_path.read_text())
+        _git(wt, "switch", "-c", "personal/notes")
+        data["branch"] = "personal/notes"
+        owner_path.write_text(json.dumps(data))
+        self.assertEqual(json.loads(self._run_cli(["cleanup", "--all"]).stdout)["removed"], [])
+        self.assertTrue((wt / ".git").is_file())
+
     def test_e2e_parallel_frontier_two_tickets_pass_and_cross_wave_touches_serialize(self) -> None:
-        """Directly tests Opus P0-1 & P1-6: 2 parallel tickets both pass without false tampering, and in-flight Touches block wave 2!"""
+        """Dispatch independent tickets together and defer conflicts with the following wave."""
         self.linear_state.add_issue(
             "TST-P1",
             "Parallel A",
@@ -1679,7 +2219,7 @@ sys.exit(res.returncode)
         self.assertNotIn("dispatch:publish-incomplete", [l["name"] for l in iss["_labels"]])
 
     def test_e2e_resume_linear_state_synced_respects_closed_pr_and_human_todo_and_cleanup_branch_owner(self) -> None:
-        """Astra P0-1 & P0-6 + Opus P1-7 & P1-8: stage-aware resume, personal-branch cleanup protection, dirty blocked rerun, label-before-revert!"""
+        """Respect human PR, Linear and branch changes during recovery and cleanup."""
         # 1. Stage-aware resume at linear_state_synced MUST NOT recreate a human-closed PR or overwrite human Todo!
         iss = self.linear_state.add_issue(
             "TST-SYNC",
@@ -1801,6 +2341,7 @@ sys.exit(res.returncode)
             bin_dst = d / "bin" / "agent-dispatch"
             (ag_skills / "my-custom-skill").mkdir(parents=True)
             (ag_skills / "my-custom-skill" / "SKILL.md").write_text("keep me", encoding="utf-8")
+            (ag_skills / "my-grill").symlink_to(src_copy / "skills" / "grill")
             cx_agents.parent.mkdir(parents=True)
             cx_agents.write_text("custom real AGENTS.md", encoding="utf-8")
 
@@ -1814,6 +2355,10 @@ sys.exit(res.returncode)
                 }
             )
             subprocess.run([str(src_copy / "install.sh")], check=True, env=env, capture_output=True)
+            initial_links = {p: p.lstat().st_ino for p in ag_skills.iterdir()}
+            subprocess.run([str(src_copy / "install.sh")], check=True, env=env, capture_output=True)
+            self.assertEqual(initial_links, {p: p.lstat().st_ino for p in ag_skills.iterdir()})
+            self.assertEqual((ag_skills / "my-grill").resolve(), src_copy / "skills" / "grill")
             # Unrelated skill preserved!
             self.assertTrue((ag_skills / "my-custom-skill" / "SKILL.md").is_file())
             # Real AGENTS.md backed up, not destroyed!
@@ -1833,20 +2378,33 @@ sys.exit(res.returncode)
 
 @unittest.skipUnless(os.environ.get("RUN_LIVE_LINEAR_TESTS") == "1", "Set RUN_LIVE_LINEAR_TESTS=1 for live Linear checks")
 class TestLiveLinearReadOnlyContract(unittest.TestCase):
+    def setUp(self) -> None:
+        # Pin the authorized origin and reject any accidental mutation before creating a request.
+        self.client = ad.LinearClient(ad.resolve_linear_auth(), url="https://api.linear.app/graphql")
+        query = self.client.query
+        def readonly(document, variables=None, **opts):
+            self.assertTrue(document.lstrip().startswith("query"))
+            self.assertNotRegex(document, r"\bmutation\s*[{(]")
+            return query(document, variables, **opts)
+        self.enterContext(mock.patch.object(self.client, "query", side_effect=readonly))
+
+    def test_atomic_label_contract(self) -> None:
+        schema = self.client.query('query { __type(name: "Mutation") { fields { name args { name } } } }')
+        fields = {f["name"]: {arg["name"] for arg in f["args"]} for f in schema["__type"]["fields"]}
+        for operation in ("issueAddLabel", "issueRemoveLabel"):
+            self.assertEqual(fields[operation], {"id", "labelId"})
+
     def test_live_linear_project_string_query_and_pagination(self) -> None:
-        auth = ad.resolve_linear_auth()
-        client = ad.LinearClient(auth)
-        teams, projects = client.list_teams_and_projects()
+        teams, projects = self.client.list_teams_and_projects()
         self.assertTrue(len(teams) >= 1)
         self.assertTrue(len(projects) >= 1)
-        issues = client.list_project_issues(projects[0]["id"], state_type="unstarted")
+        issues = self.client.list_project_issues(projects[0]["id"], state_type="unstarted")
         self.assertIsInstance(issues, list)
 
     def test_explicit_project_typo_fails_fast_with_specific_message(self) -> None:
-        client = ad.LinearClient(ad.resolve_linear_auth())
         with tempfile.TemporaryDirectory() as td:
             with self.assertRaisesRegex(RuntimeError, "Explicit Linear project"):
-                ad.resolve_project(client, Path(td), explicit="definitely-nonexistent-project-xyz")
+                ad.resolve_project(self.client, Path(td), explicit="definitely-nonexistent-project-xyz")
 
 
 if __name__ == "__main__":

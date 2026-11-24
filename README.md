@@ -8,7 +8,8 @@ Version-controlled custom engineering skills, global Codex rules, and the cross-
 ./install.sh
 ```
 
-This non-destructively symlinks (preserving any unrelated skills and backing up real files):
+The installer creates the following links. Existing matching links keep their inode. Conflicting files or links receive a uniquely named backup.
+
 - `skills/*` -> `/root/.agent/skills/*` (all 7 skills)
 - Worker-safe skills (`grill`, `diagnose`, `research`, `retro`) -> `/root/.codex/skills/*` (excludes orchestrator-only `dispatch`/`slice`/`spec` to prevent recursive dispatch)
 - `codex/AGENTS.md` -> `/root/.codex/AGENTS.md`
@@ -17,8 +18,12 @@ This non-destructively symlinks (preserving any unrelated skills and backing up 
 ## Verify
 
 ```bash
-python3 -m unittest discover -s tests -v
-RUN_LIVE_LINEAR_TESTS=1 python3 -m unittest discover -s tests -v
+PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tests -v
+RUN_LIVE_LINEAR_TESTS=1 PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tests -v
 agent-dispatch doctor
 agent-dispatch doctor --repo /path/to/repo
 ```
+
+Unit and end-to-end tests use temporary homes, caches, local Git remotes and simulated harnesses. The opt-in live suite sends GraphQL queries to the official Linear endpoint. `doctor` checks the current repository, including its verification command and Linear project mapping. Use `--project <name-or-id>` when the repository and its Linear project have different names.
+
+The CLI runs on Linux. The Pi adapter uses `memfd_create` and `/proc` to retain a redacted, resumable session. See [dispatch](skills/dispatch/SKILL.md) for model aliases, delivery stages and recovery.

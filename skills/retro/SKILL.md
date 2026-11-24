@@ -13,8 +13,8 @@ Inspect recent session transcripts, `~/.cache/agent-dispatch/runs/` logs (`sessi
 3. **Lean `AGENTS.md` & Skills THIRD**: Keep `AGENTS.md` minimal—navigation pointers and non-obvious gotchas only.
 
 ## Applying Approved Governance Changes
-- Because verify scripts, linters, `CODING_STANDARDS.md`, and `docs/adr/*` are **protected paths** under `/dispatch`, apply approved repo-governance edits directly in the Designer session (or on a dedicated ticket with explicit `## Authorized Gate/Test Changes` / `--allow-gate-edits`).
-- Global skill and `agent-dispatch` updates live in `/root/.agent/workflow` (git-tracked with unit & E2E tests): run `python3 -m unittest discover -s /root/.agent/workflow/tests -v` before committing.
+- For changes to protected gate configuration, `CODING_STANDARDS.md`, or `docs/adr/*`, apply approved repo-governance edits directly in the Designer session (or on a dedicated ticket with explicit `## Authorized Gate/Test Changes` / `--allow-gate-edits`).
+- Global skill and `agent-dispatch` updates live in `/root/.agent/workflow` (git-tracked with unit & E2E tests): run `PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s /root/.agent/workflow/tests -v` before committing.
 
 ## Agent-Doc Writing Rules
 - **Single source of truth**: keep each rule in one file and link via sharp pointers (`what it is` + `when to open it`).

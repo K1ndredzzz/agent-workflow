@@ -19,27 +19,28 @@ CODEX_ROSTER=(grill diagnose research retro)
 link_managed() {
   local src="$1"
   local dst="$2"
-  if [ -L "$dst" ]; then
-    rm -f "$dst"
-  elif [ -e "$dst" ]; then
-    local bak="${dst}.bak.${TS}"
-    mv "$dst" "$bak"
-    echo "Backed up existing non-symlink $dst -> $bak"
+  if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
+    return
   fi
-  ln -s "$src" "$dst"
+  if [ -L "$dst" ] || [ -e "$dst" ]; then
+    local bak="${dst}.bak.${TS}"
+    local n=0
+    while [ -e "$bak" ] || [ -L "$bak" ]; do
+      n=$((n + 1))
+      bak="${dst}.bak.${TS}.${n}"
+    done
+    mv -T -- "$dst" "$bak"
+    echo "Backed up $dst -> $bak"
+  fi
+  ln -s -- "$src" "$dst"
 }
 
-# Clean ONLY stale symlinks that previously pointed into this workflow repo
-for dir in "$AGENT_SKILLS_DIR" "$CODEX_SKILLS_DIR"; do
-  for entry in "$dir"/*; do
-    [ -L "$entry" ] || continue
-    target="$(readlink "$entry" || true)"
-    case "$target" in
-      "$ROOT"/skills/*)
-        rm -f "$entry"
-        ;;
-    esac
-  done
+# Remove only retired managed entries from the worker roster.
+for s in dispatch slice spec; do
+  entry="$CODEX_SKILLS_DIR/$s"
+  if [ -L "$entry" ] && [ "$(readlink "$entry")" = "$ROOT/skills/$s" ]; then
+    rm -- "$entry"
+  fi
 done
 
 for s in "${AGENT_ROSTER[@]}"; do
@@ -51,7 +52,6 @@ for s in "${CODEX_ROSTER[@]}"; do
 done
 
 link_managed "$ROOT/codex/AGENTS.md" "$CODEX_AGENTS_MD"
-chmod 755 "$ROOT/bin/agent-dispatch"
 link_managed "$ROOT/bin/agent-dispatch" "$BIN_TARGET"
 
 echo "Installed workflow from $ROOT (non-destructive, preserving unrelated skills/files)"

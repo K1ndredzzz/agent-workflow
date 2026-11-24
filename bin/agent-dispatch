@@ -20,6 +20,7 @@ Pipeline:
 from __future__ import annotations
 
 import argparse
+import ast
 import concurrent.futures
 import contextlib
 import fcntl
@@ -29,6 +30,8 @@ import http.client
 import json
 import os
 import re
+import selectors
+import shlex
 import shutil
 import signal
 import subprocess
@@ -128,9 +131,6 @@ HARNESS_ALIASES: dict[str, dict[str, str]] = {
         "": "gpt-6.2-sol",
         "sol": "gpt-6.2-sol",
         "astra": "gpt-6.2-astra",
-        "6.1-sol": "gpt-6.1-sol",
-        "6.1-terra": "gpt-6.1-terra",
-        "luna": "gpt-6-luna",
     },
     "agy": {
         "": "gemini-4-neon-xhigh",
@@ -150,17 +150,11 @@ HARNESS_ALIASES: dict[str, dict[str, str]] = {
         "": "sub2api/gpt-6.2-sol",
         "sol": "sub2api/gpt-6.2-sol",
         "astra": "sub2api/gpt-6.2-astra",
-        "6.1-sol": "sub2api/gpt-6.1-sol",
-        "6.1-terra": "sub2api/gpt-6.1-terra",
-        "luna": "sub2api/gpt-6-luna",
     },
     "pi": {
         "": "sub2api/gpt-6.2-sol",
         "sol": "sub2api/gpt-6.2-sol",
         "astra": "sub2api/gpt-6.2-astra",
-        "6.1-sol": "sub2api/gpt-6.1-sol",
-        "6.1-terra": "sub2api/gpt-6.1-terra",
-        "luna": "sub2api/gpt-6-luna",
     },
 }
 
@@ -307,12 +301,11 @@ def _kill_all_active_children(*, wait_sigkill: bool = True) -> None:
 def _install_signal_handlers() -> None:
     def _handler(signum: int, _frame: Any) -> None:
         global _SHUTDOWN_SIGNAL
+        if _SHUTDOWN_SIGNAL:
+            return
         _SHUTDOWN_SIGNAL = signum
         # Strictly lock-free SIGTERM broadcast only; callers/finally handle SIGKILL wait and reconciliation
         _kill_all_active_children(wait_sigkill=False)
-        if signum == signal.SIGINT:
-            raise KeyboardInterrupt("Interrupted by SIGINT")
-        raise SystemExit(128 + signum)
 
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         try:
@@ -362,14 +355,22 @@ def parse_harness_spec(raw: str) -> HarnessSpec:
     model = HARNESS_ALIASES[harness].get(model_key, model_key)
 
     if harness == "agy":
+        if model not in HARNESS_ALIASES[harness].values():
+            raise ValueError("Unsupported Gemini 4 model or tier")
         if effort:
             base = re.sub(r"-(low|medium|high|xhigh)$", "", model)
             tier = "medium" if effort == "med" else effort
             model = f"{base}-{tier}"
             effort = ""
+            if model not in HARNESS_ALIASES[harness].values():
+                raise ValueError("Unsupported Gemini 4 model or tier")
     else:
         if harness in ("opencode", "pi") and "/" not in model:
             model = f"sub2api/{model}"
+        if model not in HARNESS_ALIASES[harness].values():
+            raise ValueError("Unsupported GPT model for this harness")
+        if effort and effort not in ("low", "medium", "high", "xhigh"):
+            raise ValueError("Unsupported GPT reasoning effort")
         if not effort:
             effort = "xhigh"
     return HarnessSpec(harness=harness, model=model, effort=effort)
@@ -385,12 +386,37 @@ def default_reviewer_for(worker: HarnessSpec) -> HarnessSpec:
 # Security, Sanitized Child Env, Atomic IO, Locks & Streaming Process Runner
 # ---------------------------------------------------------------------------
 
+_PEM_START = re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")
+_PEM_END = re.compile(r"-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")
+_PEM_BLOCK = re.compile(_PEM_START.pattern + r".*?(?:" + _PEM_END.pattern + r"|\Z)", re.S)
+_AUTH_VALUE = re.compile(r"""(?i)\b(bearer|basic)([ \t]+)([A-Za-z0-9._~+/-]{8,}=*)""")
+_CREDENTIAL_ENV = re.compile(r"(?:_API_KEY|_TOKEN|_PASSWORD|_SECRET|_ACCESS_KEY)$")
+_REDACTED = "<REDACTED_SECRET>"
+
+
 def redact_secrets(text: str) -> str:
-    out = str(text)
+    out = _PEM_BLOCK.sub(_REDACTED, str(text))
+    out = _AUTH_VALUE.sub(lambda m: m[1] + m[2] + _REDACTED, out)
     for pat in SECRET_VALUE_PATTERNS:
-        out = pat.sub("<REDACTED_SECRET>", out)
-    out = re.sub(r"(Authorization\s*:\s*Bearer\s+)[^\s\"']+", r"\1<REDACTED>", out, flags=re.I)
+        out = pat.sub(_REDACTED, out)
+    for name, value in os.environ.items():
+        if _CREDENTIAL_ENV.search(name) and len(value) >= 8 and value in out:
+            out = out.replace(value, _REDACTED)
     return out
+
+
+def redact_data(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {redact_secrets(k): redact_data(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_data(v) for v in value]
+    if isinstance(value, str):
+        return redact_secrets(value)
+    return value
+
+
+def safe_json(value: Any, **kwargs: Any) -> str:
+    return json.dumps(redact_data(value), **kwargs)
 
 
 def atomic_write_text(path: Path, content: str) -> None:
@@ -419,11 +445,9 @@ def sha256_text(text: str) -> str:
 
 
 def scan_text_for_secrets(text: str, field_name: str) -> list[str]:
-    hits: list[str] = []
-    for pat in SECRET_VALUE_PATTERNS:
-        if pat.search(text or ""):
-            hits.append(f"Potential secret token in {field_name} matching {pat.pattern}")
-    return hits
+    if redact_secrets(text or "") != (text or ""):
+        return [f"Potential secret token in {redact_secrets(field_name)}"]
+    return []
 
 
 def git_cmd(*args: str) -> list[str]:
@@ -441,44 +465,13 @@ def git_cmd(*args: str) -> list[str]:
     ]
 
 
-_SAN_GIT_CACHE: dict[tuple[str, float], tuple[Path, Path]] = {}
-_SAN_GIT_LOCK = threading.Lock()
-
-
 def ensure_sanitized_gitconfig() -> tuple[Path, Path]:
-    """Create cached empty GH_CONFIG_DIR and sanitized global gitconfig (strips credential/http-auth/include)."""
+    """Give children an empty Git credential store without copying host config."""
     base = _cache_root() / "child-sandbox-env"
-    src_gitconfig = Path.home() / ".gitconfig"
-    src_mtime = src_gitconfig.stat().st_mtime if src_gitconfig.is_file() else -1.0
-    cache_key = (str(base), src_mtime)
-    with _SAN_GIT_LOCK:
-        cached = _SAN_GIT_CACHE.get(cache_key)
-        if cached and cached[0].is_dir() and cached[1].is_file():
-            return cached
-
-        gh_empty = base / "empty-gh-config"
-        gh_empty.mkdir(parents=True, exist_ok=True)
-        sanitized_git = base / "sanitized.gitconfig"
-
-        lines: list[str] = []
-        if src_gitconfig.is_file():
-            skip_section = False
-            for raw_line in src_gitconfig.read_text(encoding="utf-8", errors="ignore").splitlines():
-                stripped = raw_line.strip()
-                if stripped.startswith("["):
-                    low = stripped.lower()
-                    skip_section = (
-                        low.startswith("[credential")
-                        or low.startswith("[include")
-                        or low.startswith("[http")
-                    )
-                if skip_section or re.match(r"^\s*(helper|extraheader|cookiefile|askpass)\s*=", raw_line, re.I):
-                    continue
-                lines.append(raw_line)
-        lines += ["[credential]", "\thelper ="]
-        atomic_write_text(sanitized_git, "\n".join(lines) + "\n")
-        _SAN_GIT_CACHE[cache_key] = (gh_empty, sanitized_git)
-        return gh_empty, sanitized_git
+    gh_empty = base / "empty-gh-config"
+    gh_empty.mkdir(parents=True, exist_ok=True)
+    # /dev/null also avoids publishing credentials from URL rewrites or Git aliases.
+    return gh_empty, Path(os.devnull)
 
 
 def resolve_linear_auth() -> str:
@@ -496,18 +489,15 @@ def resolve_linear_auth() -> str:
     if not key and MCP_CONFIG_PATH.is_file():
         try:
             cfg = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
-            raw_auth = str(cfg.get("mcpServers", {}).get("linear", {}).get("headers", {}).get("Authorization", "")).strip()
-            if raw_auth:
-                if raw_auth.lower().startswith("bearer lin_api_"):
-                    return raw_auth.split(" ", 1)[1].strip()
-                return raw_auth
+            key = str(cfg.get("mcpServers", {}).get("linear", {}).get("headers", {}).get("Authorization") or "").strip()
         except Exception:
             pass
     if not key:
         raise RuntimeError("LINEAR_API_KEY not found in env, /etc/environment, or ~/.gemini/config/mcp_config.json")
-    if key.startswith("lin_api_") or key.lower().startswith("bearer "):
-        return key
-    return f"Bearer {key}"
+    parts = key.split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        key = parts[1]
+    return key if key.startswith("lin_api_") else f"Bearer {key}"
 
 
 def build_child_env(*, role: str = "child") -> dict[str, str]:
@@ -521,7 +511,7 @@ def build_child_env(*, role: str = "child") -> dict[str, str]:
     local_bin = str(Path.home() / ".local" / "bin")
     path_parts = env.get("PATH", "").split(":")
     if local_bin not in path_parts:
-        env["PATH"] = f"{local_bin}:{env.get('PATH', '')}"
+        env["PATH"] = f"{env.get('PATH', '')}:{local_bin}"
 
     if role == "orchestrator":
         env.pop("LINEAR_API_KEY", None)
@@ -530,6 +520,12 @@ def build_child_env(*, role: str = "child") -> dict[str, str]:
     env["AGENT_DISPATCH_CHILD"] = "1"
     for var in ("LINEAR_API_KEY", "GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "GIT_ASKPASS", "SSH_ASKPASS"):
         env.pop(var, None)
+    for name in list(env):
+        if name.startswith(("GIT_CONFIG_", "GIT_TRACE", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")) or name in (
+            "GIT_SSH_COMMAND", "GIT_SSH", "GIT_CONFIG", "GIT_CURL_VERBOSE",
+        ):
+            env.pop(name)
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
     if role != "codex":
         env.pop("CODEX_SUB2API_API_KEY", None)
 
@@ -539,6 +535,46 @@ def build_child_env(*, role: str = "child") -> dict[str, str]:
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
+
+
+class _RedactedLog:
+    """Buffer partial lines so a token split across pipe reads never reaches disk."""
+    def __init__(self, path: Path, stack: contextlib.ExitStack) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.file = stack.enter_context(path.open("w", encoding="utf-8"))
+        self.pending = bytearray()
+        self.in_pem = False
+
+    def write(self, chunk: bytes) -> None:
+        self.pending.extend(chunk)
+        end = self.pending.rfind(b"\n") + 1 if chunk else len(self.pending)
+        if not end:
+            return
+        complete = self.pending[:end].decode("utf-8", errors="replace")
+        del self.pending[:end]
+        for line in re.findall(r"[^\n]*\n|[^\n]+$", complete):
+            if self.in_pem:
+                match = _PEM_END.search(line)
+                if not match:
+                    continue
+                line = line[match.end():]
+                self.in_pem = False
+            start = _PEM_START.search(line)
+            if start and not _PEM_END.search(line, start.end()):
+                self.in_pem = True
+            # JSON event strings can contain escaped newlines, quotes or Unicode escapes.
+            try:
+                event = json.loads(line) if line.lstrip().startswith("{") else None
+            except ValueError:
+                event = None
+            if isinstance(event, dict):
+                if event.get("type") in ("message_update", "item.updated"):
+                    # Deltas can split the same credential across multiple JSON events.
+                    event = {"type": event["type"]}
+                self.file.write(safe_json(event, ensure_ascii=False) + "\n")
+            else:
+                self.file.write(redact_secrets(line))
+        self.file.flush()
 
 
 def run_cmd(
@@ -572,109 +608,111 @@ def run_cmd(
         except Exception:
             pass
 
-    if stdout_path is not None or stderr_path is not None:
-        if stdout_path:
-            stdout_path.parent.mkdir(parents=True, exist_ok=True)
-        if stderr_path:
-            stderr_path.parent.mkdir(parents=True, exist_ok=True)
-        f_out = stdout_path.open("w+", encoding="utf-8", errors="replace") if stdout_path else None
-        f_err = stderr_path.open("w+", encoding="utf-8", errors="replace") if stderr_path else None
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(cwd) if cwd else None,
-                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-                stdout=f_out if f_out is not None else subprocess.PIPE,
-                stderr=f_err if f_err is not None else subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                shell=shell,
-                env=env,
-                start_new_session=True,
-            )
-            _register_active_pgid(proc.pid)
-            try:
-                if not ignore_shutdown:
-                    _check_shutdown()
-                out_mem, err_mem = proc.communicate(input=stdin_text, timeout=timeout)
-            except (subprocess.TimeoutExpired, KeyboardInterrupt, SystemExit):
-                _terminate_proc(proc)
-                raise
-            finally:
-                _unregister_active_pgid(proc.pid)
-
-            stdout = ""
-            stderr = ""
-            if f_out is not None:
-                f_out.flush()
-                f_out.seek(0)
-                stdout = f_out.read()
-            else:
-                stdout = out_mem or ""
-            if f_err is not None:
-                f_err.flush()
-                f_err.seek(0)
-                stderr = f_err.read()
-            else:
-                stderr = err_mem or ""
-        finally:
-            if f_out is not None:
-                f_out.close()
-            if f_err is not None:
-                f_err.close()
-    else:
+    with contextlib.ExitStack() as stack:
+        logs = {name: _RedactedLog(path, stack) for name, path in (
+            ("stdout", stdout_path), ("stderr", stderr_path),
+        ) if path is not None}
         proc = subprocess.Popen(
-            cmd,
-            cwd=str(cwd) if cwd else None,
+            cmd, cwd=cwd, shell=shell, env=env, start_new_session=True,
             stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            shell=shell,
-            env=env,
-            start_new_session=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         _register_active_pgid(proc.pid)
         try:
+            selector = stack.enter_context(selectors.DefaultSelector())
+            assert proc.stdout is not None and proc.stderr is not None
+            buffers = {"stdout": bytearray(), "stderr": bytearray()}
+            for name, pipe in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+                selector.register(stack.enter_context(pipe), selectors.EVENT_READ, name)
+            pending_input = memoryview((stdin_text or "").encode("utf-8"))
+            if proc.stdin is not None:
+                stack.enter_context(proc.stdin)
+                if pending_input:
+                    selector.register(proc.stdin, selectors.EVENT_WRITE, "stdin")
+                else:
+                    proc.stdin.close()
+            deadline = time.monotonic() + timeout
+            while selector.get_map() or proc.poll() is None:
+                if not ignore_shutdown:
+                    _check_shutdown()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(redact_secrets(str(cmd)), timeout)
+                interval = min(remaining, 0.1)
+                if not selector.get_map():
+                    try:
+                        proc.wait(timeout=interval)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    continue
+                for key, _ in selector.select(interval):
+                    if key.data == "stdin":
+                        try:
+                            written = os.write(key.fd, pending_input[:4096])
+                            pending_input = pending_input[written:]
+                        except BrokenPipeError:
+                            pending_input = memoryview(b"")
+                        if not pending_input:
+                            selector.unregister(key.fd)
+                            key.fileobj.close()
+                        continue
+                    chunk = os.read(key.fd, 65536)
+                    buffers[key.data].extend(chunk)
+                    if key.data in logs:
+                        logs[key.data].write(chunk)
+                    if not chunk:
+                        selector.unregister(key.fd)
             if not ignore_shutdown:
                 _check_shutdown()
-            stdout, stderr = proc.communicate(input=stdin_text, timeout=timeout)
-        except (subprocess.TimeoutExpired, KeyboardInterrupt, SystemExit):
+        except BaseException:
             _terminate_proc(proc)
+            # Drain diagnostics already in the pipes even if shutdown won the poll race.
+            for name, pipe in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+                if name in logs and pipe is not None and not pipe.closed:
+                    os.set_blocking(pipe.fileno(), False)
+                    tail = pipe.read()
+                    if tail:
+                        logs[name].write(tail)
+                    logs[name].write(b"")
             raise
         finally:
             _unregister_active_pgid(proc.pid)
+        stdout = buffers["stdout"].decode("utf-8", errors="replace")
+        stderr = buffers["stderr"].decode("utf-8", errors="replace")
 
     if cap_output:
         if len(stdout) > DISPLAY_OUTPUT_CAP:
+            stdout = redact_secrets(stdout)
             stdout = stdout[: DISPLAY_OUTPUT_CAP // 4] + "\n...[truncated]...\n" + stdout[-(DISPLAY_OUTPUT_CAP // 2) :]
         if len(stderr) > DISPLAY_OUTPUT_CAP:
+            stderr = redact_secrets(stderr)
             stderr = stderr[: DISPLAY_OUTPUT_CAP // 4] + "\n...[truncated]...\n" + stderr[-(DISPLAY_OUTPUT_CAP // 2) :]
 
     result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
     if check and result.returncode != 0:
         raise RuntimeError(
-            f"Command failed ({result.returncode}): {cmd}\n"
-            f"STDOUT:\n{redact_secrets(result.stdout[-2000:])}\n"
-            f"STDERR:\n{redact_secrets(result.stderr[-2000:])}"
+            f"Command failed ({result.returncode}): {redact_secrets(str(cmd))}\n"
+            f"STDOUT:\n{redact_secrets(result.stdout)[-2000:]}\n"
+            f"STDERR:\n{redact_secrets(result.stderr)[-2000:]}"
         )
     return result
 
 
 @contextlib.contextmanager
-def file_lock(lock_path: Path, *, blocking: bool = True) -> Iterator[None]:
+def file_lock(lock_path: Path, *, blocking: bool = True, ignore_shutdown: bool = False) -> Iterator[None]:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fh = lock_path.open("a+", encoding="utf-8")
-    flags = fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB)
     try:
-        fcntl.flock(fh.fileno(), flags)
-    except BlockingIOError as exc:
-        fh.close()
-        raise RuntimeError(f"Resource is already locked by another active agent-dispatch process: {lock_path.name}") from exc
-    try:
+        while True:
+            if not ignore_shutdown:
+                _check_shutdown()
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if not blocking:
+                    raise RuntimeError(f"Resource is already locked by another active agent-dispatch process: {lock_path.name}") from exc
+                time.sleep(0.1)
         fh.seek(0)
         fh.truncate()
         fh.write(f"pid={os.getpid()} ts={time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
@@ -721,7 +759,7 @@ def ticket_lock_path(repo_root: Path, issue_uuid: str) -> Path:
 
 def log(msg: str) -> None:
     ts = time.strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", file=sys.stderr, flush=True)
+    print(f"[{ts}] {redact_secrets(msg)}", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -741,17 +779,23 @@ class LinearClient:
             req = urllib.request.Request(
                 self.url,
                 data=payload,
-                headers={"Content-Type": "application/json", "Authorization": self.auth_header},
+                headers={"Content-Type": "application/json"},
                 method="POST",
             )
+            req.add_unredirected_header("Authorization", self.auth_header)
             try:
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     body = json.loads(resp.read().decode("utf-8"))
                 if body.get("errors"):
-                    raise RuntimeError(f"Linear GraphQL errors: {json.dumps(body['errors'])}")
+                    errors = body["errors"]
+                    codes = {(err.get("extensions") or {}).get("code") for err in errors}
+                    if codes <= {"RATELIMITED", "INTERNAL_SERVER_ERROR"} and attempt + 1 < attempts:
+                        time.sleep(1.5 * (2**attempt))
+                        continue
+                    raise RuntimeError(f"Linear GraphQL errors: {safe_json(errors)}")
                 return body["data"]
             except urllib.error.HTTPError as e:
-                err_body = e.read().decode("utf-8", errors="ignore")
+                err_body = redact_secrets(e.read().decode("utf-8", errors="ignore"))
                 if retry and e.code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
                     time.sleep(1.5 * (2**attempt))
                     last_err = RuntimeError(f"Linear API HTTP {e.code}: {err_body[:400]}")
@@ -812,7 +856,7 @@ class LinearClient:
             )
             ent = data.get(root_field)
             if not ent:
-                break
+                raise RuntimeError(f"Linear {root_field} disappeared while reading {field}.")
             conn = ent[field]
             items.extend(conn["nodes"])
             if not conn["pageInfo"]["hasNextPage"]:
@@ -870,12 +914,18 @@ class LinearClient:
             "issue",
             issue_uuid,
             "children",
-            "id identifier title priority description assignee { id name } state { id name type } labels { nodes { id name } } children(first: 1) { nodes { id } }",
+            "id identifier title priority description assignee { id name } state { id name type } labels { nodes { id name } pageInfo { hasNextPage } } children(first: 1) { nodes { id } }",
         )
         issue["comments"] = {"nodes": sorted(comments, key=lambda c: c.get("createdAt") or "")}
         issue["inverseRelations"] = {"nodes": inv_rels}
+        self._complete_issue_labels(children)
         issue["children"] = {"nodes": children}
         return issue
+
+    def _complete_issue_labels(self, issues: list[dict[str, Any]]) -> None:
+        for issue in issues:
+            if issue["labels"]["pageInfo"]["hasNextPage"]:
+                issue["labels"] = {"nodes": self._paginate_entity_field("issue", issue["id"], "labels", "id name")}
 
     def get_issue_updated_at(self, issue_uuid: str) -> str:
         data = self.query("query($id: String!) { issue(id: $id) { updatedAt } }", {"id": issue_uuid})
@@ -933,7 +983,7 @@ class LinearClient:
                         priority
                         assignee {{ id name }}
                         state {{ id name type }}
-                        labels {{ nodes {{ id name }} }}
+                        labels {{ nodes {{ id name }} pageInfo {{ hasNextPage }} }}
                         parent {{ id identifier }}
                         children(first: 1) {{ nodes {{ id }} }}
                       }}
@@ -948,6 +998,7 @@ class LinearClient:
             if not proj:
                 raise RuntimeError(f"Linear project '{project_id}' not found.")
             conn = proj["issues"]
+            self._complete_issue_labels(conn["nodes"])
             issues.extend(conn["nodes"])
             if not conn["pageInfo"]["hasNextPage"]:
                 break
@@ -1004,25 +1055,16 @@ class LinearClient:
         match = next((l for l in team_labels if l["name"].lower() == label_name.lower()), None)
         if match:
             return match
-        # Also check workspace-level labels before creating (best-effort if endpoint supports issueLabels filter)
-        try:
-            ws_data = self.query(
-                """
-                query($name: String!) {
-                  issueLabels(filter: { name: { eqIgnoreCase: $name } }, first: 10) {
+        workspace = self.query(
+            """query($name: String!) {
+                issueLabels(filter: { name: { eqIgnoreCase: $name }, team: { null: true } }, first: 1) {
                     nodes { id name }
-                  }
                 }
-                """,
-                {"name": label_name},
-            )
-            ws_nodes = (ws_data.get("issueLabels") or {}).get("nodes", [])
-            ws_match = next((l for l in ws_nodes if l["name"].lower() == label_name.lower()), None)
-            if ws_match:
-                team_labels.append(ws_match)
-                return ws_match
-        except RuntimeError:
-            pass
+            }""",
+            {"name": label_name},
+        )["issueLabels"]["nodes"]
+        if workspace:
+            return workspace[0]
 
         try:
             created = self.query(
@@ -1042,6 +1084,7 @@ class LinearClient:
                 match = res["issueLabel"]
                 team_labels.append(match)
                 return match
+            raise RuntimeError(f"Failed to create Linear label {label_name!r}")
         except RuntimeError:
             # Handle concurrent creation race from a sibling worker: refresh team labels once before failing
             fresh_team_labels = self._paginate_entity_field("team", team["id"], "labels", "id name")
@@ -1050,7 +1093,6 @@ class LinearClient:
             if raced:
                 return raced
             raise
-        raise RuntimeError(f"Failed to create Linear label '{label_name}'")
 
     def ensure_label_and_add(self, issue: dict[str, Any], label_name: str) -> None:
         fresh_labels = self._paginate_entity_field("issue", issue["id"], "labels", "id name")
@@ -1058,102 +1100,28 @@ class LinearClient:
         if any(l["name"].lower() == label_name.lower() for l in fresh_labels):
             return
         match = self._find_or_create_label(issue, label_name)
-        # Try additive addedLabelIds first; fall back to full merged labelIds if endpoint lacks addedLabelIds
-        try:
-            upd = self.query(
-                """
-                mutation($id: String!, $addedLabelIds: [String!]!) {
-                  issueUpdate(id: $id, input: { addedLabelIds: $addedLabelIds }) {
-                    success
-                    issue { updatedAt labels { nodes { id name } } }
-                  }
-                }
-                """,
-                {"id": issue["id"], "addedLabelIds": [match["id"]]},
-                retry=False,
-            )
-            res = upd.get("issueUpdate") or {}
-            if not res.get("success"):
-                raise RuntimeError(f"issueUpdate(addedLabelIds) returned success=false: {res}")
-            if (res.get("issue") or {}).get("labels"):
-                issue["labels"] = res["issue"]["labels"]
-            else:
-                issue["labels"]["nodes"].append(match)
-            return
-        except RuntimeError as exc:
-            msg = str(exc)
-            if not ("addedLabelIds" in msg and ("not defined" in msg or "Unknown" in msg or "GRAPHQL_VALIDATION_FAILED" in msg or "Cannot query field" in msg)):
-                raise
-        new_ids = list(dict.fromkeys([*(l["id"] for l in fresh_labels), match["id"]]))
-        upd = self.query(
-            """
-            mutation($id: String!, $labelIds: [String!]!) {
-              issueUpdate(id: $id, input: { labelIds: $labelIds }) {
-                success
-                issue { updatedAt labels { nodes { id name } } }
-              }
-            }
-            """,
-            {"id": issue["id"], "labelIds": new_ids},
+        self._change_label(issue["id"], match["id"], add=True)
+        fresh_labels.append(match)
+
+    def _change_label(self, issue_id: str, label_id: str, *, add: bool) -> None:
+        operation = "issueAddLabel" if add else "issueRemoveLabel"
+        data = self.query(
+            f"""mutation($id: String!, $labelId: String!) {{
+                {operation}(id: $id, labelId: $labelId) {{ success }}
+            }}""",
+            {"id": issue_id, "labelId": label_id},
             retry=False,
         )
-        res = upd.get("issueUpdate") or {}
-        if not res.get("success"):
-            raise RuntimeError(f"issueUpdate(labelIds) returned success=false for {issue['identifier']}: {res}")
-        if (res.get("issue") or {}).get("labels"):
-            issue["labels"] = res["issue"]["labels"]
-        else:
-            issue["labels"]["nodes"].append(match)
+        if not (data.get(operation) or {}).get("success"):
+            raise RuntimeError(f"{operation} failed for issue {issue_id}")
 
     def remove_labels_if_present(self, issue: dict[str, Any], label_names: set[str]) -> None:
-        fresh_labels = self._paginate_entity_field("issue", issue["id"], "labels", "id name")
-        issue["labels"] = {"nodes": fresh_labels}
+        labels = self._paginate_entity_field("issue", issue["id"], "labels", "id name")
         targets = {n.lower() for n in label_names}
-        to_remove = [l["id"] for l in fresh_labels if l["name"].lower() in targets]
-        if not to_remove:
-            return
-        # Prefer atomic removedLabelIds so concurrent human label edits are never clobbered
-        try:
-            upd = self.query(
-                """
-                mutation($id: String!, $removedLabelIds: [String!]!) {
-                  issueUpdate(id: $id, input: { removedLabelIds: $removedLabelIds }) {
-                    success
-                    issue { updatedAt labels { nodes { id name } } }
-                  }
-                }
-                """,
-                {"id": issue["id"], "removedLabelIds": to_remove},
-                retry=False,
-            )
-            res = upd.get("issueUpdate") or {}
-            if not res.get("success"):
-                raise RuntimeError(f"issueUpdate(removedLabelIds) returned success=false for {issue['identifier']}: {res}")
-            if (res.get("issue") or {}).get("labels"):
-                issue["labels"] = res["issue"]["labels"]
-            return
-        except RuntimeError as exc:
-            msg = str(exc)
-            if not ("removedLabelIds" in msg and ("not defined" in msg or "Unknown" in msg or "GRAPHQL_VALIDATION_FAILED" in msg or "Cannot query field" in msg)):
-                raise
-        remaining_ids = [l["id"] for l in fresh_labels if l["name"].lower() not in targets]
-        upd = self.query(
-            """
-            mutation($id: String!, $labelIds: [String!]!) {
-              issueUpdate(id: $id, input: { labelIds: $labelIds }) {
-                success
-                issue { updatedAt labels { nodes { id name } } }
-              }
-            }
-            """,
-            {"id": issue["id"], "labelIds": remaining_ids},
-            retry=False,
-        )
-        res = upd.get("issueUpdate") or {}
-        if not res.get("success"):
-            raise RuntimeError(f"Failed removing labels {label_names} on {issue['identifier']}: {res}")
-        if (res.get("issue") or {}).get("labels"):
-            issue["labels"] = res["issue"]["labels"]
+        for label in labels:
+            if label["name"].lower() in targets:
+                self._change_label(issue["id"], label["id"], add=False)
+        issue["labels"] = {"nodes": [label for label in labels if label["name"].lower() not in targets]}
 
     def add_comment(self, issue_id: str, body: str) -> str:
         safe_body = redact_secrets(body)
@@ -1336,29 +1304,33 @@ def parse_authorized_changes(description: str) -> tuple[list[str], list[str]]:
     All free-form text, code blocks, and overly broad wildcards are ignored (fail-closed).
     Returns (gate_patterns, test_patterns).
     """
-    m = re.search(
-        r"^##\s+Authorized\s+Gate/Test\s+Changes\s*\n(.*?)(?=^##\s|\Z)",
-        description or "",
-        re.M | re.S | re.I,
-    )
-    if not m:
-        return [], []
     gate_pats: list[str] = []
     test_pats: list[str] = []
     benign_none = re.compile(
         r"^[\(\[_\*]*(none|n/?a|no|false|nothing|nil|not\s+applicable|无|暂无|无须修改|无需修改)[\)\]_\*\s.,;:!-]*(\(.*\))?$",
         re.I,
     )
-    in_fence = False
-    for raw_line in m.group(1).splitlines():
+    in_section = False
+    fence = ""
+    for raw_line in (description or "").splitlines():
         stripped = raw_line.strip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            in_fence = not in_fence
+        if fence:
+            if re.fullmatch(r" {0,3}" + fence[0] + "{" + str(len(fence)) + r",}[ \t]*", raw_line):
+                fence = ""
             continue
-        if in_fence or not stripped or stripped.startswith(">"):
+        opening = re.match(r"^ {0,3}(`{3,}|~{3,})", raw_line)
+        if opening:
+            fence = opening[1]
+            continue
+        if re.match(r"^ {0,3}#{1,6}(?:\s|$)", raw_line):
+            if in_section:
+                break
+            in_section = bool(re.fullmatch(r"##\s+Authorized\s+Gate/Test\s+Changes", stripped, re.I))
+            continue
+        if not in_section or not stripped or stripped.startswith(">"):
             continue
         # Only direct bullet items are eligible authorization declarations
-        bm = re.match(r"^\s*[-*]\s+(.+)$", raw_line)
+        bm = re.match(r"^[-*]\s+(.+)$", raw_line)
         if not bm:
             if not benign_none.match(stripped):
                 log(f"Ignoring non-bullet Authorized Gate/Test Changes line (fail-closed): {stripped[:80]!r}")
@@ -1471,11 +1443,17 @@ def classify_origin_remote(repo_root: Path) -> tuple[str, str | None, str]:
         return "none", None, ""
     raw_url = res.stdout.strip()
     gh = parse_github_owner_repo_url(raw_url)
+    push_urls = run_cmd(git_cmd("remote", "get-url", "--push", "--all", "origin"), cwd=repo_root,
+                        env_role="orchestrator", check=True, cap_output=False).stdout.splitlines()
+    if len(push_urls) != 1 or not (
+        push_urls[0] == raw_url or (gh and (parse_github_owner_repo_url(push_urls[0]) or "").lower() == gh.lower())
+    ):
+        raise RuntimeError("Origin fetch and push destinations differ or multiple push destinations are configured.")
     if gh:
         return "github", gh, raw_url
     if raw_url.startswith("file://") or raw_url.startswith("/") or raw_url.startswith("./") or raw_url.startswith("../"):
         return "local_path", None, raw_url
-    if Path(raw_url).exists():
+    if (repo_root / raw_url).exists():
         return "local_path", None, raw_url
     return "unknown_remote", None, raw_url
 
@@ -1526,8 +1504,8 @@ def check_dirty_docs_in_main_repo(repo_root: Path, base_branch: str) -> list[str
     return issues
 
 
-def ensure_dispatch_excluded(worktree: Path) -> None:
-    res = run_cmd(git_cmd("rev-parse", "--git-path", "info/exclude"), cwd=worktree, env_role="orchestrator")
+def ensure_dispatch_excluded(worktree: Path, *, ignore_shutdown: bool = False) -> None:
+    res = run_cmd(git_cmd("rev-parse", "--git-path", "info/exclude"), cwd=worktree, env_role="orchestrator", ignore_shutdown=ignore_shutdown)
     if res.returncode != 0:
         return
     exclude_path = Path(res.stdout.strip())
@@ -1545,6 +1523,8 @@ def ensure_dispatch_excluded(worktree: Path) -> None:
 def write_worktree_owner(worktree: Path, identifier: str, issue_uuid: str, repo_identity: str, branch: str) -> None:
     """Persist worktree lock-owner metadata inside repo lock so cleanup can NEVER race before first checkpoint."""
     owner_path = worktree / ".dispatch" / "owner.json"
+    if worktree.is_symlink() or owner_path.parent.is_symlink() or owner_path.is_symlink():
+        raise RuntimeError("Symlink in worktree ownership path; refusing to write metadata.")
     atomic_write_text(
         owner_path,
         json.dumps(
@@ -1588,6 +1568,8 @@ def prepare_worktree(
 
         base_sha = run_cmd(git_cmd("rev-parse", base_ref), cwd=repo_root, check=True, env_role="orchestrator").stdout.strip()
 
+        if wt_dir.is_symlink():
+            raise RuntimeError(f"Symlink occupies managed worktree path {wt_dir}.")
         if wt_dir.exists():
             if not (wt_dir / ".git").exists():
                 raise RuntimeError(f"Non-git directory occupies worktree path {wt_dir}; inspect and remove manually.")
@@ -1597,6 +1579,10 @@ def prepare_worktree(
             cur_br = run_cmd(git_cmd("rev-parse", "--abbrev-ref", "HEAD"), cwd=wt_dir, check=True, env_role="orchestrator").stdout.strip()
             if cur_br != branch:
                 raise RuntimeError(f"Worktree {wt_dir} is on branch '{cur_br}', expected '{branch}'")
+            if issue_uuid:
+                owner_uuid, owner_branch, _, error = _read_worktree_lock_owner(repo_root, rkey, wt_dir)
+                if error or owner_uuid != issue_uuid or owner_branch != branch:
+                    raise RuntimeError(f"Worktree ownership mismatch at {wt_dir}: {error or 'issue or branch changed'}")
             if fresh:
                 run_cmd(git_cmd("worktree", "remove", "--force", str(wt_dir)), cwd=repo_root, check=True, env_role="orchestrator")
                 run_cmd(git_cmd("branch", "-D", branch), cwd=repo_root, env_role="orchestrator")
@@ -1721,7 +1707,7 @@ def snapshot_baseline_standards(worktree: Path, base_sha: str, dest_dir: Path) -
             continue
         out = dest_dir / rel
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(content, encoding="utf-8")
+        out.write_text(redact_secrets(content), encoding="utf-8")
         active_files.append(rel)
         hashes[rel] = sha256_file(out)
     return active_files, hashes
@@ -1764,34 +1750,57 @@ def render_issue_snapshot(issue: dict[str, Any]) -> str:
             lines.append(redact_secrets((c.get("body") or "").strip()))
             lines.append("")
     lines.append("<!-- END LINEAR DATA -->")
-    return "\n".join(lines) + "\n"
+    return redact_secrets("\n".join(lines) + "\n")
 
 
 # ---------------------------------------------------------------------------
 # Verification, Protected Paths, Deterministic Test-Integrity & Full-Range Secret Scan
 # ---------------------------------------------------------------------------
 
-def _has_non_unittest_python_tests(tests_dir: Path) -> bool:
-    """Return True if tests/ uses pytest imports or top-level `def test_` functions that unittest discover would silently skip!"""
-    for py_file in tests_dir.rglob("*.py"):
-        if not (py_file.name.startswith("test_") or py_file.name.endswith("_test.py")):
-            continue
-        txt = py_file.read_text(encoding="utf-8", errors="ignore")
-        if re.search(r"^\s*(?:import|from)\s+pytest\b", txt, re.M):
-            return True
-        if re.search(r"^def\s+test_[A-Za-z0-9_]*\s*\(", txt, re.M):
-            return True
-    return False
+def _test_source_files(worktree: Path) -> Iterator[Path]:
+    for root, dirs, names in os.walk(worktree):
+        dirs[:] = [d for d in dirs if d not in {".git", ".venv", "venv", "node_modules", "__pycache__", ".tox"}]
+        for name in names:
+            if (name.endswith(".py") and (name.startswith("test") or name.endswith("_test.py"))) or re.search(
+                r"\.(?:test|spec)\.[cm]?[jt]sx?$", name
+            ):
+                yield Path(root) / name
+
+
+def _unittest_can_discover(tests_dir: Path, files: list[Path]) -> bool:
+    for path in files:
+        if not path.is_relative_to(tests_dir) or not path.name.startswith("test"):
+            return False
+        if any(not (p / "__init__.py").is_file() for p in path.parents if p.is_relative_to(tests_dir) and p != tests_dir):
+            return False
+        try:
+            module = ast.parse(path.read_bytes(), filename=str(path))
+        except (SyntaxError, ValueError):
+            return False
+        case_types = {"unittest.TestCase", "unittest.IsolatedAsyncioTestCase"}
+        for node in module.body:
+            if isinstance(node, ast.ImportFrom) and node.module == "unittest":
+                case_types.update(a.asname or a.name for a in node.names if "unittest." + a.name in case_types)
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "unittest" and alias.asname:
+                        case_types.update({alias.asname + ".TestCase", alias.asname + ".IsolatedAsyncioTestCase"})
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+                return False
+            if isinstance(node, ast.ClassDef):
+                if any(ast.unparse(base) in case_types for base in node.bases):
+                    case_types.add(node.name)
+                elif node.name.startswith("Test"):
+                    return False
+        if any(isinstance(n, ast.ImportFrom) and n.module == "pytest" or
+               isinstance(n, ast.Import) and any(a.name == "pytest" for a in n.names) for n in ast.walk(module)):
+            return False
+    return bool(files)
 
 
 def _repo_has_js_tests(worktree: Path) -> bool:
-    for dname in ("tests", "test", "__tests__"):
-        if (worktree / dname).is_dir():
-            return True
-    for pat in ("*.test.ts", "*.test.tsx", "*.test.js", "*.spec.ts", "*.spec.js"):
-        if any(worktree.glob(pat)) or ((worktree / "src").is_dir() and any((worktree / "src").rglob(pat))):
-            return True
-    return False
+    return (any((worktree / d).is_dir() for d in ("tests", "test", "__tests__"))
+            or any(p.suffix != ".py" for p in _test_source_files(worktree)))
 
 
 def detect_verify_command(worktree: Path, explicit_cmd: str | None) -> str | None:
@@ -1827,7 +1836,9 @@ def detect_verify_command(worktree: Path, explicit_cmd: str | None) -> str | Non
                 pm = "npm run"
             cmds = [f"{pm} {s}" for s in ("typecheck", "lint", "test") if s in scripts]
             # Never pass lint-only JS repo if JS test files/dirs exist without a `test` script!
-            if cmds and ("test" in scripts or not _repo_has_js_tests(worktree)):
+            if "test" not in scripts and _repo_has_js_tests(worktree):
+                return None
+            if cmds:
                 return " && ".join(cmds)
         except Exception:
             pass
@@ -1835,33 +1846,29 @@ def detect_verify_command(worktree: Path, explicit_cmd: str | None) -> str | Non
     if (worktree / "Cargo.toml").is_file():
         return "cargo clippy --all-targets && cargo test"
 
-    if (worktree / "pyproject.toml").is_file() or (worktree / "pytest.ini").is_file():
+    python_config = (worktree / "pyproject.toml").is_file() or (worktree / "pytest.ini").is_file()
+    py_tests = [p for p in _test_source_files(worktree) if p.suffix == ".py"]
+    if python_config or py_tests:
         cmds: list[str] = []
-        if shutil.which("ruff"):
+        if python_config and shutil.which("ruff"):
             cmds.append("ruff check .")
-        has_test_runner = False
         if (worktree / ".venv" / "bin" / "pytest").is_file():
             cmds.append(".venv/bin/pytest")
-            has_test_runner = True
         elif (worktree / "uv.lock").is_file() and shutil.which("uv"):
             cmds.append("uv run pytest")
-            has_test_runner = True
+        elif not python_config and _unittest_can_discover(worktree / "tests", py_tests):
+            cmds.append("python3 -m unittest discover -s tests")
         elif shutil.which("pytest"):
             cmds.append("pytest")
-            has_test_runner = True
-        elif (worktree / "tests").is_dir() and any((worktree / "tests").glob("test_*.py")):
-            if not _has_non_unittest_python_tests(worktree / "tests"):
-                cmds.append("python3 -m unittest discover -s tests")
-                has_test_runner = True
-        if cmds and (has_test_runner or not (worktree / "tests").is_dir()):
+        elif _unittest_can_discover(worktree / "tests", py_tests):
+            cmds.append("python3 -m unittest discover -s tests")
+        elif py_tests or (worktree / "tests").is_dir() or (worktree / "pytest.ini").is_file():
+            return None
+        if cmds:
             return " && ".join(cmds)
 
     if (worktree / "go.mod").is_file():
         return "go vet ./... && go test ./..."
-
-    if (worktree / "tests").is_dir() and any((worktree / "tests").glob("test_*.py")):
-        if not _has_non_unittest_python_tests(worktree / "tests"):
-            return "python3 -m unittest discover -s tests"
 
     return None
 
@@ -1899,7 +1906,15 @@ def run_verify_gate(
             "output": "No verification command detected. Pass --verify-cmd or configure a repo check script (or --allow-no-verify).",
         }
     log(f"Running verification gate: {verify_cmd}")
+    def branch_and_head() -> tuple[str, ...]:
+        status = run_cmd(
+            git_cmd("status", "--porcelain=v2", "-z", "--branch", "--untracked-files=no"),
+            cwd=worktree, check=True, env_role="orchestrator",
+        ).stdout
+        return tuple(s for s in status.split("\0") if s.startswith(("# branch.head ", "# branch.oid ")))
+
     with file_lock(_cache_root() / "locks" / f"verify-{repo_key}.lock", blocking=True):
+        original = branch_and_head()
         try:
             res = run_cmd(
                 verify_cmd,
@@ -1918,7 +1933,14 @@ def run_verify_gate(
                 "returncode": 124,
                 "output": f"Verification timed out after {timeout}s (see {log_file}).",
             }
+        finally:
+            if not _is_shutdown_requested() and branch_and_head() != original:
+                raise RuntimeError("Verification changed the worktree branch or HEAD. Inspect the worktree before rerunning.")
     combined = (res.stdout + "\n" + res.stderr).strip()
+    if (res.returncode == 0 and "unittest discover" in verify_cmd
+            and re.search(r"^Ran 0 tests? in ", combined, re.M)):
+        return {"ran": True, "passed": False, "command": verify_cmd, "returncode": 0,
+                "output": "unittest discovery collected zero tests."}
     _clean_benign_tool_caches(worktree)
     tracked_dirty = run_cmd(
         git_cmd("status", "--porcelain", "--untracked-files=no"), cwd=worktree, env_role="orchestrator"
@@ -1941,7 +1963,7 @@ def run_verify_gate(
         "passed": res.returncode == 0,
         "command": verify_cmd,
         "returncode": res.returncode,
-        "output": redact_secrets(combined[-4000:]),
+        "output": redact_secrets(combined)[-4000:],
     }
 
 
@@ -1961,8 +1983,8 @@ def check_base_baseline(
         return {"checked": False, "passed": True}
     baselines_file = _cache_root() / "baselines.json"
     baselines_lock = _cache_root() / "locks" / "baselines.lock"
-    cache_key = f"{repo_key}:{base_sha}:{verify_cmd}"
-    key_lock = _cache_root() / "locks" / f"baseline-{hashlib.sha256(cache_key.encode('utf-8')).hexdigest()[:12]}.lock"
+    cache_key = sha256_text(json.dumps([repo_key, base_sha, verify_cmd, setup_cmd_override]))
+    key_lock = _cache_root() / "locks" / f"baseline-{cache_key[:16]}.lock"
 
     # Per-cache-key lock covers check -> detached worktree -> verify -> write cache (zero parallel worktree collision or duplicate runs!)
     with file_lock(key_lock, blocking=True):
@@ -1983,11 +2005,16 @@ def check_base_baseline(
             if head != base_sha:
                 # Reused feature branch with baseline cache miss: verify base_sha in a UNIQUE temporary detached worktree!
                 temp_wt = _cache_root() / "worktrees" / repo_key / f".baseline-{base_sha[:10]}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+                owner_file = _cache_root() / "baseline-owners" / repo_key / temp_wt.name
                 with file_lock(_cache_root() / "locks" / f"repo-{repo_key}.lock", blocking=True):
+                    atomic_write_text(owner_file, json.dumps({"key": cache_key, "base_sha": base_sha}))
                     run_cmd(git_cmd("worktree", "add", "--detach", str(temp_wt), base_sha), cwd=repo_root, check=True, env_role="orchestrator")
                 bootstrap_worktree(temp_wt, setup_cmd_override, timeout=setup_timeout)
                 target_wt = temp_wt
 
+            head_before = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=target_wt, check=True, env_role="orchestrator").stdout.strip()
+            if head_before != base_sha:
+                raise RuntimeError("Bootstrap changed the baseline HEAD before verification")
             log(f"Checking clean base baseline ({base_sha[:8]}): {verify_cmd}")
             res = run_verify_gate(
                 target_wt,
@@ -1999,10 +2026,12 @@ def check_base_baseline(
             )
         finally:
             if temp_wt is not None:
-                with file_lock(_cache_root() / "locks" / f"repo-{repo_key}.lock", blocking=True):
+                with file_lock(_cache_root() / "locks" / f"repo-{repo_key}.lock", ignore_shutdown=True):
                     run_cmd(git_cmd("worktree", "remove", "--force", str(temp_wt)), cwd=repo_root, env_role="orchestrator", ignore_shutdown=True)
-                    if temp_wt.exists():
-                        shutil.rmtree(temp_wt, ignore_errors=True)
+                    if not temp_wt.exists():
+                        owner_file.unlink(missing_ok=True)
+                    else:
+                        log(f"Baseline worktree still registered for cleanup: {temp_wt}")
 
         if res["passed"]:
             with file_lock(baselines_lock, blocking=True):
@@ -2045,7 +2074,7 @@ def check_protected_paths(
         if (
             f in PROTECTED_EXACT_FILES
             or base_name in PROTECTED_BASENAMES
-            or any(f.startswith(p) for p in PROTECTED_PREFIXES)
+            or any("/" + p in "/" + f for p in PROTECTED_PREFIXES)
             or any(r.search(f) for r in PROTECTED_REGEXES)
         ):
             violations.append(f"Protected gate/policy file modified: {f}")
@@ -2068,10 +2097,10 @@ def check_protected_paths(
                 for section in ("scripts", "jest", "vitest", "eslintConfig"):
                     if old_pkg.get(section) != new_pkg.get(section):
                         violations.append(f"Protected `{f}` `{section}` section modified")
-            elif f == "package.json":
-                # Brand new root package.json introducing gate scripts still requires explicit authorization
+            else:
+                # Workspace packages can introduce gate scripts too.
                 if any(new_pkg.get(s) is not None for s in ("scripts", "jest", "vitest", "eslintConfig")):
-                    violations.append(f"Protected root `{f}` gate/script config added")
+                    violations.append(f"Protected `{f}` gate/script config added")
     return violations
 
 
@@ -2117,19 +2146,15 @@ def check_test_integrity_diff(
     if test_files:
         for tf in test_files:
             diff_txt = run_cmd(
-                git_cmd("diff", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color", "-U0", f"{base_sha}..{candidate_sha}", "--", tf),
+                git_cmd("--literal-pathspecs", "diff", "--text", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color", "-U0", f"{base_sha}..{candidate_sha}", "--", tf),
                 cwd=worktree,
                 check=True,
                 env_role="orchestrator",
                 cap_output=False,
             ).stdout
-            for line in diff_txt.splitlines():
-                if line.startswith("+") and not line.startswith("+++"):
-                    added = line[1:]
-                    for pat in TEST_SKIP_PATTERNS:
-                        if pat.search(added):
-                            findings.append(f"Added test skip/only/ignore marker in {tf}: {added.strip()[:120]}")
-                            break
+            for added in _added_patch_lines(diff_txt):
+                if any(pat.search(added) for pat in TEST_SKIP_PATTERNS):
+                    findings.append(f"Added test skip/only/ignore marker in {tf}: {redact_secrets(added.strip())[:120]}")
     return findings
 
 
@@ -2139,80 +2164,79 @@ def _is_secret_filename(path: str) -> bool:
     return any(pat.search(path) for pat in SECRET_FILENAME_PATTERNS)
 
 
+def _added_patch_lines(patch: str) -> Iterator[str]:
+    # Git headers are outside hunks. An added source line may itself begin with '++'.
+    in_hunk = False
+    for line in patch.split("\n"):
+        if line.startswith("diff --git "):
+            in_hunk = False
+        elif line.startswith("@@ "):
+            in_hunk = True
+        elif in_hunk and line.startswith("+"):
+            yield line[1:]
+
+
+def _scan_git_changes_for_secrets(worktree: Path, command: list[str], *, ignore_shutdown: bool = False) -> list[str]:
+    flags = ["--no-renames", "--no-ext-diff", "--no-textconv", "--no-color"]
+
+    paths = run_cmd(
+        git_cmd(*command, *flags, "-z", "--diff-filter=AMT", "--name-only"),
+        cwd=worktree, check=True, env_role="orchestrator", cap_output=False, ignore_shutdown=ignore_shutdown,
+    ).stdout
+    findings: set[str] = set()
+    for path in set(paths.split("\0")) - {""}:
+        findings.update(scan_text_for_secrets(path, "changed file name"))
+        if _is_secret_filename(path):
+            findings.add(f"Potential secret file: {redact_secrets(path)}")
+
+    # --text scans content even when Git would hide the patch because of NUL or attributes.
+    patch = run_cmd(
+        git_cmd(*command, *flags, "-p", "--text", "-U0"),
+        cwd=worktree, check=True, env_role="orchestrator", cap_output=False, ignore_shutdown=ignore_shutdown,
+    ).stdout
+    findings.update(scan_text_for_secrets("\n".join(_added_patch_lines(patch)), "added file content"))
+    return sorted(findings)
+
+
 def scan_range_for_secrets(worktree: Path, base_sha: str, candidate_sha: str) -> list[str]:
-    """Scan FULL untruncated commit range (NUL-safe file names, commit messages, and merge+regular patches)."""
-    findings: list[str] = []
-    raw_files = run_cmd(
-        git_cmd("log", "-z", "-m", "--name-only", "--pretty=format:", f"{base_sha}..{candidate_sha}"),
-        cwd=worktree,
-        check=True,
-        env_role="orchestrator",
-        cap_output=False,
+    revision_range = f"{base_sha}..{candidate_sha}"
+    messages = run_cmd(
+        git_cmd("log", "--pretty=format:%B%n", revision_range), cwd=worktree,
+        check=True, env_role="orchestrator", cap_output=False,
     ).stdout
-    for f in sorted(set(x for x in raw_files.split("\x00") if x)):
-        if _is_secret_filename(f):
-            findings.append(f"Potential secret file in commit range: {f}")
-
-    # Inspect all commit messages in range
-    commit_msgs = run_cmd(
-        git_cmd("log", "--pretty=format:%B%n", f"{base_sha}..{candidate_sha}"),
-        cwd=worktree,
-        check=True,
-        env_role="orchestrator",
-        cap_output=False,
-    ).stdout
-    findings.extend(scan_text_for_secrets(commit_msgs, "commit message"))
-
-    # Inspect every commit patch (including merge commits via -m) in base_sha..candidate_sha
-    full_patch = run_cmd(
-        git_cmd("log", "-m", "-p", "--no-ext-diff", "--no-textconv", "--no-color", "-U0", f"{base_sha}..{candidate_sha}"),
-        cwd=worktree,
-        check=True,
-        env_role="orchestrator",
-        cap_output=False,
-    ).stdout
-    cur_file = ""
-    for line in full_patch.splitlines():
-        if line.startswith("+++ b/"):
-            cur_file = line[6:]
-        elif line.startswith("+") and not line.startswith("+++"):
-            content = line[1:]
-            for pat in SECRET_VALUE_PATTERNS:
-                if pat.search(content):
-                    findings.append(f"Potential secret token in {cur_file or 'commit history'} matching {pat.pattern}")
-                    break
-    return sorted(set(findings))
+    return scan_text_for_secrets(messages, "commit message") + _scan_git_changes_for_secrets(
+        worktree, ["log", "-m", "--format=", revision_range]
+    )
 
 
 def scan_staged_for_secrets(worktree: Path) -> list[str]:
-    findings: list[str] = []
-    raw_staged = run_cmd(
-        git_cmd("diff", "--cached", "-z", "--name-only"),
-        cwd=worktree,
-        check=True,
-        env_role="orchestrator",
-        cap_output=False,
+    return _scan_git_changes_for_secrets(worktree, ["diff", "--cached"])
+
+
+def _scan_before_git_write(worktree: Path, *, for_stash: bool = False) -> list[str]:
+    # stash -u records three trees: index, tracked working copy, and untracked files.
+    findings = _scan_git_changes_for_secrets(worktree, ["diff", "HEAD"], ignore_shutdown=for_stash)
+    if for_stash:
+        findings.extend(_scan_git_changes_for_secrets(worktree, ["diff", "--cached"], ignore_shutdown=True))
+    untracked = run_cmd(
+        git_cmd("ls-files", "--others", "--exclude-standard", "-z"),
+        cwd=worktree, check=True, env_role="orchestrator", cap_output=False, ignore_shutdown=for_stash,
     ).stdout
-    for f in (x for x in raw_staged.split("\x00") if x):
-        if _is_secret_filename(f):
-            findings.append(f"Refusing to commit potential secret file: {f}")
-    staged_diff = run_cmd(
-        git_cmd("diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color", "-U0"),
-        cwd=worktree,
-        check=True,
-        env_role="orchestrator",
-        cap_output=False,
-    ).stdout
-    cur_file = ""
-    for line in staged_diff.splitlines():
-        if line.startswith("+++ b/"):
-            cur_file = line[6:]
-        elif line.startswith("+") and not line.startswith("+++"):
-            for pat in SECRET_VALUE_PATTERNS:
-                if pat.search(line[1:]):
-                    findings.append(f"Refusing to commit potential secret token in {cur_file} matching {pat.pattern}")
-                    break
-    return sorted(set(findings))
+    for name in filter(None, untracked.split("\0")):
+        findings.extend(scan_text_for_secrets(name, "untracked file name"))
+        if _is_secret_filename(name):
+            findings.append(f"Potential secret file: {redact_secrets(name)}")
+            continue
+        path = worktree / name
+        if path.is_symlink():
+            content = os.readlink(path)
+        elif path.is_file():
+            content = path.read_bytes().decode("utf-8", errors="replace")
+        else:
+            findings.append("Unable to scan untracked entry as a regular file or symbolic link")
+            continue
+        findings.extend(scan_text_for_secrets(content, "untracked file content"))
+    return findings
 
 
 def verify_worktree_branch_integrity(worktree: Path, expected_common_dir: Path, expected_branch: str, base_sha: str) -> None:
@@ -2238,6 +2262,10 @@ def orchestrator_commit(worktree: Path, identifier: str, title: str, attempt: in
         return head, msg_secret_hits
     status = run_cmd(git_cmd("status", "--porcelain"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
     if status:
+        secret_hits = _scan_before_git_write(worktree)
+        if secret_hits:
+            head = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
+            return head, secret_hits
         run_cmd(git_cmd("add", "-A"), cwd=worktree, check=True, env_role="orchestrator")
         run_cmd(git_cmd("reset", "-q", "--", ".dispatch"), cwd=worktree, env_role="orchestrator")
         staged = run_cmd(git_cmd("diff", "--cached", "-z", "--name-only"), cwd=worktree, check=True, env_role="orchestrator").stdout
@@ -2302,7 +2330,7 @@ def extract_json_object(text: str) -> dict[str, Any]:
             idx = brace + 1
     if best_obj is not None:
         return best_obj
-    raise ValueError(f"Could not extract JSON object from output:\n{redact_secrets(text[-1000:])}")
+    raise ValueError(f"Could not extract JSON object from output:\n{redact_secrets(text)[-1000:]}")
 
 
 def validate_schema(obj: Any, schema: dict[str, Any], *, expected_axis: str | None = None) -> dict[str, Any]:
@@ -2340,90 +2368,82 @@ def validate_schema(obj: Any, schema: dict[str, Any], *, expected_axis: str | No
     return obj
 
 
-def parse_opencode_ndjson(stdout: str) -> str:
-    """Return ONLY the final completed assistant message/step text segment so earlier tentative outputs cannot override the final verdict."""
-    segments: list[list[str]] = []
-    current: list[str] = []
-    last_msg_id: str | None = None
+def _harness_events(stdout: str) -> Iterator[dict[str, Any]]:
+    for line in stdout.split("\n"):
+        if line.lstrip().startswith("{"):
+            event = json.loads(line)
+            if isinstance(event, dict):
+                yield event
 
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        ev_type = ev.get("type")
-        if ev_type == "error":
-            raise RuntimeError(f"OpenCode error event: {ev}")
-        if ev_type == "step_start":
-            if current:
-                segments.append(current)
-                current = []
-            continue
-        if ev_type == "text":
-            part = ev.get("part") or {}
-            msg_id = str(part.get("messageID") or ev.get("messageID") or "")
-            if msg_id and last_msg_id and msg_id != last_msg_id and current:
-                segments.append(current)
-                current = []
-            if msg_id:
-                last_msg_id = msg_id
-            txt = part.get("text") if isinstance(part.get("text"), str) else ev.get("text")
-            if isinstance(txt, str) and txt.strip():
-                current.append(txt)
-    if current:
-        segments.append(current)
-    for seg in reversed(segments):
-        joined = "\n".join(seg).strip()
-        if joined:
-            return joined
-    return stdout
+
+def parse_codex_ndjson(stdout: str) -> str:
+    text = ""
+    completed = False
+    for event in _harness_events(stdout):
+        kind = event.get("type")
+        if kind in ("turn.failed", "error"):
+            raise RuntimeError("Codex reported an unsuccessful turn")
+        if kind == "turn.started":
+            text, completed = "", False
+        elif kind == "item.completed":
+            item = event.get("item") or {}
+            if item.get("type") == "agent_message":
+                text = item.get("text", "")
+        elif kind == "turn.completed":
+            completed = True
+    if not text or not completed:
+        raise ValueError("Codex produced no completed final assistant message")
+    return text
+
+
+def parse_opencode_ndjson(stdout: str) -> str:
+    current: list[str] = []
+    last_id = ""
+    finished = False
+    for event in _harness_events(stdout):
+        kind = event.get("type")
+        part = event.get("part") or {}
+        msg_id = str(part.get("messageID") or event.get("messageID") or "")
+        if kind == "error":
+            raise RuntimeError("OpenCode reported an error event")
+        if kind == "step_start" or (msg_id and last_id and msg_id != last_id):
+            current.clear()
+            finished = False
+        if msg_id:
+            last_id = msg_id
+        if kind == "text":
+            text = part.get("text", event.get("text"))
+            if isinstance(text, str):
+                current.append(text)
+        elif kind == "step_finish":
+            finished = part.get("reason") == "stop"
+    if not finished or not any(text.strip() for text in current):
+        raise ValueError("OpenCode produced no completed final assistant message")
+    return "\n".join(current)
 
 
 def parse_pi_ndjson(stdout: str) -> str:
-    last_assistant_text = ""
-
-    def _text_from_msg(msg: dict[str, Any]) -> str:
-        if msg.get("role") != "assistant":
-            return ""
-        content = msg.get("content")
-        if isinstance(content, str):
-            return content
+    final = None
+    for event in _harness_events(stdout):
+        kind = event.get("type")
+        if kind == "error":
+            raise RuntimeError("Pi reported an error event")
+        msg = event.get("message")
+        if kind in ("agent_start", "turn_start") or event.get("willRetry"):
+            final = None
+        elif kind in ("message_start", "message_update", "message_end") and isinstance(msg, dict) and msg.get("role") == "assistant":
+            final = msg if kind == "message_end" else None
+        elif kind == "agent_end":
+            final = next((m for m in reversed(event.get("messages") or [])
+                          if isinstance(m, dict) and m.get("role") == "assistant"), None)
+    if final and final.get("stopReason") in (None, "stop"):
+        content = final.get("content")
         if isinstance(content, list):
-            parts = [
-                item.get("text", "")
-                for item in content
-                if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)
-            ]
-            return "\n".join(parts)
-        return ""
-
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if ev.get("type") == "error":
-            raise RuntimeError(f"Pi error event: {ev}")
-        if isinstance(ev.get("message"), dict):
-            t = _text_from_msg(ev["message"])
-            if t.strip():
-                last_assistant_text = t
-        elif isinstance(ev.get("messages"), list):
-            for m in reversed(ev["messages"]):
-                if isinstance(m, dict):
-                    t = _text_from_msg(m)
-                    if t.strip():
-                        last_assistant_text = t
-                        break
-    if not last_assistant_text:
-        raise ValueError("Pi produced no assistant text message in NDJSON output.")
-    return last_assistant_text
+            content = "\n".join(item["text"] for item in content if isinstance(item, dict)
+                                and item.get("type") == "text" and isinstance(item.get("text"), str))
+        if isinstance(content, str) and content.strip():
+            return content
+    raise ValueError("Pi produced no completed final assistant message")
 
 
 _TRACE_WRITE_LOCK = threading.Lock()
@@ -2431,7 +2451,7 @@ _TRACE_WRITE_LOCK = threading.Lock()
 
 def append_session_trace(run_dir: Path, entry: dict[str, Any], trace_sink: list[dict[str, Any]] | None) -> None:
     """Persist every session trace immediately to run_dir/sessions.jsonl so timeouts/crashes never lose traces."""
-    entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), **entry}
+    entry = redact_data({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), **entry})
     with _TRACE_WRITE_LOCK:
         trace_file = run_dir / "sessions.jsonl"
         trace_file.parent.mkdir(parents=True, exist_ok=True)
@@ -2440,6 +2460,25 @@ def append_session_trace(run_dir: Path, entry: dict[str, Any], trace_sink: list[
             fh.flush()
         if trace_sink is not None and entry.get("event") == "end":
             trace_sink.append(entry)
+
+
+@contextlib.contextmanager
+def _pi_session_archive(path: Path, session_id: str, worktree: Path) -> Iterator[str]:
+    """Let Pi append native session entries in memory and retain a redacted replay."""
+    header = {"type": "session", "version": 3, "id": session_id, "cwd": str(worktree),
+              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    with os.fdopen(os.memfd_create("agent-dispatch-pi"), "w+", encoding="utf-8") as session:
+        session.write(json.dumps(header) + "\n")
+        session.flush()
+        try:
+            yield f"/proc/{os.getpid()}/fd/{session.fileno()}"
+        finally:
+            session.seek(0)
+            entries = []
+            for line in session:
+                if line.endswith("\n"):
+                    entries.append(safe_json(json.loads(line), ensure_ascii=False))
+            atomic_write_text(path, "\n".join(entries) + "\n")
 
 
 def invoke_harness(
@@ -2461,6 +2500,7 @@ def invoke_harness(
 ) -> dict[str, Any]:
     schema_file.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(schema_file, json.dumps(schema, indent=2))
+    prompt_text = redact_secrets(prompt_text)
     atomic_write_text(prompt_file, prompt_text)
     if out_file.exists():
         out_file.unlink()
@@ -2471,6 +2511,7 @@ def invoke_harness(
 
     pi_session_dir = run_dir / "pi-sessions"
     pi_session_id = str(uuid.uuid4()) if spec.harness == "pi" else ""
+    pi_archive = pi_session_dir / f"{pi_session_id}.jsonl"
 
     append_session_trace(
         run_dir,
@@ -2495,7 +2536,7 @@ def invoke_harness(
         "read_only": read_only,
         "status": "error",
         **(
-            {"session_id": pi_session_id, "resume_cmd": f"pi --session {pi_session_id} --session-dir {pi_session_dir}"}
+            {"session_id": pi_session_id, "resume_cmd": shlex.join(["pi", "--session", str(pi_archive)])}
             if pi_session_id
             else {}
         ),
@@ -2527,8 +2568,7 @@ def invoke_harness(
                 sandbox,
                 "--output-schema",
                 str(schema_file),
-                "-o",
-                str(out_file),
+                "--json",
                 "-",
             ]
             res = run_cmd(
@@ -2537,10 +2577,11 @@ def invoke_harness(
                 stdin_text=prompt_text,
                 timeout=timeout,
                 env_role="codex",
+                cap_output=False,
                 stdout_path=stdout_log,
                 stderr_path=stderr_log,
             )
-            sid_m = re.search(r"session id:\s*([0-9a-fA-F-]+)", res.stderr + "\n" + res.stdout)
+            sid_m = re.search(r'(?:\bsession id:\s*|"thread_id"\s*:\s*")([0-9a-fA-F-]+)', res.stdout + "\n" + res.stderr)
             sid = sid_m.group(1) if sid_m else ""
             trace_end.update(
                 {
@@ -2550,10 +2591,10 @@ def invoke_harness(
                 }
             )
             if res.returncode != 0:
-                raise RuntimeError(f"codex exec exited {res.returncode}: {redact_secrets(res.stderr[-2000:])}")
-            if not out_file.is_file():
-                raise RuntimeError("codex exec exited 0 but did not write output file.")
-            validated = validate_schema(json.loads(out_file.read_text(encoding="utf-8")), schema, expected_axis=expected_axis)
+                raise RuntimeError(f"codex exec exited {res.returncode}: {redact_secrets(res.stderr)[-2000:]}")
+            result = json.loads(parse_codex_ndjson(res.stdout))
+            validated = redact_data(validate_schema(result, schema, expected_axis=expected_axis))
+            atomic_write_text(out_file, json.dumps(validated, indent=2, ensure_ascii=False))
             trace_end["status"] = "ok"
             return validated
 
@@ -2567,7 +2608,6 @@ def invoke_harness(
                 agy_bin,
                 "--model",
                 spec.model,
-                "--dangerously-skip-permissions",
                 "--add-dir",
                 str(run_dir),
                 "--output-format",
@@ -2579,7 +2619,7 @@ def invoke_harness(
                 # Keep slash expansion enabled ONLY so --mode plan actually takes effect (prompt has no leading /cmd)
                 cmd += ["--mode", "plan"]
             else:
-                cmd += ["--disable-slash-commands"]
+                cmd += ["--dangerously-skip-permissions", "--disable-slash-commands"]
             cmd.append(f"--print={short_prompt}")
 
             res = run_cmd(
@@ -2600,6 +2640,8 @@ def invoke_harness(
                 if cid_m:
                     wrapper = {"conversation_id": cid_m.group(1)}
             cid = str(wrapper.get("conversation_id", ""))
+            if not re.fullmatch(r"[A-Za-z0-9-]+", cid):
+                cid = ""
             trace_end.update(
                 {
                     "returncode": res.returncode,
@@ -2612,14 +2654,14 @@ def invoke_harness(
             )
             if res.returncode != 0:
                 raise RuntimeError(
-                    f"agy exited {res.returncode}: {redact_secrets(res.stderr[-2000:])}\n{redact_secrets(res.stdout[-1000:])}"
+                    f"agy exited {res.returncode}: {redact_secrets(res.stderr)[-2000:]}\n{redact_secrets(res.stdout)[-1000:]}"
                 )
             if wrapper.get("status") not in (None, "SUCCESS"):
                 raise RuntimeError(f"agy returned non-SUCCESS status: {wrapper.get('status')}")
             result = wrapper.get("structured_output")
             if not isinstance(result, dict):
                 result = extract_json_object(str(wrapper.get("response", "")))
-            validated = validate_schema(result, schema, expected_axis=expected_axis)
+            validated = redact_data(validate_schema(result, schema, expected_axis=expected_axis))
             atomic_write_text(out_file, json.dumps(validated, indent=2, ensure_ascii=False))
             trace_end["status"] = "ok"
             return validated
@@ -2669,7 +2711,7 @@ def invoke_harness(
                 stdout_path=stdout_log,
                 stderr_path=stderr_log,
             )
-            sid_m = re.search(r'"sessionID"\s*:\s*"([^"]+)"', res.stdout)
+            sid_m = re.search(r'"sessionID"\s*:\s*"([A-Za-z0-9_-]+)"', res.stdout)
             sid = sid_m.group(1) if sid_m else ""
             trace_end.update(
                 {
@@ -2679,9 +2721,9 @@ def invoke_harness(
                 }
             )
             if res.returncode != 0:
-                raise RuntimeError(f"opencode run exited {res.returncode}: {redact_secrets(res.stderr[-2000:])}")
+                raise RuntimeError(f"opencode run exited {res.returncode}: {redact_secrets(res.stderr)[-2000:]}")
             text = parse_opencode_ndjson(res.stdout)
-            validated = validate_schema(extract_json_object(text), schema, expected_axis=expected_axis)
+            validated = redact_data(validate_schema(extract_json_object(text), schema, expected_axis=expected_axis))
             atomic_write_text(out_file, json.dumps(validated, indent=2, ensure_ascii=False))
             trace_end["status"] = "ok"
             return validated
@@ -2701,8 +2743,6 @@ def invoke_harness(
                 "json",
                 "--name",
                 role_name,
-                "--session-id",
-                pi_session_id,
                 "--session-dir",
                 str(pi_session_dir),
                 "--model",
@@ -2710,29 +2750,17 @@ def invoke_harness(
             ]
             if read_only:
                 cmd += ["--tools", "read,grep,find,ls"]
-            cmd.append(short_prompt)
-            res = run_cmd(
-                cmd,
-                cwd=worktree,
-                timeout=timeout,
-                env_role="child",
-                cap_output=False,
-                stdout_path=stdout_log,
-                stderr_path=stderr_log,
-            )
-            session_files = sorted(pi_session_dir.glob(f"*{pi_session_id}*"))
-            sess_path = str(session_files[0]) if session_files else str(pi_session_dir)
-            trace_end.update(
-                {
-                    "returncode": res.returncode,
-                    "session_id": pi_session_id,
-                    "resume_cmd": f"pi --session {sess_path}",
-                }
-            )
+            with _pi_session_archive(pi_archive, pi_session_id, worktree) as session_file:
+                cmd += ["--session", session_file, short_prompt]
+                res = run_cmd(
+                    cmd, cwd=worktree, timeout=timeout, env_role="child", cap_output=False,
+                    stdout_path=stdout_log, stderr_path=stderr_log,
+                )
+            trace_end["returncode"] = res.returncode
             if res.returncode != 0:
-                raise RuntimeError(f"pi exited {res.returncode}: {redact_secrets(res.stderr[-2000:])}")
+                raise RuntimeError(f"pi exited {res.returncode}: {redact_secrets(res.stderr)[-2000:]}")
             text = parse_pi_ndjson(res.stdout)
-            validated = validate_schema(extract_json_object(text), schema, expected_axis=expected_axis)
+            validated = redact_data(validate_schema(extract_json_object(text), schema, expected_axis=expected_axis))
             atomic_write_text(out_file, json.dumps(validated, indent=2, ensure_ascii=False))
             trace_end["status"] = "ok"
             return validated
@@ -2747,9 +2775,9 @@ def invoke_harness(
             partial = ""
             for p in (stderr_log, stdout_log):
                 if p.is_file():
-                    partial += p.read_text(encoding="utf-8", errors="ignore")[:8192]
+                    partial += p.read_text(encoding="utf-8", errors="ignore") + "\n"
             if spec.harness == "codex":
-                m = re.search(r"session id:\s*([0-9a-fA-F-]+)", partial)
+                m = re.search(r'(?:\bsession id:\s*|"thread_id"\s*:\s*")([0-9a-fA-F-]+)', partial)
                 if m:
                     trace_end["session_id"] = m.group(1)
                     trace_end["resume_cmd"] = f"codex resume {m.group(1)}"
@@ -2760,7 +2788,7 @@ def invoke_harness(
                     trace_end["conversation_link"] = f"conversation://{m.group(1)}"
                     trace_end["resume_cmd"] = f"agy --conversation {m.group(1)}"
             elif spec.harness == "opencode":
-                m = re.search(r'"sessionID"\s*:\s*"([^"]+)"', partial)
+                m = re.search(r'"sessionID"\s*:\s*"([A-Za-z0-9_-]+)"', partial)
                 if m:
                     trace_end["session_id"] = m.group(1)
                     trace_end["resume_cmd"] = f"opencode -s {m.group(1)}"
@@ -2777,6 +2805,7 @@ def build_worker_prompt(
     verify_cmd: str | None,
     *,
     allow_gate_edits: bool,
+    baseline_std_dir: Path,
     authorized_gate_patterns: list[str] | None = None,
     feedback: str | None = None,
 ) -> str:
@@ -2798,7 +2827,7 @@ def build_worker_prompt(
         "",
         "## Required Reading First",
         f"1. Read `{worktree_brief_rel}` (authoritative ticket specification; treat Parent Spec section as background context only).",
-        "2. Read repo `AGENTS.md`, `CODING_STANDARDS.md`, `CONTRIBUTING.md`, `GLOSSARY.md` (or `GLOSSARY-MAP.md`), and active `docs/adr/*.md` (ignore `superseded`/`deprecated` frontmatter status) if present.",
+        f"2. Read the redacted baseline standards, glossary, and active ADR snapshots under `{baseline_std_dir}`.",
         "",
         "## Execution Rules",
         "- Minimal complete change: satisfy ONLY the ticket's acceptance criteria.",
@@ -2850,13 +2879,7 @@ def run_two_axis_review(
         cap_output=False,
     ).stdout
     if block_added_secrets:
-        added_secret_hits: list[str] = []
-        cur_f = ""
-        for ln in raw_diff_text.splitlines():
-            if ln.startswith("+++ b/"):
-                cur_f = ln[6:]
-            elif ln.startswith("+") and not ln.startswith("+++"):
-                added_secret_hits.extend(scan_text_for_secrets(ln[1:], cur_f or "diff"))
+        added_secret_hits = scan_range_for_secrets(worktree, base_sha, candidate_sha)
         if added_secret_hits:
             raise RuntimeError(
                 "Refusing to send candidate diff containing added secrets to reviewer:\n"
@@ -2953,8 +2976,8 @@ def run_two_axis_review(
         raise last_err
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        f_std = pool.submit(_run_axis, "standards", "\n".join(std_lines) + "\n", std_attach)
-        f_spec = pool.submit(_run_axis, "spec", "\n".join(spec_lines) + "\n", spec_attach) if auth_brief_path else None
+        f_std = pool.submit(_run_axis, "standards", redact_secrets("\n".join(std_lines) + "\n"), std_attach)
+        f_spec = pool.submit(_run_axis, "spec", redact_secrets("\n".join(spec_lines) + "\n"), spec_attach) if auth_brief_path else None
         standards_res = f_std.result()
         spec_res = (
             f_spec.result()
@@ -3074,15 +3097,18 @@ def build_pr_body(
     return redact_secrets("\n".join(lines) + "\n")
 
 
-def fetch_open_prs_for_branch(worktree: Path, gh_repo: str | None, branch: str) -> list[dict[str, Any]]:
-    cmd = ["gh", "pr", "list", "--head", branch, "--state", "open", "--limit", "50", "--json", "url,number,state,isDraft,headRefOid,baseRefName"]
+PR_FIELDS = "url,number,state,isDraft,headRefOid,headRefName,baseRefName,isCrossRepository"
+
+
+def fetch_open_prs_for_branch(worktree: Path, gh_repo: str | None, branch: str, *, state: str = "open") -> list[dict[str, Any]]:
+    cmd = ["gh", "pr", "list", "--head", branch, "--state", state, "--limit", "100", "--json", PR_FIELDS]
     if gh_repo:
         cmd += ["--repo", gh_repo]
-    res = run_cmd(cmd, cwd=worktree, env_role="orchestrator")
-    if res.returncode != 0:
-        raise RuntimeError(f"gh pr list failed ({res.returncode}): {redact_secrets(res.stderr)}")
-    prs = json.loads(res.stdout or "[]")
-    return prs if isinstance(prs, list) else []
+    res = run_cmd(cmd, cwd=worktree, env_role="orchestrator", check=True, cap_output=False)
+    prs = json.loads(res.stdout)
+    if not isinstance(prs, list) or len(prs) >= 100:
+        raise RuntimeError(f"Incomplete GitHub PR lookup for {branch}.")
+    return [pr for pr in prs if pr["isCrossRepository"] is False and pr["headRefName"] == branch]
 
 
 def fetch_open_pr_for_branch(worktree: Path, gh_repo: str | None, branch: str) -> dict[str, Any] | None:
@@ -3093,19 +3119,6 @@ def fetch_open_pr_for_branch(worktree: Path, gh_repo: str | None, branch: str) -
             f"Multiple open PRs share head branch '{branch}' (#{nums}); refusing ambiguous push/update."
         )
     return prs[0] if prs else None
-
-
-def fetch_pr_by_number(worktree: Path, gh_repo: str | None, pr_number: int) -> dict[str, Any] | None:
-    cmd = ["gh", "pr", "view", str(pr_number), "--json", "url,number,state,isDraft,headRefOid,baseRefName"]
-    if gh_repo:
-        cmd += ["--repo", gh_repo]
-    res = run_cmd(cmd, cwd=worktree, env_role="orchestrator")
-    if res.returncode != 0:
-        return None
-    try:
-        return json.loads(res.stdout or "{}") or None
-    except json.JSONDecodeError:
-        return None
 
 
 def fetch_open_pr_feedback(worktree: Path, gh_repo: str | None, branch: str) -> str | None:
@@ -3147,7 +3160,7 @@ def fetch_open_pr_feedback(worktree: Path, gh_repo: str | None, branch: str) -> 
             cap_output=False,
         )
         if inline.returncode != 0:
-            log(f"Warning: failed fetching inline PR comments for #{pr['number']}: {redact_secrets(inline.stderr[:300])}")
+            log(f"Warning: failed fetching inline PR comments for #{pr['number']}: {redact_secrets(inline.stderr)[:300]}")
         elif inline.stdout.strip():
             try:
                 parsed = json.loads(inline.stdout)
@@ -3171,19 +3184,25 @@ def fetch_open_pr_feedback(worktree: Path, gh_repo: str | None, branch: str) -> 
                         notes.append(f"- [Inline PR Comment by @{author} on `{path}:{line}`]: {redact_secrets(body)}")
             except json.JSONDecodeError as exc:
                 log(f"Warning: could not parse inline PR comments JSON for #{pr['number']}: {exc}")
-    return "\n".join(notes) if notes else None
+    return redact_secrets("\n".join(notes)) if notes else None
+
+
+PUBLISH_STAGES = ("verified_and_reviewed", "pushing", "pushed", "pr_ready", "linear_state_synced")
+COMPLETED_STAGES = ("completed", "completed_branch_only")
 
 
 def save_checkpoint(run_dir: Path, latest_file: Path, state: dict[str, Any]) -> None:
     state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    payload = json.dumps(state, indent=2, ensure_ascii=False)
+    payload = safe_json(state, indent=2, ensure_ascii=False)
     atomic_write_text(run_dir / "state.json", payload)
-    atomic_write_text(latest_file, json.dumps({"run_dir": str(run_dir), **state}, indent=2, ensure_ascii=False))
+    atomic_write_text(latest_file, safe_json({"run_dir": str(run_dir), **state}, indent=2, ensure_ascii=False))
 
 
 def _validate_open_draft_pr(pr: dict[str, Any] | None, *, base_branch: str, candidate_sha: str | None = None, context: str = "") -> dict[str, Any]:
     if not pr:
         raise RuntimeError(f"Expected open Draft PR ({context}), but GitHub returned no open PR.")
+    if pr.get("state") != "OPEN":
+        raise RuntimeError(f"PR #{pr.get('number')} is {pr.get('state')!r} (human action preserved).")
     if pr.get("isDraft") is not True:
         raise RuntimeError(f"Open PR #{pr.get('number')} ({context}) is not a Draft PR; refusing to overwrite.")
     if pr.get("baseRefName") != base_branch:
@@ -3195,6 +3214,25 @@ def _validate_open_draft_pr(pr: dict[str, Any] | None, *, base_branch: str, cand
             f"Open PR #{pr.get('number')} ({context}) headRefOid ({str(pr.get('headRefOid') or 'missing')[:8]}) != reviewed SHA ({candidate_sha[:8]})."
         )
     return pr
+
+
+def _claim_metadata_matches(issue: dict[str, Any], state: dict[str, Any]) -> bool:
+    expected = state.get("claimed_ownership") or {}
+    return (
+        ("assignee_id" not in expected or (issue.get("assignee") or {}).get("id", "") == expected["assignee_id"])
+        and (not expected.get("description_sha") or sha256_text(issue.get("description") or "") == expected["description_sha"])
+    )
+
+
+def _require_publish_ownership(issue: dict[str, Any], state: dict[str, Any]) -> None:
+    live = issue["state"]
+    claimed = state.get("claimed_state_id")
+    in_claim = live.get("id") == claimed if claimed else live.get("name", "").lower() == "in progress"
+    in_review = live.get("name", "").lower() == "in review"
+    stage = state.get("stage")
+    if (live.get("type") in ("completed", "canceled") or not _claim_metadata_matches(issue, state)
+            or not (in_review if stage == "linear_state_synced" else in_claim or (stage == "pr_ready" and in_review))):
+        raise RuntimeError(f"Human Linear ownership conflict on {issue['identifier']} at {stage}: state {live.get('name')!r}.")
 
 
 def reconcile_publish(
@@ -3218,6 +3256,8 @@ def reconcile_publish(
     base_branch = state["base_branch"]
     candidate_sha = state["candidate_sha"]
     remote_kind, gh_repo, raw_remote_url = classify_origin_remote(worktree)
+    if state.get("publish_destination") and sha256_text(gh_repo.lower() if gh_repo else raw_remote_url) != state["publish_destination"]:
+        raise RuntimeError("Origin destination changed since preflight; refusing to publish.")
     force_gh = os.environ.get("AGENT_DISPATCH_FORCE_GH") == "1"
     if remote_kind == "github" or force_gh:
         is_github = True
@@ -3225,193 +3265,107 @@ def reconcile_publish(
         is_github = False
     else:
         raise RuntimeError(
-            f"Unrecognized non-GitHub origin remote '{raw_remote_url}'; refusing silent branch-only delivery "
+            "Unrecognized non-GitHub origin remote; refusing silent branch-only delivery "
             f"(configure a standard GitHub origin URL or pass --allow-branch-only explicitly)."
         )
 
     cur_stage = str(state.get("stage") or "verified_and_reviewed")
     recorded_pr_num = state.get("pr_number")
 
-    # 0. Pre-flight live Linear terminal + ownership guard + PR title secret guard
     live_pre = client.get_issue(issue["identifier"])
-    pre_st = live_pre.get("state") or {}
-    if pre_st.get("type") in ("completed", "canceled"):
-        raise RuntimeError(
-            f"Human terminal state conflict before publish: {live_pre['identifier']} is already '{pre_st.get('name')}'; aborting publish."
-        )
-    saved_own = state.get("claimed_ownership") or {}
-    if saved_own.get("description_sha") and sha256_text(str(live_pre.get("description") or "")) != saved_own["description_sha"]:
-        raise RuntimeError(
-            f"Linear description changed since review for {live_pre['identifier']}; refusing to publish stale reviewed commit."
-        )
-    cur_assignee_id = str((live_pre.get("assignee") or {}).get("id") or "")
-    if "assignee_id" in saved_own and cur_assignee_id != str(saved_own.get("assignee_id") or ""):
-        raise RuntimeError(
-            f"Linear assignee changed since review for {live_pre['identifier']}; refusing to publish under changed ownership."
-        )
+    _require_publish_ownership(live_pre, state)
 
     pr_title = f"{issue['identifier']}: {issue['title']}"
     title_secrets = scan_text_for_secrets(pr_title, "PR title")
     if title_secrets:
         raise RuntimeError("Refusing to publish PR with secret in title: " + "; ".join(title_secrets))
 
-    # Fast-path stage-aware resume when PR (and possibly Linear In Review) ALREADY succeeded!
-    if cur_stage in ("pr_ready", "linear_state_synced"):
-        remote_sha = get_remote_branch_sha(worktree, branch)
-        if remote_sha != candidate_sha:
-            raise RuntimeError(
-                f"Cannot resume stage '{cur_stage}': remote origin/{branch} SHA is '{remote_sha[:8] or 'deleted'}', expected '{candidate_sha[:8]}'."
-            )
-        if is_github:
-            pr_obj = fetch_pr_by_number(worktree, gh_repo, int(recorded_pr_num)) if recorded_pr_num else fetch_open_pr_for_branch(worktree, gh_repo, branch)
-            if not pr_obj:
-                raise RuntimeError(f"Previously delivered PR (#{recorded_pr_num or branch}) no longer exists; refusing to recreate.")
-            pr_state_u = str(pr_obj.get("state") or "OPEN").upper()
-            if pr_state_u != "OPEN":
-                raise RuntimeError(
-                    f"Previously delivered PR #{pr_obj.get('number')} is '{pr_state_u}' (human action preserved; refusing to recreate/overwrite)."
-                )
-            _validate_open_draft_pr(pr_obj, base_branch=base_branch, candidate_sha=candidate_sha, context=f"resume stage {cur_stage}")
-            state["pr_number"] = pr_obj["number"]
-            state["pr_url"] = pr_obj["url"]
+    # Recheck PR identity even on a late resume. A different open PR cannot replace the recorded one.
+    existing = None
+    if is_github:
+        existing = fetch_open_pr_for_branch(worktree, gh_repo, branch)
+        if recorded_pr_num and (not existing or existing["number"] != recorded_pr_num):
+            raise RuntimeError(f"Recorded PR #{recorded_pr_num} is no longer the open PR (human action preserved).")
+        if existing:
+            _validate_open_draft_pr(existing, base_branch=base_branch, context="pre-push check")
+            state["pr_number"] = existing["number"]
+        elif cur_stage in ("pr_ready", "linear_state_synced"):
+            raise RuntimeError("Previously delivered PR is no longer open (human action preserved).")
+        elif cur_stage == "pushed" or state.get("pr_create_attempted"):
+            history = fetch_open_prs_for_branch(worktree, gh_repo, branch, state="all")
+            if any(pr.get("headRefOid") == candidate_sha for pr in history):
+                raise RuntimeError("Previously delivered PR is no longer open (human action preserved).")
 
-        if cur_stage == "linear_state_synced":
-            # Step 3 already completed previously: verify human did NOT revert/move Linear away from In Review!
-            if str(pre_st.get("name") or "").lower() != "in review":
-                raise RuntimeError(
-                    f"Human state conflict on resume (stage=linear_state_synced): {live_pre['identifier']} is now '{pre_st.get('name')}', expected 'In Review'; refusing to overwrite."
-                )
-            # Ensure failure labels cleared, then perform ONLY Step 4 (idempotent marker comment) — ZERO pr edit / state overwrite!
-            client.remove_labels_if_present(live_pre, {"dispatch:failed", "dispatch:publish-incomplete"})
-            live_issue = live_pre
-        else:
-            # cur_stage == "pr_ready": perform Step 3 + Step 4 without touching the already-created PR!
-            client.update_issue_state(live_pre, "In Review")
-            client.remove_labels_if_present(live_pre, {"dispatch:failed", "dispatch:publish-incomplete"})
-            issue["state"] = live_pre["state"]
-            issue["labels"] = live_pre["labels"]
-            state["linear_state_synced"] = True
-            state["stage"] = "linear_state_synced"
-            save_checkpoint(run_dir, latest_file, state)
-            live_issue = live_pre
-    else:
-        # Full Step 0c -> Step 1 (push) -> Step 2 (create/update Draft PR) -> Step 3 (Linear In Review)
-        pre_existing_pr: dict[str, Any] | None = None
-        if is_github:
-            if recorded_pr_num:
-                rec = fetch_pr_by_number(worktree, gh_repo, int(recorded_pr_num))
-                if rec and str(rec.get("state") or "OPEN").upper() != "OPEN":
-                    raise RuntimeError(
-                        f"Previously recorded PR #{recorded_pr_num} is '{rec.get('state')}' (human action preserved; refusing to recreate)."
-                    )
-            pre_existing_pr = fetch_open_pr_for_branch(worktree, gh_repo, branch)
-            if pre_existing_pr:
-                _validate_open_draft_pr(pre_existing_pr, base_branch=base_branch, candidate_sha=None, context="pre-push check")
-
-        # 1. Persist push_attempted BEFORE any remote write, then fast-forward push exact candidate_sha
-        remote_sha = get_remote_branch_sha(worktree, branch)
-        if remote_sha == candidate_sha:
-            state["push_attempted"] = True
-            state["pushed"] = True
-        else:
-            if remote_sha:
-                run_cmd(git_cmd("fetch", "origin", f"refs/heads/{branch}"), cwd=worktree, check=True, env_role="orchestrator")
-                anc = run_cmd(git_cmd("merge-base", "--is-ancestor", remote_sha, candidate_sha), cwd=worktree, env_role="orchestrator")
-                if anc.returncode != 0:
-                    raise RuntimeError(
-                        f"Remote origin/{branch} ({remote_sha[:8]}) diverged from reviewed SHA ({candidate_sha[:8]}); refusing to overwrite."
-                    )
-            state["push_attempted"] = True
-            state["stage"] = "pushing"
-            save_checkpoint(run_dir, latest_file, state)
-
-            log(f"Pushing exact reviewed SHA {candidate_sha[:8]} -> origin/{branch} (fast-forward only)...")
-            push = run_cmd(
-                git_cmd("push", "--no-verify", "origin", f"{candidate_sha}:refs/heads/{branch}"),
-                cwd=worktree,
-                env_role="orchestrator",
-            )
-            if push.returncode != 0:
-                raise RuntimeError(f"Fast-forward push rejected:\n{redact_secrets(push.stderr[-1500:])}")
-            verify_sha = get_remote_branch_sha(worktree, branch)
-            if verify_sha != candidate_sha:
-                raise RuntimeError(f"Remote SHA mismatch after push: expected {candidate_sha}, observed {verify_sha}")
-            state["pushed"] = True
-        state["stage"] = "pushed"
+    remote_sha = get_remote_branch_sha(worktree, branch)
+    already_pushed = cur_stage in ("pushed", "pr_ready", "linear_state_synced") or state.get("pushed")
+    if remote_sha != candidate_sha and already_pushed:
+        raise RuntimeError(f"Remote origin/{branch} moved or was deleted after push; human action preserved.")
+    if remote_sha != candidate_sha:
+        if "pre_push_sha" in state and remote_sha != state["pre_push_sha"]:
+            raise RuntimeError(f"Remote origin/{branch} changed after review; refusing to push.")
+        if remote_sha:
+            run_cmd(git_cmd("fetch", "origin", f"refs/heads/{branch}"), cwd=worktree, check=True, env_role="orchestrator")
+            anc = run_cmd(git_cmd("merge-base", "--is-ancestor", remote_sha, candidate_sha), cwd=worktree, env_role="orchestrator")
+            if anc.returncode != 0:
+                raise RuntimeError(f"Remote origin/{branch} diverged from reviewed SHA; refusing to push.")
+        state.update(push_attempted=True, stage="pushing", pre_push_sha=remote_sha)
         save_checkpoint(run_dir, latest_file, state)
+        _check_shutdown()
+        # The lease closes the race with a human resetting/deleting the branch after the ancestry check.
+        ref = f"refs/heads/{branch}"
+        run_cmd(git_cmd("push", "--no-verify", f"--force-with-lease={ref}:{remote_sha}", "origin", f"{candidate_sha}:{ref}"),
+                cwd=worktree, check=True, env_role="orchestrator")
+        if get_remote_branch_sha(worktree, branch) != candidate_sha:
+            raise RuntimeError("Remote SHA mismatch after push.")
 
-        # 2. Verify / create / update OPEN Draft PR carrying exact candidate_sha
-        poll_attempts = max(1, int(os.environ.get("AGENT_DISPATCH_PR_POLL_ATTEMPTS", "5")))
-        poll_sleep = float(os.environ.get("AGENT_DISPATCH_PR_POLL_SLEEP", "2.0"))
-
+    if cur_stage not in ("pr_ready", "linear_state_synced"):
+        state.update(pushed=True, push_attempted=True, stage="pushed")
+        save_checkpoint(run_dir, latest_file, state)
         if is_github:
-            pr_body = state["pr_body"]
-            existing: dict[str, Any] | None = None
-            if pre_existing_pr:
-                for attempt_i in range(poll_attempts):
-                    existing = fetch_pr_by_number(worktree, gh_repo, int(pre_existing_pr["number"])) or fetch_open_pr_for_branch(worktree, gh_repo, branch)
-                    if existing and existing.get("headRefOid") == candidate_sha:
-                        break
-                    if attempt_i < poll_attempts - 1 and poll_sleep > 0:
-                        time.sleep(poll_sleep)
-                _validate_open_draft_pr(existing, base_branch=base_branch, candidate_sha=candidate_sha, context="existing PR")
-                assert existing is not None
-                edit_cmd = ["gh", "pr", "edit", str(existing["number"]), "--title", pr_title, "--body", pr_body]
+            if not existing:
+                state["pr_create_attempted"] = True
+                save_checkpoint(run_dir, latest_file, state)
+                body_file = run_dir / "pr-body.md"
+                atomic_write_text(body_file, redact_secrets(state["pr_body"]))
+                cmd = ["gh", "pr", "create", "--draft", "--base", base_branch, "--head", branch,
+                       "--title", pr_title, "--body-file", str(body_file)]
                 if gh_repo:
-                    edit_cmd += ["--repo", gh_repo]
-                run_cmd(edit_cmd, cwd=worktree, check=True, env_role="orchestrator")
-                state["pr_number"] = existing["number"]
-                state["pr_url"] = existing["url"]
-                state["delivery_mode"] = "draft_pr"
-            else:
-                create_cmd = [
-                    "gh",
-                    "pr",
-                    "create",
-                    "--draft",
-                    "--base",
-                    base_branch,
-                    "--head",
-                    branch,
-                    "--title",
-                    pr_title,
-                    "--body",
-                    pr_body,
-                ]
-                if gh_repo:
-                    create_cmd += ["--repo", gh_repo]
-                run_cmd(create_cmd, cwd=worktree, check=True, env_role="orchestrator")
-                verified: dict[str, Any] | None = None
-                for attempt_i in range(poll_attempts):
-                    verified = fetch_open_pr_for_branch(worktree, gh_repo, branch)
-                    if verified and verified.get("headRefOid") == candidate_sha:
-                        break
-                    if attempt_i < poll_attempts - 1 and poll_sleep > 0:
-                        time.sleep(poll_sleep)
-                _validate_open_draft_pr(verified, base_branch=base_branch, candidate_sha=candidate_sha, context="created PR read-back")
-                assert verified is not None
-                state["pr_number"] = verified["number"]
-                state["pr_url"] = verified["url"]
-                state["delivery_mode"] = "draft_pr"
+                    cmd += ["--repo", gh_repo]
+                created = run_cmd(cmd, cwd=worktree, check=True, env_role="orchestrator")
+                number = re.search(r"/pull/(\d+)/?$", created.stdout.strip())
+                if number:
+                    state["pr_number"] = int(number.group(1))
+                    save_checkpoint(run_dir, latest_file, state)
+
+            attempts = max(1, int(os.environ.get("AGENT_DISPATCH_PR_POLL_ATTEMPTS", "5")))
+            pause = float(os.environ.get("AGENT_DISPATCH_PR_POLL_SLEEP", "2.0"))
+            for attempt_i in range(attempts):
+                pr = fetch_open_pr_for_branch(worktree, gh_repo, branch)
+                if pr and pr.get("headRefOid") == candidate_sha:
+                    break
+                if attempt_i + 1 < attempts:
+                    time.sleep(pause)
+            verified = _validate_open_draft_pr(pr, base_branch=base_branch, candidate_sha=candidate_sha, context="PR read-back")
+            if state.get("pr_number") and verified["number"] != state["pr_number"]:
+                raise RuntimeError("Open PR changed during publication; human action preserved.")
+            state.update(pr_number=verified["number"], pr_url=verified["url"], delivery_mode="draft_pr")
         else:
-            state["delivery_mode"] = "branch_only"
-            state["pr_url"] = ""
+            state.update(pr_url="", delivery_mode="branch_only")
         state["stage"] = "pr_ready"
         save_checkpoint(run_dir, latest_file, state)
+    elif is_github:
+        _validate_open_draft_pr(existing, base_branch=base_branch, candidate_sha=candidate_sha, context=cur_stage)
 
-        # 3. Re-read LIVE Linear issue -> guard against human Done/Canceled, sync In Review & clear failure labels
-        live_issue = client.get_issue(issue["identifier"])
-        if (live_issue.get("state") or {}).get("type") in ("completed", "canceled"):
-            raise RuntimeError(
-                f"Human terminal state conflict at Linear sync: {live_issue['identifier']} is already '{live_issue['state']['name']}'; refusing to move to In Review."
-            )
+    live_issue = client.get_issue(issue["id"])
+    _require_publish_ownership(live_issue, state)
+    _check_shutdown()
+    if state["stage"] != "linear_state_synced":
         client.update_issue_state(live_issue, "In Review")
-        client.remove_labels_if_present(live_issue, {"dispatch:failed", "dispatch:publish-incomplete"})
-        issue["state"] = live_issue["state"]
-        issue["labels"] = live_issue["labels"]
-        state["linear_state_synced"] = True
-        state["stage"] = "linear_state_synced"
+        state.update(linear_state_synced=True, stage="linear_state_synced")
         save_checkpoint(run_dir, latest_file, state)
+    client.remove_labels_if_present(live_issue, {"dispatch:failed", "dispatch:publish-incomplete"})
+    issue["state"] = live_issue["state"]
+    issue["labels"] = live_issue["labels"]
 
     # 4. Idempotent delivery summary comment keyed by stable marker
     marker = f"<!-- agent-dispatch-delivery:{state['run_id']}:{candidate_sha} -->"
@@ -3454,7 +3408,9 @@ def verify_completed_publish_readonly(
     branch = state["branch"]
     base_branch = state["base_branch"]
     candidate_sha = state["candidate_sha"]
-    gh_repo = parse_github_owner_repo(worktree)
+    _, gh_repo, raw_remote_url = classify_origin_remote(worktree)
+    if state.get("publish_destination") and sha256_text(gh_repo.lower() if gh_repo else raw_remote_url) != state["publish_destination"]:
+        raise RuntimeError("Origin destination changed since publication.")
     is_github = bool(gh_repo or os.environ.get("AGENT_DISPATCH_FORCE_GH") == "1")
     conflicts: list[str] = []
 
@@ -3468,9 +3424,9 @@ def verify_completed_publish_readonly(
 
     if is_github and state.get("delivery_mode", "draft_pr") == "draft_pr":
         pr_num = state.get("pr_number")
-        pr_obj = fetch_pr_by_number(worktree, gh_repo, int(pr_num)) if pr_num else fetch_open_pr_for_branch(worktree, gh_repo, branch)
-        if not pr_obj:
-            conflicts.append(f"Delivered PR ({state.get('pr_url') or branch}) no longer exists or is inaccessible.")
+        pr_obj = fetch_open_pr_for_branch(worktree, gh_repo, branch)
+        if not pr_obj or (pr_num and pr_obj["number"] != pr_num):
+            conflicts.append(f"Delivered PR ({state.get('pr_url') or branch}) is no longer the open PR (human action preserved).")
         else:
             pr_state = str(pr_obj.get("state") or "OPEN").upper()
             if pr_state != "OPEN":
@@ -3523,6 +3479,12 @@ def _assert_no_external_tampering(
       - Checks local git config and .gitattributes SHA-256 unchanged
       - Checks Linear ownership fields (state, assignee, description hash)
     """
+    if expected_git_cfg:
+        cur_cfg = snapshot_local_git_config(worktree)
+        if cur_cfg["local_config_sha"] != expected_git_cfg.get("local_config_sha"):
+            raise RuntimeError(f"Unauthorized git config tampering detected during {phase} (.git/config modified).")
+        if cur_cfg["gitattributes_sha"] != expected_git_cfg.get("gitattributes_sha"):
+            raise RuntimeError(f"Unauthorized .gitattributes tampering detected during {phase}.")
     cur_branch_sha = get_remote_branch_sha(worktree, branch)
     if cur_branch_sha != expected_branch_sha:
         raise RuntimeError(
@@ -3541,12 +3503,6 @@ def _assert_no_external_tampering(
                     f"Unauthorized external mutation during {phase}: origin/{base_branch} was force-pushed/rewritten "
                     f"({expected_base_sha[:8]} is no longer an ancestor of {cur_base_sha[:8]})."
                 )
-    if expected_git_cfg:
-        cur_cfg = snapshot_local_git_config(worktree)
-        if cur_cfg["local_config_sha"] != expected_git_cfg.get("local_config_sha"):
-            raise RuntimeError(f"Unauthorized git config tampering detected during {phase} (.git/config modified).")
-        if cur_cfg["gitattributes_sha"] != expected_git_cfg.get("gitattributes_sha"):
-            raise RuntimeError(f"Unauthorized .gitattributes tampering detected during {phase}.")
     if expected_ownership:
         cur = client.get_issue_ownership_snapshot(issue_uuid)
         if cur.get("state_type") in ("completed", "canceled"):
@@ -3567,19 +3523,23 @@ def _assert_no_external_tampering(
 
 
 def _stash_dirty_worktree_for_safe_rerun(worktree: Path, label: str) -> None:
-    """Preserve uncommitted work on halt (blocked/timeout/secret) in a git stash so rerunning `run <ID>` won't wedge on dirty tree."""
+    """Stash safe edits, leaving potentially sensitive working files and index entries untouched."""
     try:
-        ensure_dispatch_excluded(worktree)
-        dirty = run_cmd(git_cmd("status", "--porcelain"), cwd=worktree, env_role="orchestrator", ignore_shutdown=True).stdout.strip()
+        ensure_dispatch_excluded(worktree, ignore_shutdown=True)
+        dirty = run_cmd(git_cmd("status", "--porcelain"), cwd=worktree, check=True, env_role="orchestrator", ignore_shutdown=True).stdout.strip()
         if dirty:
+            if _scan_before_git_write(worktree, for_stash=True):
+                log("Secret scan blocked automatic stash. Working files and index were preserved for manual inspection.")
+                return
             run_cmd(
                 git_cmd("stash", "push", "-u", "-m", f"agent-dispatch-{label}"),
                 cwd=worktree,
+                check=True,
                 env_role="orchestrator",
                 ignore_shutdown=True,
             )
-    except Exception:
-        pass
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        log(f"Could not safely stash working files: {redact_secrets(str(exc))}")
 
 
 def execute_ticket(
@@ -3608,6 +3568,7 @@ def execute_ticket(
     force_rerun: bool,
     fresh: bool,
     auto_claimed: bool = False,
+    reserved_touches: set[str] | None = None,
 ) -> dict[str, Any]:
     if max_rework < 0 or max_rework > 5:
         raise ValueError("--max-rework must be between 0 and 5")
@@ -3618,11 +3579,13 @@ def execute_ticket(
     repo_common = get_git_common_dir(repo_root)
     base_branch = detect_default_branch(repo_root)
 
+    publish_destination = ""
     if not no_push:
-        remote_kind, _, raw_remote_url = classify_origin_remote(repo_root)
+        remote_kind, remote_repo, raw_remote_url = classify_origin_remote(repo_root)
+        publish_destination = sha256_text(remote_repo.lower() if remote_repo else raw_remote_url)
         if remote_kind == "unknown_remote" and not allow_branch_only and os.environ.get("AGENT_DISPATCH_FORCE_GH") != "1":
             raise RuntimeError(
-                f"Unrecognized non-GitHub origin remote '{raw_remote_url}'; refusing silent branch-only delivery "
+                "Unrecognized non-GitHub origin remote; refusing silent branch-only delivery "
                 f"(configure a standard GitHub URL or pass --allow-branch-only)."
             )
 
@@ -3655,6 +3618,8 @@ def execute_ticket(
         if st_type in ("completed", "canceled"):
             raise RuntimeError(f"{iss_obj['identifier']} is already {iss_obj['state']['name']}; refusing to run.")
         if auto_claimed:
+            if reserved_touches is not None and reserved_touches != parse_touches(iss_obj.get("description") or ""):
+                return {"issue": iss_obj["identifier"], "status": "deferred", "reason": "touches_changed_before_claim"}
             ready_ok, ready_reason = is_ready_for_frontier(iss_obj)
             if not ready_ok:
                 return {"issue": iss_obj["identifier"], "status": "skipped_changed_before_claim", "reason": ready_reason}
@@ -3678,6 +3643,13 @@ def execute_ticket(
         return None
 
     with file_lock(t_lock, blocking=False):
+        latest_file = _cache_root() / "runs" / rkey / issue["identifier"] / ("latest-local.json" if no_push else "latest.json")
+        if not no_push and not force_rerun and latest_file.is_file():
+            latest = json.loads(latest_file.read_text(encoding="utf-8"))
+            authoritative = Path(latest["run_dir"]) / "state.json"
+            previous = json.loads(authoritative.read_text(encoding="utf-8")) if authoritative.is_file() else latest
+            if previous.get("stage") in ("claim_pending", *PUBLISH_STAGES):
+                raise RuntimeError(f"Checkpoint at {previous['stage']}; run agent-dispatch resume {issue['identifier']} first.")
         # 1. Initial eligibility check inside lock
         issue = client.get_issue(issue["id"])
         early_ret = _validate_claim_eligibility(issue)
@@ -3697,8 +3669,6 @@ def execute_ticket(
         run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
         run_dir = _cache_root() / "runs" / rkey / issue["identifier"] / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
-        # Keep --no-push local runs in latest-local.json so they NEVER clobber a pending publish_incomplete latest.json!
-        latest_file = _cache_root() / "runs" / rkey / issue["identifier"] / ("latest-local.json" if no_push else "latest.json")
 
         # 2. Prepare worktree (writes owner.json INSIDE repo lock!), remote FF, bootstrap, verify detect & base baseline ALL BEFORE claiming Linear!
         worktree, branch, base_sha = prepare_worktree(
@@ -3797,6 +3767,10 @@ def execute_ticket(
             "reviewer": reviewer.label,
             "no_push": no_push,
             "allow_branch_only": allow_branch_only,
+            "publish_destination": publish_destination,
+            "claimed_state_id": in_prog_state_id,
+            "claimed_ownership": {"description_sha": sha256_text(issue.get("description") or ""),
+                                  "assignee_id": (issue.get("assignee") or {}).get("id", "")},
             "pre_claim_state_id": pre_claim_state_id,
             "pre_claim_state_name": pre_claim_state_name,
             "gate_authorizations": gate_authorizations,
@@ -3808,6 +3782,7 @@ def execute_ticket(
 
         claim_attempted = False
         moved_in_progress = False
+        pre_git_cfg = {}
         claimed_state_id = in_prog_state_id
         publish_started = False
         terminal_ok = False
@@ -3817,6 +3792,7 @@ def execute_ticket(
                 # Persist claim_pending BEFORE sending mutation so lost ACK never strands an untracked In Progress ticket!
                 state["stage"] = "claim_pending"
                 save_checkpoint(run_dir, latest_file, state)
+                _check_shutdown()
                 claim_attempted = True
                 claimed_st = client.update_issue_state(issue, "In Progress")
                 claimed_state_id = str(claimed_st.get("id") or in_prog_state_id)
@@ -3824,10 +3800,11 @@ def execute_ticket(
             state["stage"] = "in_progress"
             state["claimed_state_id"] = claimed_state_id
             expected_ownership = client.get_issue_ownership_snapshot(issue["id"]) if not no_push else {}
-            state["claimed_ownership"] = {
-                "description_sha": expected_ownership.get("description_sha", ""),
-                "assignee_id": expected_ownership.get("assignee_id", ""),
-            }
+            if not no_push and (
+                expected_ownership["state_id"] != claimed_state_id or
+                any(expected_ownership[key] != value for key, value in state["claimed_ownership"].items())
+            ):
+                raise RuntimeError("Linear ownership changed while claiming the reviewed brief.")
             save_checkpoint(run_dir, latest_file, state)
 
             # Capture ticket-scoped remote baselines & local git config ONCE before attempts (NOT reset across retries/timeouts!)
@@ -3854,6 +3831,7 @@ def execute_ticket(
                     wt_brief_rel,
                     verify_cmd,
                     allow_gate_edits=allow_gate_edits,
+                    baseline_std_dir=baseline_std_dir,
                     authorized_gate_patterns=brief_gate_pats,
                     feedback=feedback,
                 )
@@ -3870,6 +3848,7 @@ def execute_ticket(
                         read_only=False,
                         session_label=f"{issue['identifier']}-worker-r{attempt}",
                         trace_sink=sessions,
+                        attach_files=[auth_brief_path, *(baseline_std_dir / rel for rel in baseline_std_hashes)],
                         timeout=worker_timeout,
                     )
                 except subprocess.TimeoutExpired:
@@ -4070,6 +4049,7 @@ def execute_ticket(
                     )
                     state.update(
                         {
+                            "pre_push_sha": pre_branch_sha,
                             "stage": "verified_and_reviewed",
                             "attempt": attempt,
                             "max_attempts": max_attempts,
@@ -4192,8 +4172,12 @@ def execute_ticket(
             }
         except BaseException as exc:
             failure_reason = f"Unhandled orchestrator error ({type(exc).__name__}): {exc}"
-            if not publish_started:
+            if not publish_started and state["stage"] != "claim_pending":
                 state["stage"] = "error"
+                if (worktree / ".git").exists() and pre_git_cfg and not _is_shutdown_requested():
+                    if (snapshot_local_git_config(worktree) == pre_git_cfg and
+                            run_cmd(git_cmd("branch", "--show-current"), cwd=worktree, env_role="orchestrator").stdout.strip() == branch):
+                        _stash_dirty_worktree_for_safe_rerun(worktree, f"{run_id}-error")
             state["error"] = redact_secrets(str(exc))
             state["sessions"] = sessions
             try:
@@ -4212,7 +4196,7 @@ def execute_ticket(
                     if not moved_in_progress and live_st_id == pre_claim_state_id:
                         pass
                     else:
-                        human_took_over = (live_st_type in ("completed", "canceled")) or (
+                        human_took_over = not _claim_metadata_matches(live_iss, state) or (live_st_type in ("completed", "canceled")) or (
                             bool(claimed_state_id) and live_st_id != claimed_state_id
                         )
 
@@ -4226,8 +4210,8 @@ def execute_ticket(
                             except BaseException:
                                 remote_touched = True
 
-                        if publish_started and (state.get("push_attempted") or remote_touched):
-                            if live_st_type not in ("completed", "canceled"):
+                        if publish_started:
+                            if live_st_type not in ("completed", "canceled") and _claim_metadata_matches(live_iss, state):
                                 client.ensure_label_and_add(live_iss, "dispatch:publish-incomplete")
                             client.add_comment(
                                 live_iss["id"],
@@ -4239,7 +4223,7 @@ def execute_ticket(
                                         f"- **PR**: {state.get('pr_url') or 'not confirmed yet'}",
                                         f"- **Resume**: `agent-dispatch resume {issue['identifier']}`",
                                         f"- **Run Logs**: `{run_dir}`",
-                                        f"- **Reason**:\n{redact_secrets(failure_reason[:2500])}",
+                                        f"- **Reason**:\n{redact_secrets(failure_reason)[:2500]}",
                                     ]
                                 ),
                             )
@@ -4251,7 +4235,7 @@ def execute_ticket(
                                         f"### [agent-dispatch] Halted (Preserved Current State `{live_st.get('name', 'unknown')}`)",
                                         f"- **Worktree**: `{worktree}` (`{branch}`)",
                                         f"- **Run Logs**: `{run_dir}`",
-                                        f"- **Reason**:\n{redact_secrets(failure_reason[:2500])}",
+                                        f"- **Reason**:\n{redact_secrets(failure_reason)[:2500]}",
                                     ]
                                 ),
                             )
@@ -4259,6 +4243,9 @@ def execute_ticket(
                             # CRITICAL ORDERING: add `dispatch:failed` label FIRST, THEN revert state!
                             # Guarantees ticket NEVER returns to Todo+agent-ready without dispatch:failed if interrupted!
                             client.ensure_label_and_add(live_iss, "dispatch:failed")
+                            live_iss = client.get_issue(issue["id"])
+                            if live_iss["state"]["id"] != claimed_state_id or not _claim_metadata_matches(live_iss, state):
+                                raise RuntimeError("Human Linear ownership changed during rollback.")
                             if pre_claim_state_id:
                                 client.update_issue_state_by_id(live_iss, pre_claim_state_id, label_hint=pre_claim_state_name)
                             else:
@@ -4271,7 +4258,7 @@ def execute_ticket(
                                 f"### [agent-dispatch] Halted -> Reverted to `{pre_claim_state_name}` (`dispatch:failed`)",
                                 f"- **Worktree (local, NOT pushed by this run)**: `{worktree}` (`{branch}`)",
                                 f"- **Run Logs**: `{run_dir}`",
-                                f"- **Reason**:\n{redact_secrets(failure_reason[:2500])}",
+                                f"- **Reason**:\n{redact_secrets(failure_reason)[:2500]}",
                             ]
                             if sess_lines:
                                 comment_parts += ["", "**Sessions:**", *sess_lines]
@@ -4317,7 +4304,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         force_rerun=args.force_rerun,
         fresh=args.fresh,
     )
-    print(json.dumps(res, indent=2, ensure_ascii=False))
+    print(safe_json(res, indent=2, ensure_ascii=False))
     return 0 if res.get("status") in ("passed", "passed_local", "passed_branch_only") else 1
 
 
@@ -4353,14 +4340,28 @@ def cmd_resume(args: argparse.Namespace) -> int:
             )
         if state.get("no_push"):
             raise RuntimeError(f"Latest run for {issue['identifier']} was `--no-push` local mode; rerun without `--no-push` to publish.")
-        valid_stages = ("verified_and_reviewed", "pushing", "pushed", "pr_ready", "linear_state_synced", "completed", "completed_branch_only")
-        has_verified_review = bool(state.get("candidate_sha")) and bool((state.get("review") or {}).get("passed"))
-        if state.get("stage") not in valid_stages and not has_verified_review:
-            raise RuntimeError(
-                f"Latest run for {issue['identifier']} is at stage '{state.get('stage')}' and has not passed verify+review; rerun with `run`."
-            )
-        if not state.get("candidate_sha"):
-            raise RuntimeError("Checkpoint missing candidate_sha.")
+        if state.get("stage") in ("claim_pending", "claim_released"):
+            live = client.get_issue(issue["id"])
+            if state["stage"] == "claim_pending":
+                if live["state"]["id"] != state["pre_claim_state_id"]:
+                    # Older claim_pending records lack an assignee/description snapshot.
+                    if not state.get("claimed_ownership") or live["state"]["id"] != state.get("claimed_state_id"):
+                        raise RuntimeError("Cannot verify ownership of interrupted claim; human state preserved.")
+                    _require_publish_ownership(live, state)
+                    client.ensure_label_and_add(live, "dispatch:failed")
+                    live = client.get_issue(issue["id"])
+                    _require_publish_ownership(live, state)
+                    client.update_issue_state_by_id(live, state["pre_claim_state_id"])
+                state["stage"] = "claim_released"
+                save_checkpoint(run_dir, latest_file, state)
+            print(safe_json({"issue": issue["identifier"], "status": "claim_released", "rerun": f"agent-dispatch run {issue['identifier']}"}))
+            return 0
+        if (state.get("stage") not in (*PUBLISH_STAGES, *COMPLETED_STAGES)
+                or (state.get("review") or {}).get("passed") is not True
+                or (state.get("verify") or {}).get("passed") is not True
+                or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", state.get("candidate_sha") or "")
+                or state.get("branch") != f"feat/{issue['identifier'].lower()}"):
+            raise RuntimeError(f"Checkpoint at {state.get('stage')!r} lacks verified publish evidence.")
         worktree = Path(state["worktree"])
         if not (worktree / ".git").exists():
             raise RuntimeError(f"Worktree missing at {worktree}; cannot reconcile.")
@@ -4370,9 +4371,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
         if (live_issue.get("state") or {}).get("type") in ("completed", "canceled"):
             raise RuntimeError(f"{live_issue['identifier']} is already {live_issue['state']['name']}; nothing to resume.")
 
-        if state.get("stage") in ("completed", "completed_branch_only"):
+        if state.get("stage") in COMPLETED_STAGES:
             ro_out = verify_completed_publish_readonly(client, live_issue, worktree, state)
-            print(json.dumps(ro_out, indent=2, ensure_ascii=False))
+            print(safe_json(ro_out, indent=2, ensure_ascii=False))
             return 0
 
         reconcile_publish(
@@ -4386,7 +4387,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         )
 
     print(
-        json.dumps(
+        safe_json(
             {
                 "issue": issue["identifier"],
                 "status": "passed" if state.get("stage") == "completed" else "passed_branch_only",
@@ -4488,6 +4489,28 @@ def select_non_overlapping_wave(
     return selected, deferred
 
 
+@contextlib.contextmanager
+def reserve_touches(repo_identity: str, touches: set[str]) -> Iterator[bool]:
+    """Hold shared ancestors and exclusive resources for the lifetime of a batch ticket."""
+    lock_root = _cache_root() / "locks" / f"touches-{repo_identity}"
+    lock_root.mkdir(parents=True, exist_ok=True)
+    modes = {"": fcntl.LOCK_SH if touches else fcntl.LOCK_EX}
+    for resource in touches:
+        parts = resource.split("/")
+        for depth in range(1, len(parts)):
+            modes.setdefault("/".join(parts[:depth]), fcntl.LOCK_SH)
+        modes[resource] = fcntl.LOCK_EX
+    with contextlib.ExitStack() as locks:
+        for resource, mode in sorted(modes.items()):
+            fh = locks.enter_context((lock_root / sha256_text(resource)).open("a"))
+            try:
+                fcntl.flock(fh.fileno(), mode | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+        yield True
+
+
 def run_batch_safely(
     client: LinearClient,
     repo_root: Path,
@@ -4511,36 +4534,52 @@ def run_batch_safely(
     )
     results: list[dict[str, Any]] = []
 
-    def _safe_exec(ident: str) -> dict[str, Any]:
+    repo_identity = canonical_repo_identity(repo_root)
+
+    def _safe_exec(iss: dict[str, Any]) -> dict[str, Any]:
+        ident = iss["identifier"]
+        touches = parse_touches(iss.get("description") or "")
         if _is_shutdown_requested():
             return {"issue": ident, "status": "cancelled_by_signal"}
         try:
-            return execute_ticket(
-                client,
-                repo_root,
-                repo_project,
-                ident,
-                worker,
-                reviewer,
-                verify_cmd_override=args.verify_cmd,
-                setup_cmd_override=args.setup_cmd,
-                max_rework=args.max_rework,
-                verify_timeout=args.verify_timeout,
-                setup_timeout=args.setup_timeout,
-                worker_timeout=args.worker_timeout,
-                review_timeout=args.review_timeout,
-                no_push=args.no_push,
-                allow_no_verify=args.allow_no_verify,
-                allow_gate_edits=args.allow_gate_edits,
-                allow_test_edits=args.allow_test_edits,
-                allow_dirty_docs=args.allow_dirty_docs,
-                allow_branch_only=args.allow_branch_only,
-                skip_baseline=args.skip_baseline,
-                skip_project_check=args.skip_project_check,
-                force_rerun=args.force_rerun,
-                fresh=args.fresh,
-                auto_claimed=True,
-            )
+            with reserve_touches(repo_identity, touches) as reserved:
+                if not reserved:
+                    return {"issue": ident, "status": "deferred", "reason": "overlapping_touches_in_another_batch"}
+                # The preceding wave can finish between selection and taking the local reservation.
+                project_id = (iss.get("project") or repo_project or {}).get("id")
+                if not project_id:
+                    raise RuntimeError("Batch ticket has no Linear project for Touches reconciliation.")
+                started = client.list_project_issues(project_id, state_type="started")
+                active, unscoped = extract_active_touches(started)
+                if unscoped or (active and not touches) or touches_overlap(touches, active):
+                    return {"issue": ident, "status": "deferred", "reason": "overlapping_active_touches"}
+                return execute_ticket(
+                    client,
+                    repo_root,
+                    repo_project,
+                    ident,
+                    worker,
+                    reviewer,
+                    verify_cmd_override=args.verify_cmd,
+                    setup_cmd_override=args.setup_cmd,
+                    max_rework=args.max_rework,
+                    verify_timeout=args.verify_timeout,
+                    setup_timeout=args.setup_timeout,
+                    worker_timeout=args.worker_timeout,
+                    review_timeout=args.review_timeout,
+                    no_push=args.no_push,
+                    allow_no_verify=args.allow_no_verify,
+                    allow_gate_edits=args.allow_gate_edits,
+                    allow_test_edits=args.allow_test_edits,
+                    allow_dirty_docs=args.allow_dirty_docs,
+                    allow_branch_only=args.allow_branch_only,
+                    skip_baseline=args.skip_baseline,
+                    skip_project_check=args.skip_project_check,
+                    force_rerun=args.force_rerun,
+                    fresh=args.fresh,
+                    auto_claimed=True,
+                    reserved_touches=touches,
+                )
         except (KeyboardInterrupt, SystemExit):
             return {"issue": ident, "status": "cancelled_by_signal"}
         except Exception as exc:
@@ -4548,9 +4587,13 @@ def run_batch_safely(
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.max_parallel))
     try:
-        futs = {pool.submit(_safe_exec, iss["identifier"]): iss["identifier"] for iss in wave}
+        futs = {pool.submit(_safe_exec, iss): iss["identifier"] for iss in wave}
         for fut in concurrent.futures.as_completed(futs):
-            results.append(fut.result())
+            result = fut.result()
+            if result["status"] == "deferred":
+                deferred.append({"id": result["issue"], "reason": result["reason"]})
+            else:
+                results.append(result)
     except (KeyboardInterrupt, SystemExit):
         global _SHUTDOWN_SIGNAL
         if _SHUTDOWN_SIGNAL == 0:
@@ -4572,7 +4615,7 @@ def cmd_frontier(args: argparse.Namespace) -> int:
     active_touches, active_unscoped = extract_active_touches(started)
     runnable, blocked, skipped = collect_runnable_tickets(client, issues)
     if not runnable:
-        print(json.dumps({"project": proj["name"], "status": "empty_frontier", "blocked": blocked, "skipped": skipped}, indent=2, ensure_ascii=False))
+        print(safe_json({"project": proj["name"], "status": "empty_frontier", "blocked": blocked, "skipped": skipped}, indent=2, ensure_ascii=False))
         return 0
     results, deferred = run_batch_safely(
         client,
@@ -4584,7 +4627,7 @@ def cmd_frontier(args: argparse.Namespace) -> int:
         active_has_unscoped=active_unscoped,
     )
     print(
-        json.dumps(
+        safe_json(
             {
                 "project": proj["name"],
                 "dispatched": len(results),
@@ -4610,12 +4653,15 @@ def cmd_spec(args: argparse.Namespace) -> int:
     children = (parent.get("children") or {}).get("nodes", [])
     if not children:
         raise RuntimeError(f"{parent['identifier']} has no child issues.")
-    started_children = [c for c in children if (c.get("state") or {}).get("type") == "started"]
-    active_touches, active_unscoped = extract_active_touches(started_children)
+    scheduling_project = repo_project or parent.get("project")
+    if not scheduling_project:
+        raise RuntimeError("Parent Spec has no Linear project for Touches reconciliation.")
+    started = client.list_project_issues(scheduling_project["id"], state_type="started")
+    active_touches, active_unscoped = extract_active_touches(started)
     runnable, blocked, skipped = collect_runnable_tickets(client, children)
     if not runnable:
         print(
-            json.dumps(
+            safe_json(
                 {"parent": parent["identifier"], "status": "no_unblocked_ready_children", "blocked": blocked, "skipped": skipped},
                 indent=2,
                 ensure_ascii=False,
@@ -4625,14 +4671,14 @@ def cmd_spec(args: argparse.Namespace) -> int:
     results, deferred = run_batch_safely(
         client,
         repo_root,
-        repo_project,
+        scheduling_project,
         runnable,
         args,
         active_claimed_touches=active_touches,
         active_has_unscoped=active_unscoped,
     )
     print(
-        json.dumps(
+        safe_json(
             {
                 "parent": parent["identifier"],
                 "wave_dispatched": len(results),
@@ -4697,7 +4743,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         block_added_secrets=True,
     )
     print(
-        json.dumps(
+        safe_json(
             {
                 "reviewer": reviewer.label,
                 "base_sha": base_sha,
@@ -4719,37 +4765,42 @@ def _read_worktree_lock_owner(repo_root: Path, rkey: str, wt: Path) -> tuple[str
     and latest.json. Never crashes on corrupt JSON.
     """
     expected_repo_id = canonical_repo_identity(repo_root)
-    owner_uuid = ""
-    owner_branch = ""
+    expected_branch = f"feat/{wt.name.lower()}"
     owner_f = wt / ".dispatch" / "owner.json"
-    if owner_f.is_file():
-        try:
-            owner_data = json.loads(owner_f.read_text(encoding="utf-8"))
-            if owner_data.get("repo_identity") and owner_data["repo_identity"] != expected_repo_id:
-                return "", "", {}, "owner_repo_identity_mismatch"
-            owner_uuid = str(owner_data.get("issue_uuid") or "")
-            owner_branch = str(owner_data.get("branch") or "")
-        except Exception:
-            return "", "", {}, "corrupt_owner_json"
+    if wt.is_symlink() or owner_f.parent.is_symlink() or owner_f.is_symlink():
+        return "", "", {}, "symlink_in_owner_path"
 
-    ckpt: dict[str, Any] = {}
-    ckpt_err = ""
-    latest_f = _cache_root() / "runs" / rkey / wt.name / "latest.json"
-    if latest_f.is_file():
+    records = []
+    checkpoint = {}
+    for path, kind in (
+        (owner_f, "owner"),
+        (_cache_root() / "runs" / rkey / wt.name / "latest.json", "checkpoint"),
+        (_cache_root() / "runs" / rkey / wt.name / "latest-local.json", "local_checkpoint"),
+    ):
+        if not path.exists():
+            continue
         try:
-            ckpt = json.loads(latest_f.read_text(encoding="utf-8"))
-        except Exception:
-            ckpt_err = "corrupt_latest_json"
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return "", "", {}, f"corrupt_{kind}_json"
+        if not isinstance(record, dict) or not record.get("issue_uuid"):
+            return "", "", {}, f"missing_{kind}_metadata"
+        if record.get("repo_identity") != expected_repo_id or record.get("issue") != wt.name:
+            return "", "", {}, f"{kind}_ownership_mismatch"
+        if record.get("branch") != expected_branch:
+            return "", "", {}, f"{kind} branch ownership mismatch"
+        if kind != "owner" and Path(record.get("worktree") or "").absolute() != wt.absolute():
+            return "", "", {}, f"{kind}_worktree_mismatch"
+        records.append(record)
+        if kind == "checkpoint" or (kind == "local_checkpoint" and not checkpoint):
+            checkpoint = record
 
-    ckpt_uuid = str(ckpt.get("issue_uuid") or "")
-    ckpt_branch = str(ckpt.get("branch") or "")
-    if owner_uuid and ckpt_uuid and owner_uuid != ckpt_uuid:
-        return "", "", ckpt, "owner_checkpoint_uuid_mismatch"
-    resolved_uuid = owner_uuid or ckpt_uuid
-    resolved_branch = owner_branch or ckpt_branch
-    if not resolved_uuid:
-        return "", "", ckpt, ckpt_err or "missing_lock_owner_metadata"
-    return resolved_uuid, resolved_branch, ckpt, ""
+    if not records:
+        return "", "", {}, "missing_lock_owner_metadata"
+    uuid = records[0]["issue_uuid"]
+    if any(r["issue_uuid"] != uuid for r in records):
+        return "", "", checkpoint, "owner_checkpoint_uuid_mismatch"
+    return uuid, expected_branch, checkpoint, ""
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -4804,7 +4855,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
 
     print(
-        json.dumps(
+        safe_json(
             {
                 "repo": str(repo_root),
                 "linear_project": proj["name"],
@@ -4845,8 +4896,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     try:
         gh_res = run_cmd(["gh", "auth", "status"], env_role="orchestrator")
-        gh_text = redact_secrets((gh_res.stdout + "\n" + gh_res.stderr).strip())
-        checks["gh_auth"] = {"ok": gh_res.returncode == 0, "detail": gh_text.splitlines()[:3] if gh_text else []}
+        checks["gh_auth"] = {"ok": gh_res.returncode == 0}
         if gh_res.returncode != 0:
             ok_all = False
     except FileNotFoundError:
@@ -4888,12 +4938,29 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         if not verify_cmd or dirty_docs:
             ok_all = False
     except Exception as exc:
-        if args.repo:
-            ok_all = False
+        ok_all = False
         checks["repo"] = {"ok": False, "error": str(exc)}
 
-    print(json.dumps({"ok": ok_all, "checks": checks}, indent=2, ensure_ascii=False))
+    print(safe_json({"ok": ok_all, "checks": checks}, indent=2, ensure_ascii=False))
     return 0 if ok_all else 1
+
+
+def cleanup_baseline(repo_root: Path, rkey: str, wt: Path, force: bool) -> None:
+    owner_file = _cache_root() / "baseline-owners" / rkey / wt.name
+    if not owner_file.is_file() or owner_file.is_symlink() or wt.is_symlink():
+        raise RuntimeError("missing baseline ownership")
+    owner = json.loads(owner_file.read_text(encoding="utf-8"))
+    if not isinstance(owner, dict) or not re.fullmatch(r"[0-9a-f]{64}", str(owner.get("key", ""))):
+        raise RuntimeError("invalid baseline ownership")
+    lock = _cache_root() / "locks" / f"baseline-{owner['key'][:16]}.lock"
+    with file_lock(lock, blocking=False):
+        head = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=wt, check=True, env_role="orchestrator").stdout.strip()
+        branch = run_cmd(git_cmd("branch", "--show-current"), cwd=wt, check=True, env_role="orchestrator").stdout.strip()
+        if branch or head != owner.get("base_sha") or wt != get_repo_root(str(wt)):
+            raise RuntimeError("baseline ownership changed")
+        run_cmd(git_cmd("worktree", "remove", *(["--force"] if force else []), str(wt)),
+                cwd=repo_root, check=True, env_role="orchestrator")
+        owner_file.unlink()
 
 
 def cmd_cleanup(args: argparse.Namespace) -> int:
@@ -4918,13 +4985,20 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
 
         if wt_root.is_dir():
             for wt in sorted(wt_root.iterdir()):
-                if not wt.is_dir() or wt.name.startswith(".baseline-"):
+                if not wt.is_dir():
                     continue
                 if not (wt / ".git").exists():
                     skipped.append(f"{wt.name} (not a git worktree)")
                     continue
                 if get_git_common_dir(wt) != repo_common:
                     skipped.append(f"{wt.name} (git-common-dir ownership mismatch; refusing delete)")
+                    continue
+                if wt.name.startswith(".baseline-"):
+                    try:
+                        cleanup_baseline(repo_root, rkey, wt, args.all)
+                        removed.append(wt.name)
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        skipped.append(f"{wt.name} ({redact_secrets(str(exc))})")
                     continue
                 issue_uuid, owner_branch, _, owner_err = _read_worktree_lock_owner(repo_root, rkey, wt)
                 if not issue_uuid or not owner_branch:
@@ -4940,7 +5014,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                                 f"{wt.name} (branch ownership mismatch: checked out '{br}', owner '{owner_branch}'; refusing unsafe delete)"
                             )
                             continue
-                        dirty = run_cmd(git_cmd("status", "--porcelain"), cwd=wt, env_role="orchestrator").stdout.strip()
+                        dirty = run_cmd(git_cmd("status", "--porcelain", "-z"), cwd=wt, check=True, env_role="orchestrator").stdout
                         if dirty and not args.all:
                             skipped.append(f"{wt.name} (uncommitted changes)")
                             continue
@@ -4980,11 +5054,11 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                             removed.append(f"{wt.name} ({br}@{head_sha[:8]})")
                         else:
                             skipped.append(f"{wt.name} ({br}@{head_sha[:8]}, unmerged or newer local commits)")
-                except RuntimeError:
-                    skipped.append(f"{wt.name} (active lock)")
+                except RuntimeError as exc:
+                    skipped.append(f"{wt.name} ({redact_secrets(str(exc))})")
         run_cmd(git_cmd("worktree", "prune"), cwd=repo_root, env_role="orchestrator")
 
-    print(json.dumps({"removed": removed, "skipped": skipped}, indent=2, ensure_ascii=False))
+    print(safe_json({"removed": removed, "skipped": skipped}, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -5033,7 +5107,7 @@ def add_exec_flags(p: argparse.ArgumentParser) -> None:
 def main() -> int:
     if os.environ.get("AGENT_DISPATCH_CHILD") == "1":
         print(
-            json.dumps({"status": "error", "error": "Nested agent-dispatch invocation blocked (AGENT_DISPATCH_CHILD=1)."}),
+            safe_json({"status": "error", "error": "Nested agent-dispatch invocation blocked (AGENT_DISPATCH_CHILD=1)."}),
             file=sys.stderr,
         )
         return 2
@@ -5096,9 +5170,11 @@ def main() -> int:
 
     args = parser.parse_args()
     try:
-        return args.func(args)
+        status = args.func(args)
+        _check_shutdown()
+        return status
     except Exception as exc:
-        print(json.dumps({"status": "error", "error": redact_secrets(str(exc))}, indent=2, ensure_ascii=False), file=sys.stderr)
+        print(safe_json({"status": "error", "error": redact_secrets(str(exc))}, indent=2, ensure_ascii=False), file=sys.stderr)
         return 2
 
 
