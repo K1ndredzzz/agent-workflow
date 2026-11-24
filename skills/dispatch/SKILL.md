@@ -43,6 +43,7 @@ Run from the target repository root (or pass `--repo /path/to/repo`):
 ## Designer Handling Rules
 - Full runs can take 10–60+ minutes depending on repo size and rework rounds; run via `run_command` with `NotificationTimeoutSeconds: 600` (if still running at 600s, inspect `<run_dir>` logs or `manage_task(status)`—do not poll in a loop).
 - Present a crisp summary table on completion: **Ticket | Status | Commit / Draft PR | Worker / Reviewer | Verify | Standards | Spec | Side Issues**.
+- Always include a **Session Traces** block listing every headless session recorded in `sessions`: render `agy` sessions as clickable `[<role>](conversation://<conversation_id>)` links, show `codex resume <id>` / `opencode -s <id>` / `pi --resume` commands for CLI harnesses, and link `<run_dir>` logs via `file://`.
 - **Failure routing**:
   - `worker_blocked` -> clarify the blocker with the user, update the Linear issue, rerun `/dispatch <ID>`.
   - `failed_max_rework` -> inspect `<run_dir>` logs; run **`/diagnose`** if it is a subtle technical bug or **`/slice`** if the ticket was too large.

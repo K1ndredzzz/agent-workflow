@@ -1422,6 +1422,8 @@ def invoke_harness(
     out_file: Path,
     read_only: bool,
     expected_axis: str | None = None,
+    session_label: str = "",
+    trace_sink: list[dict[str, Any]] | None = None,
     timeout: int = 1800,
 ) -> dict[str, Any]:
     schema_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1430,8 +1432,12 @@ def invoke_harness(
     if out_file.exists():
         out_file.unlink()
 
+    def _record_trace(entry: dict[str, Any]) -> None:
+        if trace_sink is not None:
+            trace_sink.append(entry)
+
     if spec.harness == "codex":
-        sandbox = "read-only" if read_only else "workspace-write"
+        sandbox = "read-only" if read_only else "danger-full-access"
         cmd = [
             "codex",
             "exec",
@@ -1441,18 +1447,35 @@ def invoke_harness(
             spec.model,
             "-c",
             f'model_reasoning_effort="{spec.effort}"',
+            "-c",
+            'approval_policy="never"',
             "--sandbox",
             sandbox,
+            "--trust",
             "--output-schema",
             str(schema_file),
             "-o",
             str(out_file),
+            "-",
         ]
-        if not read_only:
-            cmd.append("--approve-for-me")
-        cmd.append("-")
         res = run_cmd(cmd, cwd=worktree, stdin_text=prompt_text, timeout=timeout, include_secrets=False)
-        (run_dir / f"{out_file.stem}.stderr.log").write_text(redact_secrets(res.stderr), encoding="utf-8")
+        stderr_log = run_dir / f"{out_file.stem}.stderr.log"
+        stdout_log = run_dir / f"{out_file.stem}.stdout.log"
+        stderr_log.write_text(redact_secrets(res.stderr), encoding="utf-8")
+        stdout_log.write_text(redact_secrets(res.stdout), encoding="utf-8")
+        sid_match = re.search(r"session id:\s*([0-9a-fA-F-]+)", res.stderr + "\n" + res.stdout)
+        sid = sid_match.group(1) if sid_match else ""
+        _record_trace(
+            {
+                "role": session_label or out_file.stem,
+                "harness": "codex",
+                "model": spec.label,
+                "session_id": sid,
+                "resume_cmd": f"codex resume {sid}" if sid else "codex agents",
+                "log_file": str(stderr_log),
+                "output_file": str(out_file),
+            }
+        )
         if res.returncode != 0:
             raise RuntimeError(f"codex exec exited {res.returncode}: {redact_secrets(res.stderr[-2000:])}")
         if not out_file.is_file():
@@ -1473,6 +1496,7 @@ def invoke_harness(
             spec.model,
             "--mode",
             "auto",
+            "--dangerously-skip-permissions",
             "--add-dir",
             str(run_dir),
             "--disable-slash-commands",
@@ -1483,10 +1507,27 @@ def invoke_harness(
             f"--print={short_prompt}",
         ]
         res = run_cmd(cmd, cwd=worktree, timeout=timeout, include_secrets=False)
-        (run_dir / f"{out_file.stem}.stderr.log").write_text(redact_secrets(res.stderr), encoding="utf-8")
+        stderr_log = run_dir / f"{out_file.stem}.stderr.log"
+        stdout_log = run_dir / f"{out_file.stem}.stdout.log"
+        stderr_log.write_text(redact_secrets(res.stderr), encoding="utf-8")
+        stdout_log.write_text(redact_secrets(res.stdout), encoding="utf-8")
         if res.returncode != 0:
             raise RuntimeError(f"agy exited {res.returncode}: {redact_secrets(res.stderr[-2000:])}\n{redact_secrets(res.stdout[-1000:])}")
         wrapper = extract_json_object(res.stdout)
+        cid = str(wrapper.get("conversation_id", ""))
+        _record_trace(
+            {
+                "role": session_label or out_file.stem,
+                "harness": "agy",
+                "model": spec.label,
+                "conversation_id": cid,
+                "conversation_link": f"conversation://{cid}" if cid else "",
+                "resume_cmd": f"agy --conversation {cid}" if cid else "",
+                "duration_seconds": wrapper.get("duration_seconds"),
+                "usage": wrapper.get("usage"),
+                "output_file": str(out_file),
+            }
+        )
         if wrapper.get("status") not in (None, "SUCCESS"):
             raise RuntimeError(f"agy returned non-SUCCESS status: {wrapper.get('status')}")
         result = wrapper.get("structured_output")
@@ -1512,12 +1553,30 @@ def invoke_harness(
             str(worktree),
             "--format",
             "json",
+            "--title",
+            session_label or out_file.stem,
         ]
         if not read_only:
             cmd.append("--auto")
         cmd.append(short_prompt)
         res = run_cmd(cmd, cwd=worktree, timeout=timeout, include_secrets=False)
-        (run_dir / f"{out_file.stem}.stderr.log").write_text(redact_secrets(res.stderr), encoding="utf-8")
+        stderr_log = run_dir / f"{out_file.stem}.stderr.log"
+        stdout_log = run_dir / f"{out_file.stem}.stdout.log"
+        stderr_log.write_text(redact_secrets(res.stderr), encoding="utf-8")
+        stdout_log.write_text(redact_secrets(res.stdout), encoding="utf-8")
+        sid_match = re.search(r'"sessionID"\s*:\s*"([^"]+)"', res.stdout)
+        sid = sid_match.group(1) if sid_match else ""
+        _record_trace(
+            {
+                "role": session_label or out_file.stem,
+                "harness": "opencode",
+                "model": spec.label,
+                "session_id": sid,
+                "resume_cmd": f"opencode -s {sid}" if sid else "opencode session list",
+                "log_file": str(stdout_log),
+                "output_file": str(out_file),
+            }
+        )
         if res.returncode != 0:
             raise RuntimeError(f"opencode run exited {res.returncode}: {redact_secrets(res.stderr[-2000:])}")
         text = parse_opencode_ndjson(res.stdout)
@@ -1536,7 +1595,8 @@ def invoke_harness(
             "-p",
             "--mode",
             "json",
-            "--no-session",
+            "--name",
+            session_label or out_file.stem,
             "--model",
             f"{spec.model}:{spec.effort}",
         ]
@@ -1544,7 +1604,20 @@ def invoke_harness(
             cmd += ["--tools", "read,bash"]
         cmd.append(short_prompt)
         res = run_cmd(cmd, cwd=worktree, timeout=timeout, include_secrets=False)
-        (run_dir / f"{out_file.stem}.stderr.log").write_text(redact_secrets(res.stderr), encoding="utf-8")
+        stderr_log = run_dir / f"{out_file.stem}.stderr.log"
+        stdout_log = run_dir / f"{out_file.stem}.stdout.log"
+        stderr_log.write_text(redact_secrets(res.stderr), encoding="utf-8")
+        stdout_log.write_text(redact_secrets(res.stdout), encoding="utf-8")
+        _record_trace(
+            {
+                "role": session_label or out_file.stem,
+                "harness": "pi",
+                "model": spec.label,
+                "resume_cmd": "pi --resume",
+                "log_file": str(stdout_log),
+                "output_file": str(out_file),
+            }
+        )
         if res.returncode != 0:
             raise RuntimeError(f"pi exited {res.returncode}: {redact_secrets(res.stderr[-2000:])}")
         text = parse_pi_ndjson(res.stdout)
@@ -1601,6 +1674,7 @@ def run_two_axis_review(
     baseline_std_files: list[str],
     round_num: int,
     prior_findings: dict[str, list[str]] | None = None,
+    trace_sink: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     std_rubric = REVIEW_STANDARDS_REF_PATH.read_text(encoding="utf-8") if REVIEW_STANDARDS_REF_PATH.is_file() else ""
     spec_rubric = REVIEW_SPEC_REF_PATH.read_text(encoding="utf-8") if REVIEW_SPEC_REF_PATH.is_file() else ""
@@ -1654,6 +1728,8 @@ def run_two_axis_review(
             out_file=run_dir / f"review-{axis}-r{round_num}.json",
             read_only=True,
             expected_axis=axis,
+            session_label=f"review-{axis}-r{round_num}",
+            trace_sink=trace_sink,
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -2034,6 +2110,7 @@ def execute_ticket(
             feedback: str | None = fetch_open_pr_feedback(worktree, gh_repo, branch) if gh_repo else None
             prior_review_findings: dict[str, list[str]] | None = None
             all_discovered: list[str] = []
+            sessions: list[dict[str, Any]] = []
             max_attempts = 1 + max_rework
             last_verify_res: dict[str, Any] = {}
             last_review_res: dict[str, Any] = {}
@@ -2051,6 +2128,8 @@ def execute_ticket(
                     prompt_file=run_dir / f"prompt-worker-r{attempt}.md",
                     out_file=run_dir / f"worker-r{attempt}.json",
                     read_only=False,
+                    session_label=f"{issue['identifier']}-worker-r{attempt}",
+                    trace_sink=sessions,
                 )
 
                 for item in w_res.get("discovered_issues") or []:
@@ -2070,6 +2149,7 @@ def execute_ticket(
                         "blockers": w_res["blockers"],
                         "summary": w_res["summary"],
                         "discovered_issues": all_discovered,
+                        "sessions": sessions,
                     }
 
                 candidate_sha = orchestrator_commit(worktree, issue["identifier"], issue["title"], attempt)
@@ -2123,6 +2203,7 @@ def execute_ticket(
                     baseline_std_files,
                     attempt,
                     prior_findings=prior_review_findings,
+                    trace_sink=sessions,
                 )
 
                 if last_review_res["passed"]:
@@ -2148,6 +2229,7 @@ def execute_ticket(
                             "verify": {"command": last_verify_res.get("command"), "ran": last_verify_res.get("ran"), "passed": True},
                             "review": last_review_res,
                             "discovered_issues": all_discovered,
+                            "sessions": sessions,
                             "pr_body": pr_body,
                             "pushed": False,
                             "pr_url": "",
@@ -2172,6 +2254,7 @@ def execute_ticket(
                             "verify": state["verify"],
                             "review": last_review_res,
                             "discovered_issues": all_discovered,
+                            "sessions": sessions,
                         }
 
                     try:
@@ -2187,6 +2270,7 @@ def execute_ticket(
                             "branch": branch,
                             "run_dir": str(run_dir),
                             "resume_cmd": f"agent-dispatch resume {issue['identifier']}",
+                            "sessions": sessions,
                         }
 
                     terminal_ok = True
@@ -2204,6 +2288,7 @@ def execute_ticket(
                         "verify": state["verify"],
                         "review": last_review_res,
                         "discovered_issues": all_discovered,
+                        "sessions": sessions,
                     }
 
                 # Prepare convergent rework feedback
@@ -2236,6 +2321,7 @@ def execute_ticket(
                 "last_verify": last_verify_res,
                 "last_review": last_review_res,
                 "discovered_issues": all_discovered,
+                "sessions": sessions,
             }
         except Exception as exc:
             failure_reason = f"Unhandled orchestrator error: {exc}"
@@ -2512,10 +2598,11 @@ def cmd_review(args: argparse.Namespace) -> int:
 
     std_dir = run_dir / "baseline-standards"
     std_files = snapshot_baseline_standards(repo_root, base_sha, std_dir)
-    res = run_two_axis_review(reviewer, repo_root, run_dir, base_sha, candidate_sha, auth_brief, std_dir, std_files, round_num=1)
+    sessions: list[dict[str, Any]] = []
+    res = run_two_axis_review(reviewer, repo_root, run_dir, base_sha, candidate_sha, auth_brief, std_dir, std_files, round_num=1, trace_sink=sessions)
     print(
         json.dumps(
-            {"reviewer": reviewer.label, "base_sha": base_sha, "candidate_sha": candidate_sha, "run_dir": str(run_dir), **res},
+            {"reviewer": reviewer.label, "base_sha": base_sha, "candidate_sha": candidate_sha, "run_dir": str(run_dir), "sessions": sessions, **res},
             indent=2,
             ensure_ascii=False,
         )
