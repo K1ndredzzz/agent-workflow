@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Iterator
 
 PACKAGE = "agent_dispatch"
-PACKAGE_DIR = Path(__file__).resolve().parent.parent / PACKAGE
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PACKAGE_DIR = REPO_ROOT / PACKAGE
 
 L0_TO_L2 = {"config", "secrets", "process"}
 L3 = {"brief", "linear", "git_ops", "harness"}
@@ -46,6 +47,38 @@ def imported_modules(node: ast.Import | ast.ImportFrom, package: str) -> Iterato
 
 
 class TestArchitecture(unittest.TestCase):
+    def test_cli_launcher_only_bootstraps_the_package_and_runs_main(self) -> None:
+        launcher = REPO_ROOT / "bin" / "agent-dispatch"
+        source = launcher.read_text(encoding="utf-8")
+        lines = source.splitlines()
+        self.assertLessEqual(len(lines), 40, "CS-3 launcher exceeds 40 lines")
+        self.assertEqual(lines[:1], ["#!/usr/bin/env python3"])
+
+        # Compare executable structure so comments and formatting remain flexible.
+        tree = ast.parse(source, filename=str(launcher))
+        if ast.get_docstring(tree) is not None:
+            del tree.body[0]
+        expected = ast.parse('''\
+import sys
+from pathlib import Path
+
+if __name__ == "__main__":
+    workflow_root = str(Path(__file__).resolve().parent.parent)
+    if workflow_root not in sys.path:
+        sys.path.insert(0, workflow_root)
+    from agent_dispatch.cli import main
+    raise SystemExit(main())
+''')
+        self.assertTrue(
+            ast.dump(tree) == ast.dump(expected),
+            "bin/agent-dispatch must only add the resolved repository root to sys.path "
+            "and exit with agent_dispatch.cli.main() under the main guard",
+        )
+
+    def test_legacy_test_monolith_is_absent(self) -> None:
+        legacy = REPO_ROOT / "tests" / "test_agent_dispatch.py"
+        self.assertFalse(legacy.exists() or legacy.is_symlink(), "The legacy test monolith must stay retired")
+
     def test_package_module_limits_and_dependencies(self) -> None:
         marker = PACKAGE_DIR / "__init__.py"
         self.assertTrue(marker.is_file(), f"Missing package marker {marker.name}")

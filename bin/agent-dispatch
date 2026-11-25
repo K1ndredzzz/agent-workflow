@@ -1,38 +1,14 @@
 #!/usr/bin/env python3
-"""
-agent-dispatch v5: Production-grade cross-harness headless orchestrator.
-
-Pipeline:
-  Preflight (Project + Dirty Docs + Remote FF + Verify Detect + Bootstrap + Real Base Baseline) ->
-  Canonical Repo & Ticket Flock Locks (worktree owner.json inside repo lock) ->
-  Fresh Post-Preflight Claim (skipped in --no-push) ->
-  Worker (Codex/OpenCode/Pi/Antigravity, streaming logs + instant sessions.jsonl) ->
-  Branch/History Check + Secret-Checked Orchestrator Commit (hooks/fsmonitor disabled) ->
-  Full-Range Untruncated Secret Scan (diffs + commit msgs + merges) ->
-  Granular Protected-Paths + Deterministic Test-Integrity (-z NUL-safe) + Mandatory Verify ->
-  Cross-Vendor Read-Only Two-Axis Review (pre-generated diff.patch + SHA-256 verified artifacts) ->
-  Post-Review Worktree, Artifact & Ownership Verification -> Bounded Rework (1 + max_rework) ->
-  True Remote-Reconciled Option B Delivery (Pre-Push PR Guard + FF Push + Verified Open Draft PR
-  + Human-State-Safe Linear In Review + Atomic Label Cleanup + Idempotent Delivery Comment)
-  with Atomic Checkpoints (`resume`).
-"""
+"""Run agent-dispatch from the repository or an installed symlink."""
 
 import sys
 from pathlib import Path
 
-# Resolve through the installed symlink so the repository package is importable.
-_WORKFLOW_ROOT = str(Path(__file__).resolve().parent.parent)
-if _WORKFLOW_ROOT not in sys.path:
-    sys.path.insert(0, _WORKFLOW_ROOT)
-
-# Temporary exports for the legacy E2E and live test fixtures.
-from agent_dispatch.cli import main
-from agent_dispatch.gates import check_base_baseline
-from agent_dispatch.git_ops import prepare_worktree, repo_cache_key
-from agent_dispatch.linear import LinearClient, resolve_linear_auth, resolve_project
-from agent_dispatch.process import sha256_text
-from agent_dispatch.publish import save_checkpoint
-
-
 if __name__ == "__main__":
+    workflow_root = str(Path(__file__).resolve().parent.parent)
+    if workflow_root not in sys.path:
+        sys.path.insert(0, workflow_root)
+
+    from agent_dispatch.cli import main
+
     raise SystemExit(main())
