@@ -54,26 +54,84 @@ class TestArchitecture(unittest.TestCase):
         self.assertLessEqual(len(lines), 40, "CS-3 launcher exceeds 40 lines")
         self.assertEqual(lines[:1], ["#!/usr/bin/env python3"])
 
-        # Compare executable structure so comments and formatting remain flexible.
         tree = ast.parse(source, filename=str(launcher))
-        if ast.get_docstring(tree) is not None:
-            del tree.body[0]
-        expected = ast.parse('''\
-import sys
-from pathlib import Path
+        body = list(tree.body)
+        if body and ast.get_docstring(tree) is not None:
+            body.pop(0)
 
-if __name__ == "__main__":
-    workflow_root = str(Path(__file__).resolve().parent.parent)
-    if workflow_root not in sys.path:
-        sys.path.insert(0, workflow_root)
-    from agent_dispatch.cli import main
-    raise SystemExit(main())
-''')
-        self.assertTrue(
-            ast.dump(tree) == ast.dump(expected),
-            "bin/agent-dispatch must only add the resolved repository root to sys.path "
-            "and exit with agent_dispatch.cli.main() under the main guard",
-        )
+        top_imports: list[ast.stmt] = []
+        main_guards: list[ast.If] = []
+        for stmt in body:
+            if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                top_imports.append(stmt)
+            elif (
+                isinstance(stmt, ast.If)
+                and not stmt.orelse
+                and isinstance(stmt.test, ast.Compare)
+                and isinstance(stmt.test.left, ast.Name)
+                and stmt.test.left.id == "__name__"
+                and len(stmt.test.ops) == 1
+                and isinstance(stmt.test.ops[0], ast.Eq)
+                and len(stmt.test.comparators) == 1
+                and isinstance(stmt.test.comparators[0], ast.Constant)
+                and stmt.test.comparators[0].value == "__main__"
+            ):
+                main_guards.append(stmt)
+            else:
+                self.fail(
+                    f"bin/agent-dispatch:{stmt.lineno}: CS-2/CS-3 launcher may contain only stdlib imports "
+                    "and an `if __name__ == '__main__':` guard (no top-level logic or re-exports)"
+                )
+
+        self.assertEqual(len(main_guards), 1, "bin/agent-dispatch must define exactly one __main__ guard")
+        for stmt in top_imports:
+            for imported in imported_modules(stmt, ""):
+                root = imported.partition(".")[0]
+                self.assertIn(root, sys.stdlib_module_names, f"bin/agent-dispatch: CS-1 non-stdlib top import {imported}")
+
+        problems: list[str] = []
+        delegates_to_cli_main = False
+        calls_main = False
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                problems.append(f"bin/agent-dispatch:{node.lineno}: CS-3 launcher must not define {node.name}")
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for imported in imported_modules(node, ""):
+                    root = imported.partition(".")[0]
+                    if root == PACKAGE:
+                        if (
+                            isinstance(node, ast.ImportFrom)
+                            and node.module == f"{PACKAGE}.cli"
+                            and [a.name for a in node.names] == ["main"]
+                        ):
+                            delegates_to_cli_main = True
+                        else:
+                            problems.append(f"bin/agent-dispatch:{node.lineno}: CS-2 launcher may only import agent_dispatch.cli.main")
+                    elif root not in sys.stdlib_module_names:
+                        problems.append(f"bin/agent-dispatch:{node.lineno}: CS-1 third-party import {imported}")
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "main":
+                calls_main = True
+
+        if not (delegates_to_cli_main and calls_main):
+            problems.append("bin/agent-dispatch must import and invoke agent_dispatch.cli.main() inside __main__")
+        self.assertFalse(problems, "\n" + "\n".join(problems))
+
+    def test_tests_use_package_qualified_helpers_import(self) -> None:
+        tests_dir = REPO_ROOT / "tests"
+        problems: list[str] = []
+        for path in sorted(tests_dir.rglob("*.py")):
+            relative = path.relative_to(REPO_ROOT)
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(relative))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name == "helpers" or alias.name.startswith("helpers."):
+                            problems.append(f"{relative}:{node.lineno}: CS-7 import tests.helpers instead of bare '{alias.name}'")
+                elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                    mod = node.module or ""
+                    if mod == "helpers" or mod.startswith("helpers."):
+                        problems.append(f"{relative}:{node.lineno}: CS-7 use 'from tests.helpers import ...' instead of bare '{mod}'")
+        self.assertFalse(problems, "\n" + "\n".join(problems))
 
     def test_legacy_test_monolith_is_absent(self) -> None:
         legacy = REPO_ROOT / "tests" / "test_agent_dispatch.py"
