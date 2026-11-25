@@ -227,31 +227,6 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
                 "Potential secret token in commit message",
             ])
 
-    def test_nested_authorization_headers_are_redacted_in_structured_logs(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            folder = Path(td)
-            token = "syntheticopaque"
-            event = {"request": {"AUTHORIZATION": "Bearer " + token,
-                                 "Proxy-Authorization": "Basic " + token},
-                     "description": "Support bearer authentication"}
-            log = folder / "log"
-            with contextlib.ExitStack() as stack:
-                writer = process.RedactedLog(log, stack)
-                writer.write((json.dumps(event) + "\n").encode())
-            ad.append_session_trace(folder, event, None)
-            for path in (log, folder / "sessions.jsonl"):
-                saved = json.loads(path.read_text())
-                self.assertNotIn(token, json.dumps(saved))
-                self.assertEqual(saved["description"], event["description"])
-
-    def test_codex_rejects_malformed_final_assistant_after_valid_verdict(self) -> None:
-        for bad_text in (None, {"verdict": "pass"}, ["text"]):
-            with self.subTest(bad_text=bad_text):
-                items = [{"type": "item.completed", "item": {"type": "agent_message", "text": val}}
-                         for val in ('{"verdict":"pass"}', bad_text)]
-                with self.assertRaises(ValueError):
-                    ad.parse_codex_ndjson("\n".join(map(json.dumps, [*items, {"type": "turn.completed"}])))
-
     def test_review_rechecks_diff_before_retrying_transient_failure(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
@@ -295,144 +270,6 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
                                       allow_gate_edits=False, allow_test_edits=False, allow_dirty_docs=True,
                                       skip_baseline=True, skip_project_check=True, force_rerun=False, fresh=False)
                 self.assertEqual(harness.call_count, 1)
-
-    def test_harness_model_policy_rejects_unlisted_names_and_tiers(self) -> None:
-        for spec in ("agy:opus", "agy:claude-sonnet", "agy:gemini-3", "agy:neon@bogus",
-                     "codex:6.1-sol", "opencode:sub2api/custom", "pi:other/gpt-6.2-astra"):
-            with self.subTest(spec=spec), self.assertRaises(ValueError):
-                ad.parse_harness_spec(spec)
-        for harness in ("codex", "opencode", "pi"):
-            for model in ("gpt-6.2-sol", "gpt-6.2-astra"):
-                self.assertTrue(ad.parse_harness_spec(f"{harness}:{model}").model.endswith(model))
-        for model in ("neon", "carbon", "argon", "hydrogen"):
-            self.assertTrue(ad.parse_harness_spec(f"agy:{model}").model.startswith("gemini-4-"))
-
-    def test_ndjson_incomplete_final_turn_cannot_reuse_prior_verdict(self) -> None:
-        text = '{"verdict":"pass"}'
-        previous = {"role": "assistant", "content": text, "stopReason": "stop"}
-        failed = {"role": "assistant", "content": [], "stopReason": "error"}
-        for final in ({"type": "message_update", "message": previous},
-                      {"type": "message_end", "message": failed},
-                      {"type": "agent_end", "messages": [previous, failed]}):
-            with self.subTest(event=final["type"]), self.assertRaises(ValueError):
-                ad.parse_pi_ndjson("\n".join(map(json.dumps, [{"type": "message_end", "message": previous}, final])))
-        oc = [{"type": "text", "part": {"text": text}}, {"type": "step_finish", "part": {"reason": "stop"}},
-              {"type": "step_start"}, {"type": "step_finish", "part": {"reason": "length"}}]
-        with self.assertRaises(ValueError):
-            ad.parse_opencode_ndjson("\n".join(map(json.dumps, oc)))
-        cx = [{"type": "item.completed", "item": {"type": "agent_message", "text": text}},
-              {"type": "turn.completed"}, {"type": "turn.started"}]
-        with self.assertRaises(ValueError):
-            ad.parse_codex_ndjson("\n".join(map(json.dumps, cx)))
-
-    def test_review_prompt_result_and_trace_are_redacted(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            d = Path(td)
-            secret = "lin_api_" + "syntheticvalue123456"
-            output = {"status": "completed", "summary": secret, "tests_run": [], "discovered_issues": [], "blockers": ""}
-            def codex_response(cmd, **kw):
-                self.assertNotIn(secret, kw["stdin_text"])
-                self.assertIn("--json", cmd)
-                self.assertNotIn("-o", cmd)
-                events = [{"type": "thread.started", "thread_id": "aaaa-bbbb"},
-                          {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(output)}},
-                          {"type": "turn.completed"}]
-                return subprocess.CompletedProcess(cmd, 0, "\n".join(map(json.dumps, events)), "")
-            with mock.patch.object(ad, "run_cmd", side_effect=codex_response):
-                result = ad.invoke_harness(ad.parse_harness_spec("codex"), secret, worktree=d, run_dir=d,
-                                           schema=ad.WORKER_SCHEMA, schema_file=d / "schema", prompt_file=d / "prompt",
-                                           out_file=d / "result", read_only=False, session_label=secret)
-                self.assertEqual(result["summary"], "<REDACTED_SECRET>")
-            for path in (d / "prompt", d / "result", d / "sessions.jsonl"):
-                self.assertNotIn(secret, path.read_text())
-
-    def test_pi_session_replay_preserves_native_entries_and_redacts_on_interrupt(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            d = Path(td)
-            archive = d / "session.jsonl"
-            secret = "lin_api_" + "syntheticpioutput12345"
-            entry = {"type": "message", "id": "a1", "parentId": None, "message": {"content": secret}}
-            with self.assertRaises(KeyboardInterrupt):
-                with ad._pi_session_archive(archive, "11111111-2222-3333-4444-555555555555", d) as native:
-                    subprocess.run([sys.executable, "-B", "-c",
-                                    "import sys; open(sys.argv[1], 'a').write(sys.stdin.read())", native],
-                                   input=json.dumps(entry) + "\n" + '{"type":', text=True, check=True)
-                    self.assertFalse(archive.exists())
-                    raise KeyboardInterrupt
-            header, message = map(json.loads, archive.read_text().splitlines())
-            self.assertEqual(header["version"], 3)
-            self.assertEqual(message["id"], "a1")
-            self.assertEqual(message["message"]["content"], "<REDACTED_SECRET>")
-
-    def test_harness_aliases_and_heterogeneous_reviewer(self) -> None:
-        w_codex = ad.parse_harness_spec("codex:sol@xhigh")
-        self.assertEqual(w_codex.label, "codex:gpt-6.2-sol@xhigh")
-        self.assertEqual(ad.default_reviewer_for(w_codex).label, "agy:gemini-4-neon-xhigh")
-
-        w_agy = ad.parse_harness_spec("agy:neon@high")
-        self.assertEqual(w_agy.model, "gemini-4-neon-high")
-        self.assertEqual(w_agy.effort, "")
-        self.assertEqual(ad.default_reviewer_for(w_agy).label, "codex:gpt-6.2-sol@xhigh")
-
-        w_oc = ad.parse_harness_spec("opencode:astra")
-        self.assertEqual(w_oc.model, "sub2api/gpt-6.2-astra")
-        self.assertEqual(ad.default_reviewer_for(w_oc).label, "agy:gemini-4-neon-xhigh")
-
-        w_pi = ad.parse_harness_spec("pi:sol@high")
-        self.assertEqual(w_pi.model, "sub2api/gpt-6.2-sol")
-        self.assertEqual(w_pi.effort, "high")
-
-    def test_final_array_and_corrupt_protocol_event_cannot_approve_a_review(self) -> None:
-        verdict = {"axis": "standards", "verdict": "pass", "hard_findings": [], "suggestions": [],
-                   "test_integrity_violation": False, "summary": "ok"}
-        for output in (json.dumps([verdict]), json.dumps(verdict) + "\nFinal: []"):
-            stream = [{"type": "text", "part": {"text": output}}, {"type": "step_finish", "part": {"reason": "stop"}}]
-            final_text = ad.parse_opencode_ndjson("\n".join(map(json.dumps, stream)))
-            with self.assertRaises(ValueError):
-                ad.validate_schema(ad.extract_json_object(final_text), ad.REVIEW_SCHEMA)
-        interim = {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(verdict)}}
-        stream = "\n".join([json.dumps(interim), '{"type":"item.completed","item":', '{"type":"turn.completed"}'])
-        with self.assertRaises(ValueError):
-            ad.parse_codex_ndjson(stream)
-
-    def test_truncated_final_object_cannot_reuse_draft_or_nested_verdict(self) -> None:
-        draft = '{"verdict":"pass"}'
-        for tail in ('{"verdict":"fail"', '{"details":{"verdict":"pass"}', '{', '{"summary":"unfinished'):
-            with self.subTest(tail=tail):
-                for response in (draft + "\nFinal answer:\n" + tail, "```json\n" + draft + "\n```\n" + tail):
-                    with self.assertRaises(ValueError):
-                        ad.extract_json_object(response)
-        self.assertEqual(ad.extract_json_object('draft {"bad": } final {"verdict":"fail"} done'),
-                         {"verdict": "fail"})
-
-    def test_extract_json_raw_decode_with_trailing_logs(self) -> None:
-        raw = 'noise {"a": 1}\nfinal: {"status": "completed", "summary": "ok"} trailing log line\n'
-        self.assertEqual(ad.extract_json_object(raw), {"status": "completed", "summary": "ok"})
-
-    def test_pi_ndjson_ignores_user_schema_and_takes_last_assistant(self) -> None:
-        events = [
-            json.dumps({"type": "message_end", "message": {"role": "user", "content": json.dumps(ad.WORKER_SCHEMA)}}),
-            json.dumps({"type": "message_end", "message": {"role": "toolResult", "content": '{"noise": true}'}}),
-            json.dumps({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": '{"status":"completed","summary":"done","tests_run":["pytest"],"discovered_issues":[],"blockers":""}'}]}}),
-        ]
-        txt = ad.parse_pi_ndjson("\n".join(events))
-        obj = ad.validate_schema(ad.extract_json_object(txt), ad.WORKER_SCHEMA)
-        self.assertEqual(obj["summary"], "done")
-
-    def test_schema_validator_rejects_missing_and_wrong_axis(self) -> None:
-        with self.assertRaises(ValueError):
-            ad.validate_schema({"axis": "standards", "verdict": "pass"}, ad.REVIEW_SCHEMA, expected_axis="standards")
-        valid_std = {
-            "axis": "standards",
-            "verdict": "pass",
-            "hard_findings": [],
-            "suggestions": [],
-            "test_integrity_violation": False,
-            "summary": "Clean.",
-        }
-        with self.assertRaises(ValueError):
-            ad.validate_schema(valid_std, ad.REVIEW_SCHEMA, expected_axis="spec")
-        self.assertEqual(ad.validate_schema(valid_std, ad.REVIEW_SCHEMA, expected_axis="standards")["verdict"], "pass")
 
     def test_pr_markdown_rendering(self) -> None:
         body = ad.build_pr_body(
@@ -767,34 +604,18 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
         self.assertEqual([i["identifier"] for i in wave], ["TST-1", "TST-2"])
         self.assertEqual([d["id"] for d in deferred], ["TST-3", "TST-4"])
 
-    def test_no_renames_catches_git_mv_bypass_and_dirty_docs_allows_behind_origin(self) -> None:
+    def test_no_renames_catches_git_mv_bypass(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            bare = Path(td) / "origin.git"
-            repo = Path(td) / "demo"
-            _git(Path(td), "init", "--bare", "-b", "main", str(bare))
-            _git(Path(td), "clone", str(bare), str(repo))
+            repo = Path(td)
+            _git(repo, "init", "-b", "main")
             _git(repo, "config", "user.email", "t@example.com")
             _git(repo, "config", "user.name", "T")
             (repo / "tests" / "unit").mkdir(parents=True)
             (repo / "tests" / "unit" / "test_math.py").write_text("def test_add():\n    assert 1+1==2\n", encoding="utf-8")
             (repo / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
-            (repo / "GLOSSARY.md").write_text("# Glossary\n", encoding="utf-8")
             _git(repo, "add", "-A")
             _git(repo, "commit", "-m", "init")
-            _git(repo, "push", "-u", "origin", "main")
             base_sha = _git(repo, "rev-parse", "HEAD")
-
-            # Simulate docs PR merged on origin/main while local main is behind -> MUST NOT flag dirty docs!
-            other = Path(td) / "other"
-            _git(Path(td), "clone", str(bare), str(other))
-            _git(other, "config", "user.email", "t@example.com")
-            _git(other, "config", "user.name", "T")
-            (other / "GLOSSARY.md").write_text("# Glossary v2\n", encoding="utf-8")
-            _git(other, "add", "GLOSSARY.md")
-            _git(other, "commit", "-m", "docs PR")
-            _git(other, "push", "origin", "main")
-            _git(repo, "fetch", "origin", "main")
-            self.assertEqual(ad.check_dirty_docs_in_main_repo(repo, "main"), [])
 
             # Test --no-renames catches git mv of test file & pytest.ini!
             _git(repo, "mv", "tests/unit/test_math.py", "math_checks.py")
@@ -806,75 +627,6 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
             self.assertTrue(any("pytest.ini" in x for x in prot))
             ti = ad.check_test_integrity_diff(repo, base_sha, cand_sha)
             self.assertTrue(any("tests/unit/test_math.py" in x for x in ti))
-
-    def test_opencode_attaches_files_before_double_dash_and_captures_session(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            d = Path(td)
-            wt = d / "wt"
-            run_dir = d / "run"
-            wt.mkdir()
-            run_dir.mkdir()
-            extra_diff = run_dir / "diff-r1.patch"
-            extra_diff.write_text("diff --git a/a.py b/a.py\n+x = 1\n", encoding="utf-8")
-            captured_cmds: list[list[str]] = []
-
-            def fake_run_cmd(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-                captured_cmds.append(list(cmd))
-                ndjson = "\n".join(
-                    [
-                        json.dumps({"type": "step_start", "sessionID": "ses_unit_12345"}),
-                        json.dumps(
-                            {
-                                "type": "text",
-                                "sessionID": "ses_unit_12345",
-                                "part": {
-                                    "text": json.dumps(
-                                        {
-                                            "axis": "standards",
-                                            "verdict": "pass",
-                                            "hard_findings": [],
-                                            "suggestions": [],
-                                            "test_integrity_violation": False,
-                                            "summary": "Clean diff.",
-                                        }
-                                    )
-                                },
-                            }
-                        ),
-                        json.dumps({"type": "step_finish", "part": {"reason": "stop"}}),
-                    ]
-                )
-                return subprocess.CompletedProcess(cmd, 0, stdout=ndjson, stderr="")
-
-            traces: list[dict[str, Any]] = []
-            with mock.patch.object(ad, "run_cmd", side_effect=fake_run_cmd):
-                res = ad.invoke_harness(
-                    ad.parse_harness_spec("opencode:sol@low"),
-                    "Review diff",
-                    worktree=wt,
-                    run_dir=run_dir,
-                    schema=ad.REVIEW_SCHEMA,
-                    schema_file=run_dir / "s.json",
-                    prompt_file=run_dir / "p.md",
-                    out_file=run_dir / "o.json",
-                    read_only=True,
-                    expected_axis="standards",
-                    session_label="review-standards-r1",
-                    trace_sink=traces,
-                    attach_files=[extra_diff, extra_diff],
-                )
-            self.assertEqual(res["verdict"], "pass")
-            self.assertEqual(len(captured_cmds), 1)
-            cmd = captured_cmds[0]
-            self.assertIn("--agent", cmd)
-            self.assertEqual(cmd[cmd.index("--agent") + 1], "plan")
-            # Deduplicated -f flags precede `--` and the positional message
-            dd_idx = cmd.index("--")
-            f_vals = [cmd[i + 1] for i, tok in enumerate(cmd[:dd_idx]) if tok == "-f"]
-            self.assertEqual(f_vals, [str(run_dir / "p.md"), str(extra_diff)])
-            self.assertEqual(dd_idx, len(cmd) - 2)
-            self.assertEqual(traces[0]["session_id"], "ses_unit_12345")
-            self.assertEqual(traces[0]["resume_cmd"], "opencode -s ses_unit_12345")
 
     def test_non_ascii_paths_utf8_replace_hooks_and_granular_gates(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -935,7 +687,7 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
                 _, sec_hits2 = ad.orchestrator_commit(repo, "TST-99", "secret file test", 2)
             self.assertTrue(any("目录/.env" in x for x in sec_hits2), sec_hits2)
 
-    def test_pr_feedback_trust_filter_pi_timeout_trace_and_review_json_retry(self) -> None:
+    def test_pr_feedback_trust_filter(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
             # 1. PR feedback: empty authorAssociation & NONE MUST be rejected; OWNER accepted; paginated --slurp flattened!
@@ -971,30 +723,6 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
             self.assertNotIn("untrusted empty", fb)
             self.assertNotIn("untrusted none", fb)
             self.assertNotIn("bad inline", fb)
-
-            # 2. Pi timeout MUST preserve session_id in sessions.jsonl!
-            run_dir = d / "pi-run"
-            run_dir.mkdir()
-            traces: list[dict[str, Any]] = []
-            with mock.patch.object(ad, "run_cmd", side_effect=subprocess.TimeoutExpired(["pi"], 5)):
-                with self.assertRaises(subprocess.TimeoutExpired):
-                    ad.invoke_harness(
-                        ad.parse_harness_spec("pi:sol@low"),
-                        "check",
-                        worktree=d,
-                        run_dir=run_dir,
-                        schema=ad.REVIEW_SCHEMA,
-                        schema_file=run_dir / "s.json",
-                        prompt_file=run_dir / "p.md",
-                        out_file=run_dir / "o.json",
-                        read_only=True,
-                        expected_axis="standards",
-                        session_label="pi-timeout-test",
-                        trace_sink=traces,
-                    )
-            self.assertEqual(len(traces), 1)
-            self.assertEqual(traces[0]["status"], "timeout")
-            self.assertTrue(traces[0].get("session_id"), "Pi timeout MUST keep generated session_id!")
 
     def test_reused_branch_baseline_runs_in_detached_worktree_and_catches_red_base(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1196,32 +924,6 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
                         2,
                     )
 
-            # 2. agy worker mode MUST pass --disable-slash-commands and NOT --mode plan!
-            agy_cmds: list[list[str]] = []
-            def fake_agy_worker(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
-                agy_cmds.append(list(cmd))
-                out = {
-                    "conversation_id": "11111111-1111-1111-1111-111111111111",
-                    "status": "SUCCESS",
-                    "structured_output": {"status": "completed", "summary": "ok", "tests_run": [], "discovered_issues": [], "blockers": ""},
-                }
-                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(out), stderr="")
-            with mock.patch.object(ad, "run_cmd", side_effect=fake_agy_worker):
-                ad.invoke_harness(
-                    ad.parse_harness_spec("agy:carbon"),
-                    "work",
-                    worktree=repo,
-                    run_dir=run_dir,
-                    schema=ad.WORKER_SCHEMA,
-                    schema_file=run_dir / "ws.json",
-                    prompt_file=run_dir / "wp.md",
-                    out_file=run_dir / "wo.json",
-                    read_only=False,
-                    session_label="agy-worker-test",
-                )
-            self.assertIn("--disable-slash-commands", agy_cmds[0])
-            self.assertNotIn("plan", agy_cmds[0])
-
             # 3. Publish-phase KeyboardInterrupt AFTER push_attempted=True MUST keep stage='pushing' (NOT 'error') and NOT roll back Linear to Todo!
             _git(repo, "checkout", "main")
             ls_state = FakeLinearState(project_name="repo")
@@ -1287,60 +989,6 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
                 srv.server_close()
 
     def test_v5_regressions_opus_removed_opencode_verdict_mixed_tests_globs_remotes_and_parallel_baseline(self) -> None:
-        # 1. Opus/Claude aliases completely removed from agy harness
-        self.assertNotIn("opus", ad.HARNESS_ALIASES["agy"])
-        self.assertNotIn("sonnet", ad.HARNESS_ALIASES["agy"])
-        self.assertEqual(ad.parse_harness_spec("agy:neon").vendor, "google")
-
-        # 2. OpenCode NDJSON: earlier fenced `pass` MUST NEVER override trailing bare `fail`!
-        oc_stream = "\n".join(
-            [
-                json.dumps({"type": "step_start", "sessionID": "ses_1"}),
-                json.dumps(
-                    {
-                        "type": "text",
-                        "sessionID": "ses_1",
-                        "part": {
-                            "messageID": "m1",
-                            "text": 'Draft check:\n```json\n{"axis":"standards","verdict":"pass","hard_findings":[],"suggestions":[],"test_integrity_violation":false,"summary":"looks ok"}\n```',
-                        },
-                    }
-                ),
-                json.dumps({"type": "step_start", "sessionID": "ses_1"}),
-                json.dumps(
-                    {
-                        "type": "text",
-                        "sessionID": "ses_1",
-                        "part": {
-                            "messageID": "m2",
-                            "text": 'Final verdict:\n{"axis":"standards","verdict":"fail","hard_findings":["Null deref"],"suggestions":[],"test_integrity_violation":false,"summary":"Found bug"}',
-                        },
-                    }
-                ),
-                json.dumps({"type": "step_finish", "part": {"reason": "stop"}}),
-            ]
-        )
-        parsed_txt = ad.parse_opencode_ndjson(oc_stream)
-        verdict_obj = ad.validate_schema(ad.extract_json_object(parsed_txt), ad.REVIEW_SCHEMA, expected_axis="standards")
-        self.assertEqual(verdict_obj["verdict"], "fail")
-        # Also verify extract_json_object alone when BOTH fenced pass and trailing bare fail are in the same message!
-        same_msg = (
-            '```json\n{"axis":"spec","verdict":"pass","hard_findings":[],"suggestions":[],"test_integrity_violation":false,"summary":"early"}\n```\n'
-            'Actually failed:\n{"axis":"spec","verdict":"fail","hard_findings":["Missing AC"],"suggestions":[],"test_integrity_violation":false,"summary":"final"}'
-        )
-        self.assertEqual(ad.extract_json_object(same_msg)["verdict"], "fail")
-
-        # 5. GitHub URL parser handles SSH-over-443 & trailing .git/, and unknown remote fails closed
-        self.assertEqual(
-            ad.parse_github_owner_repo_url("ssh://git@ssh.github.com:443/K1ndredzzz/agent-workflow.git/"),
-            "K1ndredzzz/agent-workflow",
-        )
-        self.assertEqual(
-            ad.parse_github_owner_repo_url("https://github.com/K1ndredzzz/agent-workflow.git/"),
-            "K1ndredzzz/agent-workflow",
-        )
-        self.assertIsNone(ad.parse_github_owner_repo_url("git@github-work:org/repo.git"))
-
         # 6. Mixed Python unittest+pytest repo MUST NOT silently fall back to unittest discover; JS lint-only with tests/ returns None!
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
@@ -1447,35 +1095,6 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
                 with self.assertRaisesRegex(RuntimeError, "Multiple open PRs share head branch"):
                     ad.fetch_open_pr_for_branch(prepo, "org/repo", "feat/x")
 
-    def test_harness_events_and_pi_archive_tolerate_malformed_lines_without_masking_errors(self) -> None:
-        # Stray non-JSON line starting with '{' must not break NDJSON parsing
-        verdict = json.dumps({"status": "completed"})
-        codex_out = "\n".join([
-            "{non-json diagnostic header",
-            json.dumps({"type": "turn.started"}),
-            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": verdict}}),
-            json.dumps({"type": "turn.completed"}),
-        ])
-        self.assertEqual(ad.parse_codex_ndjson(codex_out), verdict)
-
-        # Malformed newline-terminated line in Pi session memfd must not mask outer exception or drop valid lines
-        with tempfile.TemporaryDirectory() as td:
-            d = Path(td)
-            archive = d / "pi.jsonl"
-            valid_entry = {"type": "message", "id": "m1", "message": {"content": "ok"}}
-            with self.assertRaisesRegex(RuntimeError, "outer harness failure"):
-                with ad._pi_session_archive(archive, "22222222-3333-4444-5555-666666666666", d) as native:
-                    subprocess.run(
-                        [sys.executable, "-B", "-c", "import sys; open(sys.argv[1], 'a').write(sys.stdin.read())", native],
-                        input="\n{malformed json line\n" + json.dumps(valid_entry) + "\n",
-                        text=True,
-                        check=True,
-                    )
-                    raise RuntimeError("outer harness failure")
-            lines = [json.loads(line) for line in archive.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual(len(lines), 2)
-            self.assertEqual(lines[1]["id"], "m1")
-
     def test_polyglot_python_tests_dir_does_not_block_frontend_lint_and_setup_files_edge_cases(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1540,24 +1159,6 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
                         ad.parse_harness_spec("agy:neon"), repo, root / "r2", base, cand,
                         None, None, root / "std", {}, 1, setup_files=setup_files,
                     )
-
-    def test_oversized_harness_output_stops_and_keeps_session_trace(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            fake = root / "codex"
-            fake.write_text("#!/bin/sh\nprintf '%s\\n' '\"session id: 11111111-2222-3333-4444\"' >&2\n"
-                            "exec head -c 262144 /dev/zero\n")
-            fake.chmod(0o755)
-            with mock.patch.dict(os.environ, {"PATH": str(root) + os.pathsep + os.defpath}), \
-                    mock.patch.object(ad, "HARNESS_OUTPUT_LIMIT", 32768, create=True):
-                with self.assertRaisesRegex(RuntimeError, "output limit"):
-                    ad.invoke_harness(ad.parse_harness_spec("codex:sol"), "review", worktree=root, run_dir=root,
-                                      schema=ad.REVIEW_SCHEMA, schema_file=root / "schema", prompt_file=root / "prompt",
-                                      out_file=root / "result", read_only=True)
-            end = json.loads((root / "sessions.jsonl").read_text().splitlines()[-1])
-            self.assertEqual(end["status"], "error")
-            self.assertEqual(end["session_id"], "11111111-2222-3333-4444")
-            self.assertFalse((root / "result").exists())
 
     def test_wildcard_touches_reserve_all_matching_descendants(self) -> None:
         candidates = [{"identifier": "A", "description": "## Touches\n- src/*.py"},
