@@ -22,7 +22,6 @@ from __future__ import annotations
 import argparse
 import codecs
 import ast
-import base64
 import concurrent.futures
 import contextlib
 import fcntl
@@ -48,220 +47,42 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
-# ---------------------------------------------------------------------------
-# Constants, Configurable Roots & Preloaded Immutable Rubrics
-# ---------------------------------------------------------------------------
+# Resolve through the installed symlink so the repository package is importable.
+_WORKFLOW_ROOT = str(Path(__file__).resolve().parent.parent)
+if _WORKFLOW_ROOT not in sys.path:
+    sys.path.insert(0, _WORKFLOW_ROOT)
 
-def _linear_url() -> str:
-    return os.environ.get("AGENT_DISPATCH_LINEAR_URL", "https://api.linear.app/graphql").strip()
-
-
-def _cache_root() -> Path:
-    custom = os.environ.get("AGENT_DISPATCH_CACHE_ROOT", "").strip()
-    return Path(custom).resolve() if custom else (Path.home() / ".cache" / "agent-dispatch")
-
-
-def _worktree_cache_path(repo_key: str, name: str | None = None) -> Path:
-    """Accept the configured cache root, but never traverse symlinks below it."""
-    path = _cache_root()
-    components = ("worktrees", repo_key) if name is None else ("worktrees", repo_key, name)
-    for part in components:
-        if not part or part in (".", "..") or Path(part).name != part:
-            raise RuntimeError("Invalid managed worktree path component.")
-        path = path / part
-        if path.is_symlink():
-            raise RuntimeError(f"Refusing symlink in managed worktree path: {path}")
-    return path
-
-
-def _resolve_skills_root() -> Path:
-    custom = os.environ.get("AGENT_DISPATCH_SKILLS_ROOT", "").strip()
-    if custom:
-        return Path(custom).resolve()
-    rel = Path(__file__).resolve().parent.parent / "skills"
-    if (rel / "dispatch" / "references").is_dir():
-        return rel
-    return Path("/root/.agent/skills")
-
-
-SKILLS_ROOT = _resolve_skills_root()
-TDD_REF_PATH = SKILLS_ROOT / "dispatch" / "references" / "tdd.md"
-REVIEW_STANDARDS_REF_PATH = SKILLS_ROOT / "dispatch" / "references" / "review-standards.md"
-REVIEW_SPEC_REF_PATH = SKILLS_ROOT / "dispatch" / "references" / "review-spec.md"
-MCP_CONFIG_PATH = Path.home() / ".gemini" / "config" / "mcp_config.json"
-
-PRELOADED_REFS: dict[str, str] = {
-    "tdd": TDD_REF_PATH.read_text(encoding="utf-8") if TDD_REF_PATH.is_file() else "",
-    "standards": REVIEW_STANDARDS_REF_PATH.read_text(encoding="utf-8") if REVIEW_STANDARDS_REF_PATH.is_file() else "",
-    "spec": REVIEW_SPEC_REF_PATH.read_text(encoding="utf-8") if REVIEW_SPEC_REF_PATH.is_file() else "",
-}
-
-
-def assert_required_rubrics_loaded() -> None:
-    missing = [k for k in ("tdd", "standards", "spec") if not PRELOADED_REFS.get(k, "").strip()]
-    if missing:
-        raise RuntimeError(
-            f"Required workflow rubric files missing or empty under {SKILLS_ROOT}: {missing}. "
-            f"Re-run install.sh or set AGENT_DISPATCH_SKILLS_ROOT."
-        )
-
-DISPLAY_OUTPUT_CAP = 2 * 1024 * 1024
-HARNESS_OUTPUT_LIMIT = 32 * 1024 * 1024
-
-WORKER_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "status": {"type": "string", "enum": ["completed", "blocked"]},
-        "summary": {"type": "string"},
-        "tests_run": {"type": "array", "items": {"type": "string"}},
-        "discovered_issues": {"type": "array", "items": {"type": "string"}},
-        "blockers": {"type": "string"},
-    },
-    "required": ["status", "summary", "tests_run", "discovered_issues", "blockers"],
-    "additionalProperties": False,
-}
-
-REVIEW_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "axis": {"type": "string", "enum": ["standards", "spec"]},
-        "verdict": {"type": "string", "enum": ["pass", "fail"]},
-        "hard_findings": {"type": "array", "items": {"type": "string"}},
-        "suggestions": {"type": "array", "items": {"type": "string"}},
-        "test_integrity_violation": {"type": "boolean"},
-        "summary": {"type": "string"},
-    },
-    "required": [
-        "axis",
-        "verdict",
-        "hard_findings",
-        "suggestions",
-        "test_integrity_violation",
-        "summary",
-    ],
-    "additionalProperties": False,
-}
-
-HARNESS_ALIASES: dict[str, dict[str, str]] = {
-    "codex": {
-        "": "gpt-6.2-sol",
-        "sol": "gpt-6.2-sol",
-        "astra": "gpt-6.2-astra",
-    },
-    "agy": {
-        "": "gemini-4-neon-xhigh",
-        "neon": "gemini-4-neon-xhigh",
-        "neon-xhigh": "gemini-4-neon-xhigh",
-        "neon-high": "gemini-4-neon-high",
-        "neon-med": "gemini-4-neon-medium",
-        "neon-low": "gemini-4-neon-low",
-        "carbon": "gemini-4-carbon-high",
-        "carbon-high": "gemini-4-carbon-high",
-        "carbon-med": "gemini-4-carbon-medium",
-        "carbon-low": "gemini-4-carbon-low",
-        "argon": "gemini-4-argon-high",
-        "hydrogen": "gemini-4-hydrogen-xhigh",
-    },
-    "opencode": {
-        "": "sub2api/gpt-6.2-sol",
-        "sol": "sub2api/gpt-6.2-sol",
-        "astra": "sub2api/gpt-6.2-astra",
-    },
-    "pi": {
-        "": "sub2api/gpt-6.2-sol",
-        "sol": "sub2api/gpt-6.2-sol",
-        "astra": "sub2api/gpt-6.2-astra",
-    },
-}
-
-PROTECTED_EXACT_FILES: set[str] = set()
-
-PROTECTED_BASENAMES = {
-    "justfile",
-    "Justfile",
-    "Makefile",
-    "AGENTS.md",
-    "CLAUDE.md",
-    "GEMINI.md",
-    "CODING_STANDARDS.md",
-    "CONTRIBUTING.md",
-    "GLOSSARY.md",
-    "GLOSSARY-MAP.md",
-    "pytest.ini",
-    "pyproject.toml",
-    "setup.cfg",
-    "setup.py",
-    "tox.ini",
-    "noxfile.py",
-    "mypy.ini",
-    ".coveragerc",
-    "ruff.toml",
-    ".ruff.toml",
-    ".pre-commit-config.yaml",
-    ".gitattributes",
-    "Cargo.toml",
-    "conftest.py",
-}
-
-PROTECTED_PREFIXES = (
-    "docs/adr/",
-    ".github/workflows/",
-    ".github/actions/",
-    ".cargo/",
+from agent_dispatch.config import (
+    HARNESS_ALIASES,
+    PEM_END as _PEM_END,
+    PEM_START as _PEM_START,
+    PLANNING_TITLE_PREFIXES,
+    PRELOADED_REFS,
+    PROTECTED_BASENAMES,
+    PROTECTED_EXACT_FILES,
+    PROTECTED_PREFIXES,
+    PROTECTED_REGEXES,
+    REVIEW_SCHEMA,
+    SKILLS_ROOT,
+    TEST_FILE_RE,
+    TEST_SKIP_PATTERNS,
+    TRUSTED_PR_AUTHOR_ASSOCIATIONS,
+    WORKER_SCHEMA,
+    _cache_root,
+    _linear_url,
+    _worktree_cache_path,
+    assert_required_rubrics_loaded,
+)
+# Legacy callers and tests still look up these values on this module.
+from agent_dispatch.config import DISPLAY_OUTPUT_CAP, HARNESS_OUTPUT_LIMIT, MCP_CONFIG_PATH
+from agent_dispatch.secrets import (
+    is_secret_filename as _is_secret_filename,
+    redact_data,
+    redact_secrets,
+    safe_json,
+    scan_text_for_secrets,
 )
 
-PROTECTED_REGEXES = (
-    re.compile(r"(^|/)(vitest|vite|jest|eslint|playwright)\.config\..+$"),
-    re.compile(r"(^|/)\.(eslintrc|mocharc)(\..+)?$"),
-    re.compile(r"(^|/)tsconfig(\..+)?\.json$"),
-    re.compile(r"\.mk$", re.I),
-)
-
-SECRET_FILENAME_ALLOWLIST = (
-    re.compile(r"(^|/)\.env\.(example|sample|template|dist|schema)$", re.I),
-)
-
-SECRET_FILENAME_PATTERNS = (
-    re.compile(r"(^|/)\.env(\..+)?$"),
-    re.compile(r"\.(pem|key|p12|pfx)$", re.I),
-    re.compile(r"(^|/)(id_rsa|id_ed25519|credentials\.json|secrets?\.(json|ya?ml|toml))$", re.I),
-)
-
-SECRET_VALUE_PATTERNS = (
-    re.compile(r"(?<![A-Za-z0-9_-])lin_api_[A-Za-z0-9_-]{12,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])gh[pousr]_[A-Za-z0-9_]{20,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])github_pat_[A-Za-z0-9_]{20,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])sk-(?:proj-|live-|test-|ant-)?[A-Za-z0-9_-]{20,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])[sr]k_live_[A-Za-z0-9]{16,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])xox[baprs]-[A-Za-z0-9-]{10,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])"),
-    re.compile(r"(?<![A-Za-z0-9_-])glpat-[A-Za-z0-9_-]{20,}"),
-    re.compile(r"(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])"),
-    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
-)
-
-PLANNING_TITLE_PREFIXES = ("[research]", "[grill]", "[prototype]", "[map]", "[task]")
-
-TEST_FILE_RE = re.compile(
-    r"(^|/)(tests?|__tests__|spec|specs)/|"
-    r"(^|/)(tests?\.py|test_[^/]+|[^/]+_(test|spec)\.[^/]+|[^/]+\.(test|spec)\.[^/]+|[^/]+Test\.[^/]+)$",
-    re.I,
-)
-
-TEST_SKIP_PATTERNS = (
-    re.compile(r"\b(it|test|describe|context)\.(skip|only|todo|skipIf|runIf)\s*\("),
-    re.compile(r"\b(xit|xtest|xdescribe|fit|fdescribe)\s*\("),
-    re.compile(r"@pytest\.mark\.(skip|skipif|xfail)\b"),
-    re.compile(r"\bpytestmark\s*=.*pytest\.mark\.(skip|skipif|xfail)\b"),
-    re.compile(r"\bpytest\.(skip|xfail)\s*\("),
-    re.compile(r"@unittest\.(skip|skipIf|skipUnless|expectedFailure)\b"),
-    re.compile(r"\bself\.skipTest\s*\("),
-    re.compile(r"#\s*\[\s*ignore\b"),
-    re.compile(r"\bt\.Skip(?:Now)?\s*\("),
-    re.compile(r"@(Disabled|Ignore)\b"),
-)
-
-TRUSTED_PR_AUTHOR_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 
 # 100% lock-free signal-safe shutdown coordination & active PGID tracking
 # Uses a plain integer flag (NEVER threading.Event.set() inside a signal handler, avoiding CPython Event's non-reentrant lock!)
@@ -419,240 +240,6 @@ def default_reviewer_for(worker: HarnessSpec) -> HarnessSpec:
 # Security, Sanitized Child Env, Atomic IO, Locks & Streaming Process Runner
 # ---------------------------------------------------------------------------
 
-_PEM_START = re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")
-_PEM_END = re.compile(r"-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")
-_PEM_BLOCK = re.compile(_PEM_START.pattern + r".*?(?:" + _PEM_END.pattern + r"|\Z)", re.S)
-_AUTH_HEADER_SCHEMES = r"(?:bearer|basic|token|apikey|oauth)"
-_AUTH_PARAM_VAL = (
-    r"""(?:"[^"\r\n]*"|'[^'\r\n]*'|\$\{\{[^}\r\n]+\}\}|\{\{[^}\r\n]+\}\}"""
-    r"""|\$\{[^}\s\r\n]+\}|<[^>\s\r\n]+>|[^=\s,"';}\]][^\s,"';}\]]*)"""
-)
-_AUTH_PARAM_PAIR = re.compile(
-    rf"""([A-Za-z_][A-Za-z0-9_-]*)[ \t]*=[ \t]*(?:"([^"\r\n]*)"|'([^'\r\n]*)'|(\$\{{\{{[^}}\r\n]+\}}\}}|\{{\{{[^}}\r\n]+\}}\}}|\$\{{[^}}\s\r\n]+\}}|<[^>\s\r\n]+>|[^=\s,"';}}\]][^\s,"';}}\]]*))"""
-)
-_AUTH_PARAM_LIST_QUOTED = re.compile(
-    rf"""^(?:[A-Za-z_][A-Za-z0-9_-]*[ \t]*=[ \t]*{_AUTH_PARAM_VAL})(?:(?:[ \t]*,[ \t]*|[ \t]+)[A-Za-z_][A-Za-z0-9_-]*[ \t]*=[ \t]*{_AUTH_PARAM_VAL})*$"""
-)
-_AUTH_PARAM_LIST_UNQUOTED = (
-    rf"""[A-Za-z_][A-Za-z0-9_-]*[ \t]*=[ \t]*{_AUTH_PARAM_VAL}(?:[ \t]*,[ \t]*[A-Za-z_][A-Za-z0-9_-]*[ \t]*=[ \t]*{_AUTH_PARAM_VAL})*"""
-)
-_AUTH_HEADER_VALUE = re.compile(
-    rf"""(\b(?:proxy-)?authorization\b["']?[ \t]*[:=][ \t]*)"""
-    rf"""(?:"""
-    rf""""({_AUTH_HEADER_SCHEMES}[ \t]+)((?:\\.|[^"\\\r\n])*)"?"""
-    rf"""|'({_AUTH_HEADER_SCHEMES}[ \t]+)((?:\\.|[^'\\\r\n])*)'?"""
-    rf"""|({_AUTH_HEADER_SCHEMES}[ \t]+)({_AUTH_PARAM_LIST_UNQUOTED}|\$\{{\{{[^}}\r\n]+\}}\}}|\{{\{{[^}}\r\n]+\}}\}}|\$\{{[^}}\s\r\n]+\}}|[^\s"',;}}\]]+)"""
-    rf"""|(?P<alias>\*[^\s"',;{{}}\[\]]+)"""
-    rf""")""",
-    re.I,
-)
-_AUTH_NONSECRET_PARAMS = frozenset({
-    "realm", "version", "algorithm", "qop", "charset",
-    "oauth_version", "oauth_signature_method",
-})
-_AUTH_EMPTY_PARAM_KEYS = frozenset({
-    "token", "key", "apikey", "api_key", "secret", "password",
-    "credential", "access_token", "oauth_token", "oauth_consumer_key",
-    "oauth_signature",
-})
-_API_KEY_HEADERS = ("x-api-key", "x-goog-api-key")
-# Bare HTTP fields have a literal value. Source-code expressions have their own rules below.
-_RAW_CREDENTIAL_FIELD = re.compile(
-    r"^([+ -]?\ufeff?[ \t]*(?:(?:proxy-)?authorization:[ \t]*(?:bearer|basic|token|apikey|oauth)[ \t]+|(?:%s):[ \t]*))([^\r\n]+)"
-    % "|".join(_API_KEY_HEADERS), re.I | re.M,
-)
-_API_KEY_HEADER_VALUE = re.compile(
-    r"""(\b(?:%s)\b["']?[ \t]*[:=][ \t]*)(?:"((?:\\.|[^"\\\r\n])*)"?|'((?:\\.|[^'\\\r\n])*)'?|(\$\{[^}\s]+\}|[^\s"',;})\]]+))"""
-    % "|".join(_API_KEY_HEADERS), re.I,
-)
-_API_KEY_PLACEHOLDER = re.compile(
-    r"^(?:<[^>\s]+>|\$\{\{[^}]+\}\}|\{\{[^}]+\}\}|\$\{[^}\s]+\}|\$[A-Z_][A-Z0-9_]*)$"
-)
-_API_KEY_BENIGN_WORDS = frozenset({
-    "string", "str", "number", "boolean", "bool", "object", "any", "unknown",
-    "null", "none", "nil", "true", "false", "undefined", "required", "optional",
-})
-_API_KEY_CODE_EXPR = re.compile(
-    r"^(?:[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+|"
-    r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*[\[(].*|"
-    r"[a-z]+(?:_[a-z]+)+)$"
-)
-_BEARER_VALUE = re.compile(r"""(?i)\b(bearer)([ \t]+)([A-Za-z0-9._~+/-]{8,}=*)""")
-_BASIC_VALUE = re.compile(r"""(?i)\b(basic)([ \t]+)([A-Za-z0-9+/]{8,}={0,2})(?![A-Za-z0-9._~+/-])""")
-_PLAIN_ALPHA_WORD = re.compile(r"(?:[A-Za-z][a-z]+|[A-Z]+)")
-_CREDENTIAL_ENV = re.compile(r"(?:_API_KEY|_TOKEN|_PASSWORD|_SECRET|_ACCESS_KEY)$")
-_REDACTED = "<REDACTED_SECRET>"
-
-
-def _is_plausible_basic_token(tok: str) -> bool:
-    if _PLAIN_ALPHA_WORD.fullmatch(tok):
-        return False
-    padded = tok + ("=" * (-len(tok) % 4))
-    try:
-        decoded = base64.b64decode(padded, validate=True).decode("utf-8")
-        if ":" in decoded and all(32 <= ord(c) < 127 or c == "\t" for c in decoded):
-            return True
-    except Exception:
-        pass
-    if len(tok) >= 16:
-        classes = sum(bool(re.search(p, tok)) for p in (r"[A-Z]", r"[a-z]", r"[0-9]", r"[+/=]"))
-        if classes >= 3:
-            return True
-    return False
-
-
-def _redact_bearer(m: re.Match[str]) -> str:
-    if _PLAIN_ALPHA_WORD.fullmatch(m.group(3)):
-        return m.group(0)
-    return m.group(1) + m.group(2) + _REDACTED
-
-
-def _redact_basic(m: re.Match[str]) -> str:
-    if not _is_plausible_basic_token(m.group(3)):
-        return m.group(0)
-    return m.group(1) + m.group(2) + _REDACTED
-
-
-def _redact_api_key_header(m: re.Match[str]) -> str:
-    quoted = m[2] if m[2] is not None else m[3]
-    val = quoted if quoted is not None else (m[4] or "")
-    stripped = val.strip()
-    if quoted is None and stripped.startswith("*"):
-        return m[1] + _REDACTED
-    if len(stripped) < 8 or stripped.lower() in _API_KEY_BENIGN_WORDS or _API_KEY_PLACEHOLDER.fullmatch(stripped):
-        return m.group(0)
-    if quoted is None:
-        if _API_KEY_CODE_EXPR.fullmatch(stripped):
-            return m[0]
-        line_start = m.string.rfind("\n", 0, m.start()) + 1
-        prefix = m.string[line_start:m.start()]
-        # Source dictionaries can refer to variables. YAML flow mappings can use
-        # the same quoted key with a literal bare scalar.
-        if stripped.isidentifier() and m[1].rstrip().endswith(('":', "':")):
-            assignment, brace, _ = prefix.partition("{")
-            if brace and assignment.rstrip().endswith("="):
-                return m[0]
-        # Markdown field descriptions have a prose value spanning more than one word.
-        if (prefix.strip() == "-" and _PLAIN_ALPHA_WORD.fullmatch(stripped)
-                and m.string.startswith(" ", m.end()) and m.string[m.end() + 1:m.end() + 2].isalpha()):
-            return m[0]
-    if m[2] is not None:
-        return m[1] + '"' + _REDACTED + '"'
-    if m[3] is not None:
-        return m[1] + "'" + _REDACTED + "'"
-    return m[1] + _REDACTED
-
-
-def _is_benign_auth_token(tok: str) -> bool:
-    s = tok.strip()
-    if not s or s.lower() in _API_KEY_BENIGN_WORDS or _API_KEY_PLACEHOLDER.fullmatch(s):
-        return True
-    if len(s) < 6:
-        return True
-    if len(s) < 8 and _PLAIN_ALPHA_WORD.fullmatch(s):
-        return True
-    return False
-
-
-def _is_benign_auth_param_list(value: str) -> bool:
-    empty_param = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_-]*)[ \t]*=", value)
-    if empty_param and empty_param.group(1).lower() in _AUTH_EMPTY_PARAM_KEYS:
-        return True
-    if not _AUTH_PARAM_LIST_QUOTED.fullmatch(value):
-        return False
-    for pm in _AUTH_PARAM_PAIR.finditer(value):
-        pkey = pm.group(1).lower()
-        pval = pm.group(2) if pm.group(2) is not None else (pm.group(3) if pm.group(3) is not None else (pm.group(4) or ""))
-        if pkey in _AUTH_NONSECRET_PARAMS:
-            continue
-        if not _is_benign_auth_token(pval):
-            return False
-    return True
-
-
-def _redact_raw_credential_field(m: re.Match[str]) -> str:
-    value = re.sub(r"[ \t]+#.*$", "", m[2].strip()).strip()
-    if (
-        not value
-        or value[0] in ("'", '"')
-        or _API_KEY_PLACEHOLDER.fullmatch(value)
-        or _is_benign_auth_param_list(value)
-        or value.lower() in _API_KEY_BENIGN_WORDS
-        or any(ch.isspace() for ch in value)
-    ):
-        return m[0]
-    return m[1] + _REDACTED
-
-
-def _redact_auth_header(m: re.Match[str]) -> str:
-    if m["alias"]:
-        return m[1] + _REDACTED
-    if m[2] is not None:
-        quote, scheme, raw_val = '"', m[2], m[3] or ""
-        unescaped = raw_val.replace('\\"', '"').strip()
-    elif m[4] is not None:
-        quote, scheme, raw_val = "'", m[4], m[5] or ""
-        unescaped = raw_val.replace("\\'", "'").strip()
-    else:
-        quote, scheme, raw_val = "", m[6], m[7] or ""
-        unescaped = raw_val.strip()
-
-    if not unescaped:
-        return m[0]
-    if _is_benign_auth_param_list(unescaped):
-        return m[0]
-    if not _AUTH_PARAM_LIST_QUOTED.fullmatch(unescaped):
-        if any(ch.isspace() for ch in unescaped):
-            return m[0]
-        if _is_benign_auth_token(unescaped) and (quote or not unescaped.startswith("*")):
-            return m[0]
-        if not quote and _PLAIN_ALPHA_WORD.fullmatch(unescaped) and re.match(r"[ \t]+[A-Za-z]", m.string[m.end():]):
-            return m[0]
-    if quote:
-        return m[1] + quote + scheme + _REDACTED + quote
-    return m[1] + scheme + _REDACTED
-
-
-def _redact_heuristic_credentials(text: str) -> str:
-    out = _RAW_CREDENTIAL_FIELD.sub(_redact_raw_credential_field, text)
-    out = _AUTH_HEADER_VALUE.sub(_redact_auth_header, out)
-    out = _API_KEY_HEADER_VALUE.sub(_redact_api_key_header, out)
-    out = _BEARER_VALUE.sub(_redact_bearer, out)
-    return _BASIC_VALUE.sub(_redact_basic, out)
-
-
-def _live_credential_values() -> Iterator[str]:
-    for name, value in os.environ.items():
-        if _CREDENTIAL_ENV.search(name) and len(value) >= 8:
-            yield value
-
-
-def redact_secrets(text: str) -> str:
-    out = _redact_heuristic_credentials(_PEM_BLOCK.sub(_REDACTED, str(text)))
-    for pat in SECRET_VALUE_PATTERNS:
-        out = pat.sub(_REDACTED, out)
-    for value in _live_credential_values():
-        out = out.replace(value, _REDACTED)
-    return out
-
-
-def redact_data(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            redact_secrets(k): _REDACTED if str(k).lower() in ("authorization", "proxy-authorization", *_API_KEY_HEADERS) else redact_data(v)
-            for k, v in value.items()
-        }
-    if isinstance(value, list):
-        return [redact_data(v) for v in value]
-    if isinstance(value, str):
-        return redact_secrets(value)
-    return value
-
-
-def safe_json(value: Any, **kwargs: Any) -> str:
-    return json.dumps(redact_data(value), **kwargs)
-
-
 def atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
@@ -676,27 +263,6 @@ def sha256_file(path: Path) -> str:
 
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def scan_text_for_secrets(text: str, field_name: str) -> list[str]:
-    return _scan_text_for_secrets(text, field_name, allow_marker=True)
-
-
-def _scan_text_for_secrets(text: str, field_name: str, *, allow_marker: bool) -> list[str]:
-    text = text or ""
-    # These rules inspect the original text, including marked lines and comments.
-    if (
-        _PEM_START.search(text)
-        or any(pattern.search(text) for pattern in SECRET_VALUE_PATTERNS)
-        or any(value in text for value in _live_credential_values())
-    ):
-        return [f"Potential secret token in {redact_secrets(field_name)}"]
-    marker = "# secret-scan:allow"
-    if allow_marker and marker in text:
-        text = "\n".join("" if marker in line else line for line in text.split("\n"))
-    if _redact_heuristic_credentials(text) != text:
-        return [f"Potential secret token in {redact_secrets(field_name)}"]
-    return []
 
 
 def git_cmd(*args: str, attr_source: str | None = None) -> list[str]:
@@ -2656,12 +2222,6 @@ def check_test_integrity_diff(
     return findings
 
 
-def _is_secret_filename(path: str) -> bool:
-    if any(allow.search(path) for allow in SECRET_FILENAME_ALLOWLIST):
-        return False
-    return any(pat.search(path) for pat in SECRET_FILENAME_PATTERNS)
-
-
 def _added_patch_lines(patch: str) -> Iterator[str]:
     # Git headers are outside hunks. A source line may itself begin with '++'.
     in_hunk = False
@@ -2727,7 +2287,7 @@ def _scan_git_changes_for_secrets(
     ).stdout
     findings: set[str] = set()
     for path in set(paths.split("\0")) - {""}:
-        findings.update(_scan_text_for_secrets(path, "changed file name", allow_marker=False))
+        findings.update(scan_text_for_secrets(path, "changed file name", allow_marker=False))
         if _is_secret_filename(path):
             findings.add(f"Potential secret file: {redact_secrets(path)}")
 
@@ -2749,7 +2309,7 @@ def scan_range_for_secrets(worktree: Path, base_sha: str, candidate_sha: str) ->
         git_cmd("log", "--pretty=format:%B%n", revision_range), cwd=worktree,
         check=True, env_role="orchestrator", cap_output=False,
     ).stdout
-    return _scan_text_for_secrets(messages, "commit message", allow_marker=False) + _scan_git_changes_for_secrets(
+    return scan_text_for_secrets(messages, "commit message", allow_marker=False) + _scan_git_changes_for_secrets(
         worktree, ["log", "-m", "--format=", revision_range], attr_source=base_sha
     )
 
@@ -2776,7 +2336,7 @@ def _scan_before_git_write(
     for name in filter(None, untracked.split("\0")):
         if name in exclude_paths:
             continue
-        findings.extend(_scan_text_for_secrets(name, "untracked file name", allow_marker=False))
+        findings.extend(scan_text_for_secrets(name, "untracked file name", allow_marker=False))
         if _is_secret_filename(name):
             findings.append(f"Potential secret file: {redact_secrets(name)}")
             continue
@@ -2790,7 +2350,7 @@ def _scan_before_git_write(
             if _is_secret_filename(content):
                 findings.append(f"Potential secret symlink target: {redact_secrets(name)}")
                 continue
-            findings.extend(_scan_text_for_secrets(content, "untracked symlink target", allow_marker=False))
+            findings.extend(scan_text_for_secrets(content, "untracked symlink target", allow_marker=False))
         elif path.is_file():
             try:
                 findings.extend(_scan_git_bytes(path.read_bytes(), "untracked file content"))
@@ -2828,7 +2388,7 @@ def orchestrator_commit(
     """Stage & commit changes safely (hooks/fsmonitor disabled; scans commit msg + staged diff). Returns (head_sha, violations)."""
     ensure_dispatch_excluded(worktree)
     commit_msg = f"{identifier}: {title} (attempt {attempt})"
-    msg_secret_hits = _scan_text_for_secrets(commit_msg, "ticket title / commit message", allow_marker=False)
+    msg_secret_hits = scan_text_for_secrets(commit_msg, "ticket title / commit message", allow_marker=False)
     if msg_secret_hits:
         head = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
         return head, msg_secret_hits
@@ -3902,7 +3462,7 @@ def reconcile_publish(
     _require_publish_ownership(live_pre, state)
 
     pr_title = f"{issue['identifier']}: {issue['title']}"
-    title_secrets = _scan_text_for_secrets(pr_title, "PR title", allow_marker=False)
+    title_secrets = scan_text_for_secrets(pr_title, "PR title", allow_marker=False)
     if title_secrets:
         raise RuntimeError("Refusing to publish PR with secret in title: " + "; ".join(title_secrets))
 
@@ -4292,7 +3852,7 @@ def execute_ticket(
             return early_ret
 
         # Early metadata secret scan BEFORE writing brief or calling ANY LLM harness!
-        early_title_hits = _scan_text_for_secrets(str(issue.get("title") or ""), "ticket title", allow_marker=False)
+        early_title_hits = scan_text_for_secrets(str(issue.get("title") or ""), "ticket title", allow_marker=False)
         if early_title_hits:
             return {
                 "issue": issue["identifier"],
@@ -4362,7 +3922,7 @@ def execute_ticket(
         early_ret2 = _validate_claim_eligibility(issue)
         if early_ret2 is not None:
             return early_ret2
-        early_title_hits2 = _scan_text_for_secrets(str(issue.get("title") or ""), "ticket title", allow_marker=False)
+        early_title_hits2 = scan_text_for_secrets(str(issue.get("title") or ""), "ticket title", allow_marker=False)
         if early_title_hits2:
             return {
                 "issue": issue["identifier"],
