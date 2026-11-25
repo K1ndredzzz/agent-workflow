@@ -37,7 +37,7 @@ _AUTH_HEADER_VALUE = re.compile(
     rf""""({_AUTH_HEADER_SCHEMES}[ \t]+)((?:\\.|[^"\\\r\n])*)"?"""
     rf"""|'({_AUTH_HEADER_SCHEMES}[ \t]+)((?:\\.|[^'\\\r\n])*)'?"""
     rf"""|({_AUTH_HEADER_SCHEMES}[ \t]+)({_AUTH_PARAM_LIST_UNQUOTED}|\$\{{\{{[^}}\r\n]+\}}\}}|\{{\{{[^}}\r\n]+\}}\}}|\$\{{[^}}\s\r\n]+\}}|[^\s"',;}}\]]+)"""
-    rf"""|(?P<alias>\*[^\s"',;{{}}\[\]]+)"""
+    rf"""|(?P<alias>\*[^\s"',;{{}}\[\]*]+)(?=$|[\s"',;{{}}\[\]])"""
     rf""")""",
     re.I,
 )
@@ -76,6 +76,7 @@ _BEARER_VALUE = re.compile(r"""(?i)\b(bearer)([ \t]+)([A-Za-z0-9._~+/-]{8,}=*)""
 _BASIC_VALUE = re.compile(r"""(?i)\b(basic)([ \t]+)([A-Za-z0-9+/]{8,}={0,2})(?![A-Za-z0-9._~+/-])""")
 _PLAIN_ALPHA_WORD = re.compile(r"(?:[A-Za-z][a-z]+|[A-Z]+)")
 _CREDENTIAL_ENV = re.compile(r"(?:_API_KEY|_TOKEN|_PASSWORD|_SECRET|_ACCESS_KEY)$")
+_ALLOW_MARKER = re.compile(r"# secret-scan:allow(?=$|\s)")
 _REDACTED = "<REDACTED_SECRET>"
 
 
@@ -264,9 +265,8 @@ def scan_text_for_secrets(text: str, field_name: str, *, allow_marker: bool = Tr
         or any(value in text for value in _live_credential_values())
     ):
         return [f"Potential secret token in {redact_secrets(field_name)}"]
-    marker = "# secret-scan:allow"
-    if allow_marker and marker in text:
-        text = "\n".join("" if marker in line else line for line in text.split("\n"))
+    if allow_marker and _ALLOW_MARKER.search(text):
+        text = "\n".join("" if _ALLOW_MARKER.search(line) else line for line in text.split("\n"))
     if _redact_heuristic_credentials(text) != text:
         return [f"Potential secret token in {redact_secrets(field_name)}"]
     return []

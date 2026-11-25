@@ -480,11 +480,11 @@ class TestGitSecretGates(IsolatedDispatchCase):
                             content = f"{declaration}headers:\n  {prefix}{value}{marker}\n".encode(encoding)
                             untracked.write_bytes(content)
                             self.assertEqual(gates.scan_before_git_write(repo), [] if marker else [
-                                "Potential secret token in untracked file content",
+                                "Potential secret token in untracked file content (example.yaml)",
                             ])
                             untracked.unlink()
                             tracked.write_bytes(content)
-                            expected = [] if marker else ["Potential secret token in added file content"]
+                            expected = [] if marker else ["Potential secret token in added file content (gateway.yaml)"]
                             self.assertEqual(gates.scan_before_git_write(repo), expected)
                             _git(repo, "add", tracked.name)
                             self.assertEqual(gates.scan_staged_for_secrets(repo), expected)
@@ -513,10 +513,10 @@ class TestGitSecretGates(IsolatedDispatchCase):
                 ):
                     with self.subTest(filename=filename):
                         expected_file = ["Potential secret file: .env"]
-                        expected_content = ["Potential secret token in added file content"]
+                        expected_content = [f"Potential secret token in added file content ({filename})"]
                         (repo / filename).write_text(content + "\n", encoding="utf-8")
                         self.assertEqual(gates.scan_before_git_write(repo), expected_file if credential is None else [
-                            "Potential secret token in untracked file content",
+                            f"Potential secret token in untracked file content ({filename})",
                         ])
                         _git(repo, "add", filename)
                         expected = expected_file if credential is None else expected_content
@@ -556,6 +556,38 @@ class TestGitSecretGates(IsolatedDispatchCase):
                     self.assertFalse(gates.scan_range_for_secrets(root, head, cleaned))
                     self.assertTrue(gates.scan_range_for_secrets(root, base, cleaned))
                     base = cleaned
+
+    def test_git_content_findings_identify_each_file_with_redacted_paths(self) -> None:
+        repo = self.sandbox / "repo"
+        repo.mkdir()
+        _git(repo, "init", "-b", "main")
+        _git(repo, "config", "user.name", "Test")
+        _git(repo, "config", "user.email", "test@example.invalid")
+        _git(repo, "commit", "--allow-empty", "-m", "base")
+
+        token = "lin_api_" + "SYNTHETICCONTENT012345"
+        path_token = "lin_api_" + "SYNTHETICFILENAME012345"
+        settings = repo / "config"
+        settings.mkdir()
+        (settings / "a 目录.yaml").write_text(f"setting={token}\n", encoding="utf-8")
+        (settings / "b ordinary.yaml").write_text("setting=ordinary\n", encoding="utf-8")
+        (settings / f'c "{path_token}"\t.yaml').write_text(f"setting={token}\n", encoding="utf-16")
+
+        self.assertCountEqual(gates.scan_before_git_write(repo), [
+            "Potential secret token in untracked file name",
+            "Potential secret token in untracked file content (config/a 目录.yaml)",
+            'Potential secret token in untracked file content (config/c "<REDACTED_SECRET>"\t.yaml)',
+        ])
+        _git(repo, "add", "-A")
+        expected = [
+            "Potential secret token in changed file name",
+            "Potential secret token in added file content (config/a 目录.yaml)",
+            'Potential secret token in added file content (config/c "<REDACTED_SECRET>"\t.yaml)',
+        ]
+        self.assertCountEqual(gates.scan_staged_for_secrets(repo), expected)
+        self.assertCountEqual(gates.scan_before_git_write(repo), expected)
+        _git(repo, "commit", "-m", "add synthetic fixtures")
+        self.assertCountEqual(gates.scan_range_for_secrets(repo, "HEAD^", "HEAD"), expected)
 
     def test_json_quoted_authorization_credentials_across_git_scans(self) -> None:
         token = "synthetic_pd_tok_987654321"
