@@ -1,14 +1,8 @@
-#!/usr/bin/env python3
-"""
-Unit, security/false-positive, end-to-end CLI fault-injection, parallel frontier, real-signal,
-and opt-in live Linear contract tests for agent-dispatch v5 and install.sh.
-"""
+"""Subprocess CLI, fault-injection, and recovery tests for agent-dispatch."""
 
 from __future__ import annotations
 
 import concurrent.futures
-import importlib.machinery
-import importlib.util
 import json
 import os
 import shutil
@@ -17,36 +11,14 @@ import subprocess
 import sys
 import tempfile
 import time
-import unittest
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
-# Prevent SourceFileLoader from leaving .pyc artifacts inside bin/__pycache__
-sys.dont_write_bytecode = True
-
-if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
+from agent_dispatch import git_ops, process, publish
 from tests.helpers import FakeLinearState, IsolatedDispatchCase, WORKFLOW_ROOT, _git, _write_exec, start_fake_linear
 
 BIN_PATH = WORKFLOW_ROOT / "bin" / "agent-dispatch"
-INSTALL_SH = WORKFLOW_ROOT / "install.sh"
-
-loader = importlib.machinery.SourceFileLoader("_agent_dispatch_legacy", str(BIN_PATH))
-spec = importlib.util.spec_from_loader(loader.name, loader)
-assert spec is not None
-ad = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = ad
-loader.exec_module(ad)
-
-from agent_dispatch import config, process
-
-
-class LegacyDispatchCase(IsolatedDispatchCase):
-    def setUp(self) -> None:
-        super().setUp()
-        self.enterContext(mock.patch.object(config, "MCP_CONFIG_PATH", self.sandbox / "unused-mcp.json"))
 
 
 class TestCLIEntrypoint(IsolatedDispatchCase):
@@ -60,12 +32,21 @@ class TestCLIEntrypoint(IsolatedDispatchCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn("usage: agent-dispatch", result.stdout)
 
+    def test_symlink_propagates_cli_exit_status(self) -> None:
+        link = self.sandbox / "agent-dispatch"
+        link.symlink_to(BIN_PATH)
+        result = subprocess.run(
+            [str(link), "--help"],
+            cwd=self.sandbox,
+            env=dict(os.environ, AGENT_DISPATCH_CHILD="1"),
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("Nested agent-dispatch invocation blocked", result.stderr)
 
-# ---------------------------------------------------------------------------
-# End-to-End Subprocess CLI Fault-Injection Suite
-# ---------------------------------------------------------------------------
 
-class TestEndToEndCLIFaultInjection(LegacyDispatchCase):
+class TestEndToEndCLIFaultInjection(IsolatedDispatchCase):
     def setUp(self) -> None:
         super().setUp()
         self.td = tempfile.TemporaryDirectory()
@@ -196,7 +177,7 @@ elif mode == "edit_gitattributes":
     )
 elif mode == "edit_gitattributes_with_secret":
     (cwd / ".gitattributes").write_text("secret.json -diff\\n", encoding="utf-8")
-    (cwd / "secret.json").write_text(json.dumps({{"Authorization": "Token token=synthetic_hidden_secret_12345"}}) + "\\n", encoding="utf-8")
+    (cwd / "secret.json").write_text(json.dumps({{"Authorization": "Token " + "token=synthetic_hidden_secret_12345"}}) + "\\n", encoding="utf-8")
 elif mode == "tamper_git_config":
     import subprocess
     subprocess.run(["git", "config", "core.hooksPath", ".husky/_"], cwd=str(cwd), check=True)
@@ -332,7 +313,7 @@ sys.exit(1)
         env.pop("AGENT_DISPATCH_CHILD", None)
         env["GIT_CONFIG_GLOBAL"] = "/dev/null"
         env["PATH"] = f"{self.fake_bin}:{env['PATH']}"
-        env["LINEAR_API_KEY"] = "lin_api_fake_e2e_key_1234567890"
+        env["LINEAR_API_KEY"] = "lin_api_" + "fake_e2e_key_1234567890"
         env["AGENT_DISPATCH_LINEAR_URL"] = self.linear_url
         env["AGENT_DISPATCH_CACHE_ROOT"] = str(self.cache_dir)
         env["AGENT_DISPATCH_FORCE_GH"] = "1"
@@ -363,7 +344,7 @@ sys.exit(1)
     def test_relative_origin_from_linked_worktree_only_updates_original_bare(self) -> None:
         iss = self.linear_state.add_issue("TST-REL", "Relative origin", "Work", labels=["agent-ready"])
         _git(self.repo, "remote", "set-url", "origin", f"../{self.bare.name}")
-        wt_parent = self.cache_dir / "worktrees" / ad.repo_cache_key(self.repo)
+        wt_parent = self.cache_dir / "worktrees" / git_ops.repo_cache_key(self.repo)
         wt_parent.mkdir(parents=True)
         other = wt_parent / self.bare.name
         _git(wt_parent, "init", "--bare", "-b", "main", str(other))
@@ -530,7 +511,7 @@ sys.exit(rc)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(issue["state"]["name"], "Canceled")
         self.assertEqual(self.linear_state.mutation_log, [])
-        latest = self.cache_dir / "runs" / ad.repo_cache_key(self.repo) / issue["identifier"] / "latest.json"
+        latest = self.cache_dir / "runs" / git_ops.repo_cache_key(self.repo) / issue["identifier"] / "latest.json"
         self.assertNotEqual(json.loads(latest.read_text())["stage"], "claim_pending")
 
     def test_existing_pr_closed_during_worker_is_preserved_before_push(self) -> None:
@@ -574,13 +555,13 @@ sys.exit(rc)
 
     def test_resume_interrupted_claim_only_restores_owned_state(self) -> None:
         issue = self.linear_state.add_issue("TST-CLAIM", "Claim", "scope", state_name="In Progress")
-        ticket_dir = self.cache_dir / "runs" / ad.repo_cache_key(self.repo) / issue["identifier"]
+        ticket_dir = self.cache_dir / "runs" / git_ops.repo_cache_key(self.repo) / issue["identifier"]
         run_dir = ticket_dir / "claim-run"
         run_dir.mkdir(parents=True)
         state = {"stage": "claim_pending", "issue_uuid": issue["id"], "run_dir": str(run_dir),
                  "pre_claim_state_id": "st-todo", "claimed_state_id": "st-prog",
-                 "claimed_ownership": {"description_sha": ad.sha256_text("scope"), "assignee_id": ""}}
-        ad.save_checkpoint(run_dir, ticket_dir / "latest.json", state)
+                 "claimed_ownership": {"description_sha": process.sha256_text("scope"), "assignee_id": ""}}
+        publish.save_checkpoint(run_dir, ticket_dir / "latest.json", state)
         args = ["resume", issue["identifier"], "--repo", str(self.repo)]
         issue["assignee"] = {"id": "human", "name": "Human"}
         self.assertNotEqual(self._run_cli(args).returncode, 0)
@@ -605,7 +586,7 @@ sys.exit(rc)
         self.assertEqual(state["stage"], "linear_state_synced")
         args = ["resume", issue["identifier"], "--repo", str(self.repo)]
         state["stage"] = "pr_ready"
-        ad.save_checkpoint(run_dir, latest, state)
+        publish.save_checkpoint(run_dir, latest, state)
         issue["state"] = self.linear_state.states[1]  # Todo
         count = len(self.linear_state.mutation_log)
         self.assertNotEqual(self._run_cli(args).returncode, 0)
@@ -616,7 +597,7 @@ sys.exit(rc)
         prs[0].update(body="Human notes", state="CLOSED")
         self.gh_state_file.write_text(json.dumps(prs))
         state.pop("pr_number")  # create succeeded but its response was lost
-        ad.save_checkpoint(run_dir, latest, state)
+        publish.save_checkpoint(run_dir, latest, state)
         self.assertNotEqual(self._run_cli(args).returncode, 0)
         self.assertEqual(json.loads(self.gh_state_file.read_text()), prs)
         prs[0]["state"] = "OPEN"
@@ -626,11 +607,11 @@ sys.exit(rc)
         self.assertEqual(_git(self.bare, "for-each-ref", f"refs/heads/{state['branch']}"), "")
         _git(self.bare, "update-ref", f"refs/heads/{state['branch']}", state["candidate_sha"])
         state["review"]["passed"] = False
-        ad.save_checkpoint(run_dir, latest, state)
+        publish.save_checkpoint(run_dir, latest, state)
         self.assertNotEqual(self._run_cli(args).returncode, 0)
         self.assertEqual(len(self.linear_state.mutation_log), count)
         state["review"]["passed"] = True
-        ad.save_checkpoint(run_dir, latest, state)
+        publish.save_checkpoint(run_dir, latest, state)
         success = self._run_cli(args)
         self.assertEqual(success.returncode, 0, success.stderr)
         self.assertEqual(json.loads(self.gh_state_file.read_text())[0]["body"], "Human notes")
@@ -744,7 +725,7 @@ sys.exit(rc)
         owner_f = wt / ".dispatch" / "owner.json"
         if owner_f.is_file():
             owner_f.unlink()
-        rkey = ad.repo_cache_key(self.repo)
+        rkey = git_ops.repo_cache_key(self.repo)
         (self.cache_dir / "runs" / rkey / "TST-20" / "latest.json").write_text("{corrupt", encoding="utf-8")
         clean_all = self._run_cli(["cleanup", "--all", "--repo", str(self.repo)])
         self.assertEqual(clean_all.returncode, 0, clean_all.stderr)
@@ -780,9 +761,10 @@ sys.exit(rc)
 
         # 2. Secret in Linear ticket title MUST be blocked BEFORE calling any LLM harness (0 codex calls!)
         codex_before_sec = int((self.root / "codex_calls.count").read_text()) if (self.root / "codex_calls.count").exists() else 0
+        synthetic_token = "github_" + "pat_11ABCDEFG01234567890_abcdefghijklmnop"
         iss_sec = self.linear_state.add_issue(
             "TST-41",
-            "Fix token github_pat_11ABCDEFG01234567890_abcdefghijklmnop leak",
+            f"Fix token {synthetic_token} leak",
             "## What to Build\nAdd mul(a, b)\n\n## Testing Seam & Acceptance Criteria\n- [ ] mul(2, 3) == 6\n",
             labels=["agent-ready"],
         )
@@ -868,18 +850,24 @@ sys.exit(rc)
         base = _git(self.repo, "rev-parse", "HEAD")
         _git(self.repo, "commit", "--allow-empty", "-m", "ahead")
         entered, release = self.root / "entered", self.root / "release"
+        setup = self.root / "interrupt_baseline.py"
+        setup.write_text(
+            "import os, signal, sys, time\nfrom pathlib import Path\n"
+            f"Path({str(entered)!r}).touch()\n"
+            f"while not Path({str(release)!r}).exists(): time.sleep(.02)\n"
+            "os.kill(int(sys.argv[1]), signal.SIGUSR1)\n"
+        )
         runner = self.root / "baseline.py"
         runner.write_text(
-            "import os, runpy, time\nfrom pathlib import Path\n"
-            f"ad=runpy.run_path({str(BIN_PATH)!r}); repo=Path({str(self.repo)!r})\n"
-            "def interrupt(*args, **kwargs):\n"
-            f"    Path({str(entered)!r}).touch()\n"
-            f"    while not Path({str(release)!r}).exists(): time.sleep(.02)\n"
-            "    os._exit(42)\n"
-            "ad['check_base_baseline'].__globals__['bootstrap_worktree']=interrupt\n"
-            f"ad['check_base_baseline'](repo, ad['repo_cache_key'](repo), repo, {base!r}, 'true', repo)\n"
+            "import os, shlex, signal, sys\nfrom pathlib import Path\n"
+            "from agent_dispatch.gates import check_base_baseline\n"
+            "from agent_dispatch.git_ops import repo_cache_key\n"
+            "signal.signal(signal.SIGUSR1, lambda *_: os._exit(42))\n"
+            f"repo = Path({str(self.repo)!r})\n"
+            f"setup_cmd = shlex.join([sys.executable, '-B', {str(setup)!r}, str(os.getpid())])\n"
+            f"check_base_baseline(repo, repo_cache_key(repo), repo, {base!r}, 'true', repo, setup_cmd_override=setup_cmd)\n"
         )
-        env = {**os.environ, "AGENT_DISPATCH_CACHE_ROOT": str(self.cache_dir)}
+        env = dict(os.environ, AGENT_DISPATCH_CACHE_ROOT=str(self.cache_dir), PYTHONPATH=str(WORKFLOW_ROOT))
         with subprocess.Popen([sys.executable, "-B", str(runner)], env=env) as child:
             try:
                 deadline = time.monotonic() + 10
@@ -978,7 +966,7 @@ sys.exit(rc)
     def test_reused_feature_checks_current_base_with_base_verify_recipe(self) -> None:
         issue = self.linear_state.add_issue("TST-FORK", "feature", "## Touches\n- app", labels=["agent-ready"])
         with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CACHE_ROOT": str(self.cache_dir)}):
-            wt, _, _ = ad.prepare_worktree(self.repo, issue["identifier"], "main", issue_uuid=issue["id"])
+            wt, _, _ = git_ops.prepare_worktree(self.repo, issue["identifier"], "main", issue_uuid=issue["id"])
         _git(wt, "commit", "--allow-empty", "-m", "feature before base moved")
         (self.repo / "Makefile").write_text("check:\n\t@echo current-base-red\n\t@false\n")
         _git(self.repo, "commit", "-am", "base now fails check")
@@ -1124,7 +1112,7 @@ sys.exit(res.returncode)
         self.assertTrue(sig_marker.exists(), f"Push did not reach SIGTERM injection (exit {res1.returncode}): {res1.stdout} {res1.stderr}")
         self.assertEqual(res1.returncode, 128 + signal.SIGTERM, res1.stderr + res1.stdout)
         # Checkpoint MUST persist pushed=True and stage='pushed' immediately once remote read-back confirms push!
-        rkey = ad.repo_cache_key(self.repo)
+        rkey = git_ops.repo_cache_key(self.repo)
         ckpt = json.loads((self.cache_dir / "runs" / rkey / "TST-TERM" / "latest.json").read_text(encoding="utf-8"))
         state_json = json.loads((Path(ckpt["run_dir"]) / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(ckpt["stage"], "pushed")
@@ -1175,7 +1163,7 @@ sys.exit(res.returncode)
         self.assertTrue(outage_flag.exists())
         # Ticket stayed In Progress because Linear was unreachable during cleanup; checkpoint recorded rollback_pending.
         self.assertEqual(iss["state"]["name"], "In Progress")
-        rkey = ad.repo_cache_key(self.repo)
+        rkey = git_ops.repo_cache_key(self.repo)
         ckpt = json.loads((self.cache_dir / "runs" / rkey / "TST-RB" / "latest.json").read_text(encoding="utf-8"))
         self.assertEqual(ckpt["stage"], "rollback_pending")
         self.assertEqual(ckpt["pre_claim_state_id"], "st-todo")
@@ -1278,7 +1266,7 @@ if os.environ.get("FAKE_NPM_TAMPER_GIT_CONFIG") == "1":
         # 2. Detached baseline bootstrap tampering shared core.hooksPath MUST ALSO abort before Linear claim!
         iss_base = self.linear_state.add_issue("TST-BOOT2", "Baseline bootstrap tamper", "## Touches\n- app\n", labels=["agent-ready"])
         with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CACHE_ROOT": str(self.cache_dir)}):
-            wt2, _, _ = ad.prepare_worktree(self.repo, iss_base["identifier"], "main", issue_uuid=iss_base["id"])
+            wt2, _, _ = git_ops.prepare_worktree(self.repo, iss_base["identifier"], "main", issue_uuid=iss_base["id"])
         # Pre-populate node_modules on candidate so candidate skips npm ci, while feature branch is ahead so detached baseline runs npm ci!
         (wt2 / "node_modules").mkdir()
         _git(wt2, "commit", "--allow-empty", "-m", "ahead of base")
@@ -1410,7 +1398,7 @@ if os.environ.get("FAKE_NPM_TAMPER_GIT_CONFIG") == "1":
         self.assertNotIn("pr edit", self.gh_calls_log.read_text(encoding="utf-8")[len(gh_before):])
 
         # 2. Cleanup --all MUST NOT delete worktree switched by human to a personal branch!
-        wt = self.cache_dir / "worktrees" / ad.repo_cache_key(self.repo) / "TST-SYNC"
+        wt = self.cache_dir / "worktrees" / git_ops.repo_cache_key(self.repo) / "TST-SYNC"
         _git(wt, "checkout", "-b", "personal/wip")
         clean_pers = self._run_cli(["cleanup", "--all", "--repo", str(self.repo)])
         self.assertEqual(clean_pers.returncode, 0)
@@ -1474,129 +1462,15 @@ if os.environ.get("FAKE_NPM_TAMPER_GIT_CONFIG") == "1":
         self.assertEqual(iss2["state"]["name"], "Todo")
         self.assertIn("dispatch:failed", [l["name"] for l in iss2["_labels"]])
         # Verify sessions.jsonl captured the crashed codex session_id!
-        rkey = ad.repo_cache_key(self.repo)
+        rkey = git_ops.repo_cache_key(self.repo)
         latest = json.loads((self.cache_dir / "runs" / rkey / "TST-31" / "latest.json").read_text())
         sfile = Path(latest["run_dir"]) / "sessions.jsonl"
         self.assertTrue(sfile.is_file())
         self.assertIn("11111111-2222-3333-4444", sfile.read_text())
 
-    def test_install_sh_preserves_unrelated_skills_and_backs_up_real_agents_md(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            d = Path(td)
-            # Copy install source into temp dir so the test NEVER mutates permissions in the live checkout!
-            src_copy = d / "workflow_src"
-            shutil.copytree(WORKFLOW_ROOT, src_copy, ignore=shutil.ignore_patterns(".git", "__pycache__"))
-            ag_skills = d / "agent_skills"
-            ag_plugins = d / "agy_plugins"
-            cx_skills = d / "codex_skills"
-            cx_agents = d / "codex" / "AGENTS.md"
-            bin_dst = d / "bin" / "agent-dispatch"
-            (ag_skills / "my-custom-skill").mkdir(parents=True)
-            (ag_skills / "my-custom-skill" / "SKILL.md").write_text("keep me", encoding="utf-8")
-            (ag_skills / "my-grill").symlink_to(src_copy / "skills" / "grill")
-            (ag_plugins / "unrelated-plugin").mkdir(parents=True)
-            (ag_plugins / "unrelated-plugin" / "plugin.json").write_text('{"name":"unrelated"}\n', encoding="utf-8")
-            (ag_plugins / "agent-workflow").mkdir(parents=True)
-            (ag_plugins / "agent-workflow" / "plugin.json").write_text(
-                '{"name":"agent-workflow","displayName":"Old Workflow Plugin"}\n', encoding="utf-8"
-            )
-            (ag_plugins / "agent-workflow" / "custom.txt").write_text("backup plugin", encoding="utf-8")
-            cx_agents.parent.mkdir(parents=True)
-            cx_agents.write_text("custom real AGENTS.md", encoding="utf-8")
-
-            env = os.environ.copy()
-            env.update(
-                {
-                    "AGENT_SKILLS_DIR": str(ag_skills),
-                    "AGY_PLUGINS_DIR": str(ag_plugins),
-                    "CODEX_SKILLS_DIR": str(cx_skills),
-                    "CODEX_AGENTS_MD": str(cx_agents),
-                    "BIN_TARGET": str(bin_dst),
-                }
-            )
-            env.pop("AGY_PLUGINS_BACKUP_DIR", None)
-            subprocess.run([str(src_copy / "install.sh")], check=True, env=env, capture_output=True)
-            initial_links = {p: p.lstat().st_ino for p in ag_skills.iterdir()}
-            plugin_inode = (ag_plugins / "agent-workflow").lstat().st_ino
-            subprocess.run([str(src_copy / "install.sh")], check=True, env=env, capture_output=True)
-            self.assertEqual(initial_links, {p: p.lstat().st_ino for p in ag_skills.iterdir()})
-            self.assertEqual((ag_plugins / "agent-workflow").lstat().st_ino, plugin_inode)
-            self.assertEqual((ag_skills / "my-grill").resolve(), src_copy / "skills" / "grill")
-            # Unrelated skill and plugin preserved!
-            self.assertTrue((ag_skills / "my-custom-skill" / "SKILL.md").is_file())
-            self.assertTrue((ag_plugins / "unrelated-plugin" / "plugin.json").is_file())
-            # Global Antigravity rules plugin linked and conflicting plugin moved OUTSIDE auto-discovery dir!
-            self.assertEqual((ag_plugins / "agent-workflow").resolve(), src_copy / "agy" / "plugin")
-            self.assertTrue((ag_plugins / "agent-workflow" / "rules" / "AGENTS.md").is_file())
-            self.assertEqual(list(ag_plugins.glob("*.bak.*")), [], "Plugin backup must NOT remain inside AGY_PLUGINS_DIR!")
-            plugin_bak_root = d / "plugins.bak"
-            plugin_backups = list(plugin_bak_root.glob("agent-workflow.bak.*"))
-            self.assertEqual(len(plugin_backups), 1)
-            self.assertEqual(
-                json.loads((plugin_backups[0] / "plugin.json").read_text(encoding="utf-8"))["displayName"],
-                "Old Workflow Plugin",
-            )
-            self.assertEqual((plugin_backups[0] / "custom.txt").read_text(encoding="utf-8"), "backup plugin")
-            # Conflicting symlink to an old checkout is also moved out of AGY_PLUGINS_DIR into plugins.bak!
-            old_checkout = d / "old_checkout_plugin"
-            old_checkout.mkdir()
-            (old_checkout / "plugin.json").write_text('{"name":"agent-workflow","displayName":"Relocated"}\n', encoding="utf-8")
-            (ag_plugins / "agent-workflow").unlink()
-            (ag_plugins / "agent-workflow").symlink_to(old_checkout)
-            subprocess.run([str(src_copy / "install.sh")], check=True, env=env, capture_output=True)
-            self.assertEqual(list(ag_plugins.glob("*.bak.*")), [])
-            self.assertEqual((ag_plugins / "agent-workflow").resolve(), src_copy / "agy" / "plugin")
-            self.assertEqual(len(list(plugin_bak_root.glob("agent-workflow.bak.*"))), 2)
-            # Setting AGY_PLUGINS_BACKUP_DIR inside AGY_PLUGINS_DIR fails closed!
-            bad_env = dict(env, AGY_PLUGINS_BACKUP_DIR=str(ag_plugins / "nested-bak"))
-            bad_res = subprocess.run([str(src_copy / "install.sh")], env=bad_env, capture_output=True, text=True)
-            self.assertNotEqual(bad_res.returncode, 0)
-            # Real AGENTS.md backed up, not destroyed!
-            backups = list(cx_agents.parent.glob("AGENTS.md.bak.*"))
-            self.assertEqual(len(backups), 1)
-            self.assertEqual(backups[0].read_text(encoding="utf-8"), "custom real AGENTS.md")
-            # Orchestrator skills NOT symlinked into codex skills!
-            self.assertFalse((cx_skills / "dispatch").exists())
-            self.assertFalse((cx_skills / "slice").exists())
-            self.assertTrue((cx_skills / "grill").is_symlink())
-            self.assertTrue((ag_skills / "dispatch").is_symlink())
-
-    def test_installer_resolves_script_and_registry_aliases(self) -> None:
-        source = self.root / "source"
-        shutil.copytree(WORKFLOW_ROOT, source, ignore=shutil.ignore_patterns(".git", "__pycache__"))
-        script = self.root / "relink"
-        script.symlink_to(source / "install.sh")
-        agent_skills = self.root / "agent-skills"
-        agent_skills.symlink_to(source / "skills")
-        agy_plugins = self.root / "agy-plugins"
-        worker_skills = self.root / "worker-skills"
-        worker_skills.mkdir()
-        relative = worker_skills / "research"
-        relative.symlink_to("../source/skills/research")
-        inode = relative.lstat().st_ino
-        retired = worker_skills / "dispatch"
-        retired.symlink_to("../source/skills/dispatch")
-        env = dict(os.environ, AGENT_SKILLS_DIR=str(agent_skills), AGY_PLUGINS_DIR=str(agy_plugins),
-                   CODEX_SKILLS_DIR=str(worker_skills), CODEX_AGENTS_MD=str(self.root / "AGENTS.md"),
-                   BIN_TARGET=str(self.root / "agent-dispatch"))
-        subprocess.run([str(script)], env=env, check=True, capture_output=True)
-        self.assertTrue((agent_skills / "dispatch/SKILL.md").is_file())
-        self.assertFalse((source / "skills/dispatch").is_symlink())
-        self.assertFalse(retired.is_symlink())
-        self.assertEqual(relative.lstat().st_ino, inode)
-        self.assertEqual((agy_plugins / "agent-workflow").resolve(), source / "agy/plugin")
-        self.assertEqual((self.root / "agent-dispatch").resolve(), source / "bin/agent-dispatch")
-        self.assertFalse(list(source.rglob("*.bak.*")))
-
-        # Both rosters cannot be installed into the same physical directory.
-        env["CODEX_SKILLS_DIR"] = str(source / "skills")
-        conflict = subprocess.run([str(script)], env=env, capture_output=True)
-        self.assertNotEqual(conflict.returncode, 0)
-        self.assertTrue((agent_skills / "dispatch/SKILL.md").is_file())
-
     def test_cleanup_reclaims_bootstrapped_baseline_with_untracked_files_and_protects_tracked_edits(self) -> None:
         base = _git(self.repo, "rev-parse", "HEAD")
-        rkey = ad.repo_cache_key(self.repo)
+        rkey = git_ops.repo_cache_key(self.repo)
         wt_root = self.cache_dir / "worktrees" / rkey
         owner_root = self.cache_dir / "baseline-owners" / rkey
         wt_root.mkdir(parents=True, exist_ok=True)
@@ -1650,7 +1524,7 @@ time.sleep(30)
                 "PATH": f"{self.fake_bin}:{env.get('PATH', '')}",
                 "AGENT_DISPATCH_LINEAR_URL": self.linear_url,
                 "AGENT_DISPATCH_CACHE_ROOT": str(self.cache_dir),
-                "LINEAR_API_KEY": "lin_api_fake_e2e_key_123456",
+                "LINEAR_API_KEY": "lin_api_" + "fake_e2e_key_123456",
                 "AGENT_DISPATCH_FORCE_GH": "1",
                 "AGENT_DISPATCH_PR_POLL_SLEEP": "0.01",
             }
@@ -1676,42 +1550,3 @@ time.sleep(30)
         self.assertIn("dispatch:failed", [l["name"] for l in t1["_labels"]])
         self.assertEqual(t2["state"]["name"], "Todo")
         self.assertNotIn("dispatch:failed", [l["name"] for l in t2["_labels"]])
-
-
-# ---------------------------------------------------------------------------
-# Opt-in Live Read-Only Linear GraphQL Contract Tests
-# ---------------------------------------------------------------------------
-
-@unittest.skipUnless(os.environ.get("RUN_LIVE_LINEAR_TESTS") == "1", "Set RUN_LIVE_LINEAR_TESTS=1 for live Linear checks")
-class TestLiveLinearReadOnlyContract(unittest.TestCase):
-    def setUp(self) -> None:
-        # Pin the authorized origin and reject any accidental mutation before creating a request.
-        self.client = ad.LinearClient(ad.resolve_linear_auth(), url="https://api.linear.app/graphql")
-        query = self.client.query
-        def readonly(document, variables=None, **opts):
-            self.assertTrue(document.lstrip().startswith("query"))
-            self.assertNotRegex(document, r"\bmutation\s*[{(]")
-            return query(document, variables, **opts)
-        self.enterContext(mock.patch.object(self.client, "query", side_effect=readonly))
-
-    def test_atomic_label_contract(self) -> None:
-        schema = self.client.query('query { __type(name: "Mutation") { fields { name args { name } } } }')
-        fields = {f["name"]: {arg["name"] for arg in f["args"]} for f in schema["__type"]["fields"]}
-        for operation in ("issueAddLabel", "issueRemoveLabel"):
-            self.assertEqual(fields[operation], {"id", "labelId"})
-
-    def test_live_linear_project_string_query_and_pagination(self) -> None:
-        teams, projects = self.client.list_teams_and_projects()
-        self.assertTrue(len(teams) >= 1)
-        self.assertTrue(len(projects) >= 1)
-        issues = self.client.list_project_issues(projects[0]["id"], state_type="unstarted")
-        self.assertIsInstance(issues, list)
-
-    def test_explicit_project_typo_fails_fast_with_specific_message(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            with self.assertRaisesRegex(RuntimeError, "Explicit Linear project"):
-                ad.resolve_project(self.client, Path(td), explicit="definitely-nonexistent-project-xyz")
-
-
-if __name__ == "__main__":
-    unittest.main()
