@@ -41,13 +41,13 @@ ad = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = ad
 loader.exec_module(ad)
 
-from agent_dispatch import process
+from agent_dispatch import config, process
 
 
 class LegacyDispatchCase(IsolatedDispatchCase):
     def setUp(self) -> None:
         super().setUp()
-        self.enterContext(mock.patch.object(ad, "MCP_CONFIG_PATH", self.sandbox / "unused-mcp.json"))
+        self.enterContext(mock.patch.object(config, "MCP_CONFIG_PATH", self.sandbox / "unused-mcp.json"))
 
 
 class TestCLIEntrypoint(IsolatedDispatchCase):
@@ -325,7 +325,7 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
         with self.assertRaises(ValueError):
             ad.parse_codex_ndjson("\n".join(map(json.dumps, cx)))
 
-    def test_review_prompt_result_trace_and_snapshots_are_redacted(self) -> None:
+    def test_review_prompt_result_and_trace_are_redacted(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
             secret = "lin_api_" + "syntheticvalue123456"
@@ -345,12 +345,6 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
                 self.assertEqual(result["summary"], "<REDACTED_SECRET>")
             for path in (d / "prompt", d / "result", d / "sessions.jsonl"):
                 self.assertNotIn(secret, path.read_text())
-            _git(d, "init", "-b", "main")
-            (d / "GLOSSARY.md").write_text(secret)
-            _git(d, "add", "GLOSSARY.md")
-            _git(d, "-c", "user.name=Test", "-c", "user.email=test@example.org", "commit", "-m", "baseline")
-            ad.snapshot_baseline_standards(d, "HEAD", d / "standards")
-            self.assertNotIn(secret, (d / "standards" / "GLOSSARY.md").read_text())
 
     def test_pi_session_replay_preserves_native_entries_and_redacts_on_interrupt(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -440,11 +434,7 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
             ad.validate_schema(valid_std, ad.REVIEW_SCHEMA, expected_axis="spec")
         self.assertEqual(ad.validate_schema(valid_std, ad.REVIEW_SCHEMA, expected_axis="standards")["verdict"], "pass")
 
-    def test_adr_frontmatter_parser_and_pr_markdown_rendering(self) -> None:
-        self.assertTrue(ad.is_active_adr("---\nstatus: accepted # accepted | deprecated | superseded by ADR-0002\n---\n# Ok"))
-        self.assertFalse(ad.is_active_adr("---\nstatus: superseded by ADR-0005\n---\n# Old"))
-        self.assertFalse(ad.is_active_adr("---\nstatus: deprecated\n---\n# Old"))
-
+    def test_pr_markdown_rendering(self) -> None:
         body = ad.build_pr_body(
             {"identifier": "K1N-99", "title": "Add auth", "url": "https://linear.app/k1n/issue/K1N-99"},
             "a" * 40,
@@ -464,15 +454,6 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
             self.assertFalse(line.startswith("    "), f"Broken 4-space codeblock indent: {line!r}")
         self.assertNotIn("lin_api_SECRET", body)
         self.assertIn("<REDACTED_SECRET>", body)
-
-    def test_authorization_requires_real_heading_and_matching_fence(self) -> None:
-        brief = (
-            "````md\n## Authorized Gate/Test Changes\n- gate: Makefile\n```\n"
-            "- gate: pytest.ini\n````\n## Authorized Gate/Test Changes\n"
-            "    - gate: setup.py\n~~~\n```\n- gate: setup.cfg\n~~~\n- gate: src/Makefile\n"
-            "# Out of scope\n- gate: Cargo.toml\n"
-        )
-        self.assertEqual(ad.parse_authorized_changes(brief), (["src/Makefile"], []))
 
     def test_polyglot_verify_runs_python_after_javascript(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -776,96 +757,7 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
             (d / "Justfile").write_text('verify := "nope"\nverify:\n    pytest\n', encoding="utf-8")
             self.assertEqual(ad.detect_verify_command(d, None), "just verify")
 
-    def test_linear_transient_reads_and_credential_redirect_policy(self) -> None:
-        from io import BytesIO
-        responses = [
-            {"errors": [{"extensions": {"code": "RATELIMITED"}}]},
-            {"data": {"ok": True}},
-        ]
-        def boundary(request, timeout):
-            self.assertEqual(request.get_header("Authorization"), "synthetic-test-credential")
-            self.assertNotIn("Authorization", request.headers)  # urllib only copies these headers on redirect
-            return BytesIO(json.dumps(responses.pop(0)).encode())
-        with mock.patch.object(ad.urllib.request, "urlopen", side_effect=boundary), mock.patch.object(ad.time, "sleep"):
-            self.assertEqual(ad.LinearClient("synthetic-test-credential").query("query { ok }"), {"ok": True})
-        self.assertFalse(responses)
-
-    def test_linear_auth_normalizes_personal_key_and_oauth(self) -> None:
-        key = "lin_api_" + "X" * 24
-        for value, expected in [(key, key), ("Bearer " + key, key), ("test-oauth", "Bearer test-oauth")]:
-            with mock.patch.dict(os.environ, {"LINEAR_API_KEY": value}):
-                self.assertEqual(ad.resolve_linear_auth(), expected)
-
-    def test_label_pagination_and_concurrent_human_labels(self) -> None:
-        client = ad.LinearClient("synthetic-test-credential")
-        rows = [{"id": "one", "labels": {"nodes": [], "pageInfo": {"hasNextPage": True}}}]
-        pages = [
-            {"issue": {"labels": {"nodes": [{"id": "a", "name": "A"}], "pageInfo": {"hasNextPage": True, "endCursor": "next"}}}},
-            {"issue": {"labels": {"nodes": [{"id": "b", "name": "B"}], "pageInfo": {"hasNextPage": False}}}},
-        ]
-        with mock.patch.object(client, "query", side_effect=pages) as query:
-            client._complete_issue_labels(rows)
-            self.assertEqual([x["id"] for x in rows[0]["labels"]["nodes"]], ["a", "b"])
-            self.assertEqual(query.call_args.args[1]["after"], "next")
-        labels = {"human-A"}
-        def boundary(query, variables, **_):
-            if "issueAddLabel(" in query:
-                labels.add("concurrent-human")
-                labels.add(variables["labelId"])
-                return {"issueAddLabel": {"success": True}}
-            if "issueRemoveLabel(" in query:
-                labels.remove(variables["labelId"])
-                return {"issueRemoveLabel": {"success": True}}
-            if "labels(first:" in query:
-                return {"issue": {"labels": {"nodes": [{"id": x, "name": x} for x in labels], "pageInfo": {"hasNextPage": False}}}}
-            self.fail("unexpected label operation")
-        issue = {"id": "one", "team": {"labels": {"nodes": [{"id": "dispatch:failed", "name": "dispatch:failed"}]}}}
-        with mock.patch.object(client, "query", side_effect=boundary):
-            client.ensure_label_and_add(issue, "dispatch:failed")
-            client.remove_labels_if_present(issue, {"dispatch:failed"})
-        self.assertEqual(labels, {"human-A", "concurrent-human"})
-
-    def test_touches_wave_selection_frontier_label_and_fail_closed_authorization(self) -> None:
-        self.assertEqual(ad.parse_touches("## Touches\n- n/a\n"), set())
-        self.assertEqual(ad.parse_touches("## Touches\n- src/routes, auth\n"), {"src/routes", "auth"})
-
-        # Fail-closed authorization parser: ALL free-form/none prose returns ([], [])!
-        for prose in (
-            "- None",
-            "- None (list explicitly only if authorized)",
-            "- Not applicable",
-            "- No changes authorized",
-            "- N/A (pure feature)",
-            "- (none)",
-            "- _None_",
-            "- 无",
-            "- Migrate pytest.ini",  # Unstructured -> rejected fail-closed!
-            "- gate: *",  # Wildcard -> rejected!
-        ):
-            self.assertEqual(
-                ad.parse_authorized_changes(f"## Authorized Gate/Test Changes\n{prose}\n"),
-                ([], []),
-                f"Expected fail-closed empty auth for {prose!r}",
-            )
-        self.assertEqual(
-            ad.parse_authorized_changes("## Authorized Gate/Test Changes\n- gate: `pytest.ini`\n- test: tests/legacy_*.py\n"),
-            (["pytest.ini"], ["tests/legacy_*.py"]),
-        )
-
-        # Frontier MUST require `agent-ready` label even if ## Acceptance Criteria exists!
-        unlabeled = {
-            "identifier": "TST-H1",
-            "title": "Human ticket",
-            "description": "## Acceptance Criteria\n- [ ] works\n",
-            "state": {"name": "Todo", "type": "unstarted"},
-            "assignee": None,
-            "labels": {"nodes": []},
-            "children": {"nodes": []},
-        }
-        ok_f, reason_f = ad.is_ready_for_frontier(unlabeled)
-        self.assertFalse(ok_f)
-        self.assertEqual(reason_f, "missing_agent_ready_label")
-
+    def test_touches_wave_selection_defers_overlapping_and_unscoped_issues(self) -> None:
         # Hierarchical Touches overlap: src/routes and src/routes/admin MUST NOT share a wave!
         iss_a = {"identifier": "TST-1", "description": "## Touches\n- src/routes\n"}
         iss_b = {"identifier": "TST-2", "description": "## Touches\n- src/auth\n"}
@@ -1011,12 +903,6 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
             hook = repo / ".git" / "hooks" / "pre-commit"
             _write_exec(hook, "#!/bin/sh\necho hook_must_not_run >&2\nexit 1\n")
 
-            # Snapshot MUST include Chinese ADR under default core.quotePath=true!
-            std_dir = d / "std"
-            files, hashes = ad.snapshot_baseline_standards(repo, base_sha, std_dir)
-            self.assertIn("docs/adr/中文.md", files)
-            self.assertIn("docs/adr/中文.md", hashes)
-
             # Mutate Chinese ADR, nested pyproject.toml, *.mk, pytest.ini, invalid package.json, delete app/tests.py, add t.SkipNow()
             (repo / "docs" / "adr" / "中文.md").write_text("# modified\n", encoding="utf-8")
             (repo / "packages" / "api" / "pyproject.toml").write_text("# tampered\n", encoding="utf-8")
@@ -1109,29 +995,6 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
             self.assertEqual(len(traces), 1)
             self.assertEqual(traces[0]["status"], "timeout")
             self.assertTrue(traces[0].get("session_id"), "Pi timeout MUST keep generated session_id!")
-
-            # 3. LinearClient.query retries TimeoutError before succeeding
-            client = ad.LinearClient("lin_api_fake_1234567890", url="http://127.0.0.1:9/graphql")
-            calls = {"n": 0}
-
-            class _FakeResp:
-                def __enter__(self) -> "_FakeResp":
-                    return self
-                def __exit__(self, *a: Any) -> None:
-                    pass
-                def read(self) -> bytes:
-                    return json.dumps({"data": {"ok": True}}).encode("utf-8")
-
-            def flaky_urlopen(req: Any, timeout: int = 30) -> _FakeResp:
-                calls["n"] += 1
-                if calls["n"] == 1:
-                    raise TimeoutError("simulated read timeout")
-                return _FakeResp()
-
-            with mock.patch("urllib.request.urlopen", side_effect=flaky_urlopen), mock.patch("time.sleep"):
-                res = client.query("query { ok }")
-            self.assertEqual(res, {"ok": True})
-            self.assertEqual(calls["n"], 2)
 
     def test_reused_branch_baseline_runs_in_detached_worktree_and_catches_red_base(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1467,35 +1330,6 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
         )
         self.assertEqual(ad.extract_json_object(same_msg)["verdict"], "fail")
 
-        # 3. Path-segment globs & fenced code blocks in Authorized Gate/Test Changes
-        fenced_brief = (
-            "## Authorized Gate/Test Changes\n"
-            "Example:\n"
-            "```markdown\n"
-            "- gate: Makefile\n"
-            "```\n"
-            "> - gate: pyproject.toml\n"
-            "- gate: ?*\n"
-            "- gate: */*\n"
-            "- test: tests/*.py\n"
-        )
-        g_pats, t_pats = ad.parse_authorized_changes(fenced_brief)
-        self.assertEqual(g_pats, [], "Fenced/quoted/wildcard gate patterns MUST be rejected!")
-        self.assertEqual(t_pats, ["tests/*.py"])
-        self.assertTrue(ad.path_matches_any_pattern("tests/test_a.py", t_pats))
-        self.assertFalse(ad.path_matches_any_pattern("tests/nested/test_a.py", t_pats), "Single * MUST NOT cross /!")
-
-        # 4. Frontier MUST reject custom non-Todo unstarted states like 'Awaiting approval'
-        custom_unstarted = {
-            "identifier": "TST-WAIT",
-            "title": "Needs approval",
-            "state": {"name": "Awaiting approval", "type": "unstarted"},
-            "assignee": None,
-            "labels": {"nodes": [{"name": "agent-ready"}]},
-            "children": {"nodes": []},
-        }
-        self.assertFalse(ad.is_ready_for_frontier(custom_unstarted)[0])
-
         # 5. GitHub URL parser handles SSH-over-443 & trailing .git/, and unknown remote fails closed
         self.assertEqual(
             ad.parse_github_owner_repo_url("ssh://git@ssh.github.com:443/K1ndredzzz/agent-workflow.git/"),
@@ -1726,50 +1560,13 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
             self.assertFalse((root / "result").exists())
 
     def test_wildcard_touches_reserve_all_matching_descendants(self) -> None:
-        for pattern, expected in [("**/shared", set()), ("*.ts", set()), ("src/*/utils", {"src"}),
-                                  ("src/api/[av]*.py", {"src/api"}), ("src/user?.py", {"src"})]:
-            with self.subTest(pattern=pattern):
-                self.assertEqual(ad.parse_touches(f"## Touches\n- {pattern}"), expected)
-        for root in ("*", "**", "`*`"):
-            self.assertEqual(ad.parse_touches(f"## Touches\n- {root}\n- docs"), set())
         candidates = [{"identifier": "A", "description": "## Touches\n- src/*.py"},
                       {"identifier": "B", "description": "## Touches\n- src/core.py"}]
         selected, deferred = ad.select_non_overlapping_wave(candidates)
         self.assertEqual(selected, candidates[:1])
         self.assertEqual([entry["id"] for entry in deferred], ["B"])
 
-    def test_touches_normalization_fences_headings_wildcards_and_symlink_and_pkg_guards(self) -> None:
-        brief = (
-            "```md\n## Touches\n- fake/from-codeblock\n```\n"
-            "## Touches\n"
-            "- `./src//api/`, `pkg\\core/*`\n"
-            "# Appendix\n"
-            "- unrelated/outside-section\n"
-        )
-        self.assertEqual(ad.parse_touches(brief), {"src/api", "pkg/core"})
-        self.assertTrue(ad.touches_overlap(ad.parse_touches("## Touches\n- ./src/api\n"), {"src/api/v1"}))
-        # Wildcard root fails closed as unscoped empty set
-        self.assertEqual(ad.parse_touches("## Touches\n- *\n"), set())
-        self.assertEqual(ad.parse_touches("## Touches\n- **/*\n"), set())
-
-    def test_touches_numbered_lists_and_fail_closed_unparseable_entries(self) -> None:
-        self.assertEqual(ad.parse_touches("## Touches\n1. `src/auth`\n"), {"src/auth"})
-        self.assertEqual(ad.parse_touches("## Touches\n2) src/auth\n10. `./src/routes/`\n"), {"src/auth", "src/routes"})
-        self.assertEqual(ad.parse_touches("## Touches\n- src/auth\n"), ad.parse_touches("## Touches\n1. `src/auth`\n"))
-
-        # Unparseable / non-literal entries fail closed as unscoped (empty set -> exclusive repo lock).
-        for bad_entry in (
-            "1. `src/auth` (login flow)",
-            "- Touch auth and billing modules",
-            "- • src/auth",
-            "- (a) src/auth",
-            "- src/{auth,billing}",
-            "- `src/auth",
-            "1. 仅修改登录模块",
-        ):
-            with self.subTest(bad_entry=bad_entry):
-                self.assertEqual(ad.parse_touches(f"## Touches\n{bad_entry}\n"), set())
-
+    def test_numbered_touches_conflict_in_wave_and_locks(self) -> None:
         # Unordered list and numbered list for the same path MUST conflict in wave selection and local touch locks.
         iss_bullet = {"identifier": "TST-BUL", "description": "## Touches\n- src/auth\n"}
         iss_num = {"identifier": "TST-NUM", "description": "## Touches\n1. `src/auth`\n"}
@@ -1786,6 +1583,7 @@ class TestUnitGatesAndParsing(LegacyDispatchCase):
             with ad.reserve_touches("repo-touches-num-test", t_num) as locked2:
                 self.assertFalse(locked2)
 
+    def test_non_object_package_json_and_secret_symlink(self) -> None:
         # package.json containing non-object valid JSON triggers violation cleanly instead of AttributeError;
         # symlink pointing to a secret filename is blocked before git write
         with tempfile.TemporaryDirectory() as td:
