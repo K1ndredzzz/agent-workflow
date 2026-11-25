@@ -8,28 +8,26 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
-import http.server
 import importlib.machinery
 import importlib.util
 import json
 import os
 import shutil
 import signal
-import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from helpers import FakeLinearState, IsolatedDispatchCase, WORKFLOW_ROOT, _git, _write_exec, start_fake_linear
+
 # Prevent SourceFileLoader from leaving .pyc artifacts inside bin/__pycache__
 sys.dont_write_bytecode = True
 
-WORKFLOW_ROOT = Path(__file__).resolve().parent.parent
 BIN_PATH = WORKFLOW_ROOT / "bin" / "agent-dispatch"
 INSTALL_SH = WORKFLOW_ROOT / "install.sh"
 
@@ -40,221 +38,13 @@ ad = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = ad
 loader.exec_module(ad)
 
-
-def _git(cwd: Path, *args: str, check: bool = True) -> str:
-    return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *args], cwd=str(cwd), text=True, capture_output=True, check=check).stdout.strip()
+from agent_dispatch import process
 
 
-def _write_exec(path: Path, body: str) -> None:
-    path.write_text(body, encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-
-
-# ---------------------------------------------------------------------------
-# Local HTTP FakeLinear Server for True Subprocess E2E Fault Injection
-# ---------------------------------------------------------------------------
-
-class FakeLinearState:
-    def __init__(self, project_name: str = "demo-repo") -> None:
-        self.project = {"id": "proj-1", "name": project_name, "state": "started", "teams": {"nodes": [{"id": "team-1", "key": "TST", "name": "Test"}]}}
-        self.states = [
-            {"id": "st-backlog", "name": "Backlog", "type": "backlog"},
-            {"id": "st-todo", "name": "Todo", "type": "unstarted"},
-            {"id": "st-prog", "name": "In Progress", "type": "started"},
-            {"id": "st-rev", "name": "In Review", "type": "started"},
-            {"id": "st-done", "name": "Done", "type": "completed"},
-            {"id": "st-canceled", "name": "Canceled", "type": "canceled"},
-        ]
-        self.team_labels: list[dict[str, str]] = [
-            {"id": "lbl-ready", "name": "agent-ready"},
-        ]
-        self.issues: dict[str, dict[str, Any]] = {}
-        self.comments: dict[str, list[dict[str, Any]]] = {}
-        self.fail_next_comment_create = False
-        self.fail_next_state_update = False
-        self.outage_flag_file: Path | None = None
-        self.mutation_log: list[tuple[str, dict[str, Any]]] = []
-        self._tick = 1
-
-    def add_issue(
-        self,
-        identifier: str,
-        title: str,
-        description: str,
-        *,
-        state_name: str = "Todo",
-        labels: list[str] | None = None,
-        uuid_str: str | None = None,
-    ) -> dict[str, Any]:
-        st = next(s for s in self.states if s["name"] == state_name)
-        uid = uuid_str or f"uuid-{identifier.lower()}"
-        lbl_objs = []
-        for ln in labels or []:
-            ex = next((l for l in self.team_labels if l["name"] == ln), None)
-            if not ex:
-                ex = {"id": f"lbl-{len(self.team_labels)+1}", "name": ln}
-                self.team_labels.append(ex)
-            lbl_objs.append(ex)
-        iss = {
-            "id": uid,
-            "identifier": identifier,
-            "title": title,
-            "description": description,
-            "url": f"https://linear.app/tst/issue/{identifier}",
-            "priority": 2,
-            "updatedAt": f"2026-11-24T00:00:{self._tick:02d}Z",
-            "assignee": None,
-            "state": st,
-            "team": {"id": "team-1", "key": "TST", "name": "Test"},
-            "project": {"id": self.project["id"], "name": self.project["name"]},
-            "parent": None,
-            "_labels": lbl_objs,
-            "_inverseRelations": [],
-            "_children": [],
-        }
-        self._tick += 1
-        self.issues[uid] = iss
-        self.issues[identifier] = iss
-        self.comments.setdefault(uid, [])
-        return iss
-
-    def get_issue(self, key: str) -> dict[str, Any] | None:
-        return self.issues.get(key)
-
-    def handle(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
-        if self.outage_flag_file and self.outage_flag_file.exists():
-            return {"errors": [{"message": "Simulated Linear API/network outage"}]}
-        if "teams(first:" in query:
-            return {"data": {"teams": {"nodes": [{"id": "team-1", "key": "TST", "name": "Test"}], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}
-        if "projects(first:" in query:
-            return {"data": {"projects": {"nodes": [self.project], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}
-        if "team(id: $id)" in query and "states(first:" in query:
-            return {"data": {"team": {"states": {"nodes": self.states, "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}
-        if "team(id: $id)" in query and "labels(first:" in query:
-            return {"data": {"team": {"labels": {"nodes": self.team_labels, "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}
-        if "project(id: $projectId)" in query:
-            uniq = list({v["id"]: v for v in self.issues.values()}.values())
-            st_type = variables.get("stateType")
-            if st_type:
-                uniq = [i for i in uniq if i["state"]["type"] == st_type]
-            nodes = [
-                {
-                    **{k: v for k, v in i.items() if not k.startswith("_")},
-                    "labels": {"nodes": i["_labels"], "pageInfo": {"hasNextPage": False}},
-                    "children": {"nodes": i["_children"]},
-                }
-                for i in uniq
-            ]
-            return {"data": {"project": {"id": self.project["id"], "name": self.project["name"], "issues": {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}
-        if "issueLabels(filter:" in query:
-            return {"data": {"issueLabels": {"nodes": []}}}
-        if "mutation" in query and ("issueAddLabel(" in query or "issueRemoveLabel(" in query):
-            iss = self.get_issue(variables["id"])
-            label = next(l for l in self.team_labels if l["id"] == variables["labelId"])
-            if "issueAddLabel(" in query:
-                if label not in iss["_labels"]:
-                    iss["_labels"].append(label)
-                operation, event = "issueAddLabel", "addLabels"
-            else:
-                iss["_labels"] = [l for l in iss["_labels"] if l["id"] != label["id"]]
-                operation, event = "issueRemoveLabel", "removeLabels"
-            self.mutation_log.append((event, {"id": iss["identifier"], "labels": [l["name"] for l in iss["_labels"]]}))
-            return {"data": {operation: {"success": True}}}
-        if "mutation" in query and "issueLabelCreate" in query:
-            name = variables["name"]
-            ex = next((l for l in self.team_labels if l["name"].lower() == name.lower()), None)
-            if not ex:
-                ex = {"id": f"lbl-{len(self.team_labels)+1}", "name": name}
-                self.team_labels.append(ex)
-            self.mutation_log.append(("issueLabelCreate", {"name": name}))
-            return {"data": {"issueLabelCreate": {"success": True, "issueLabel": ex}}}
-        if "mutation" in query and "issueUpdate" in query:
-            iss = self.get_issue(variables["id"])
-            assert iss is not None
-            if "stateId" in variables:
-                if self.fail_next_state_update:
-                    self.fail_next_state_update = False
-                    return {"data": {"issueUpdate": {"success": False, "issue": None}}}
-                st = next(s for s in self.states if s["id"] == variables["stateId"])
-                iss["state"] = st
-                self._tick += 1
-                iss["updatedAt"] = f"2026-11-24T00:00:{self._tick:02d}Z"
-                self.mutation_log.append(("state", {"id": iss["identifier"], "state": st["name"]}))
-                return {"data": {"issueUpdate": {"success": True, "issue": {"id": iss["id"], "identifier": iss["identifier"], "updatedAt": iss["updatedAt"], "state": st}}}}
-        if "mutation" in query and "commentCreate" in query:
-            if self.fail_next_comment_create:
-                self.fail_next_comment_create = False
-                return {"errors": [{"message": "Simulated transient Linear comment failure"}]}
-            uid = variables["issueId"]
-            cid = f"cmt-{len(self.comments.setdefault(uid, []))+1}"
-            self.comments[uid].append({"id": cid, "body": variables["body"], "createdAt": f"2026-11-24T00:01:{len(self.comments[uid]):02d}Z", "user": {"name": "bot"}})
-            self.mutation_log.append(("commentCreate", {"issueId": uid}))
-            return {"data": {"commentCreate": {"success": True, "comment": {"id": cid}}}}
-        if "issue(id: $id)" in query:
-            iss = self.get_issue(variables["id"])
-            if not iss:
-                return {"data": {"issue": None}}
-            if "labels(first:" in query:
-                return {"data": {"issue": {"labels": {"nodes": iss["_labels"], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}
-            if "comments(first:" in query:
-                return {"data": {"issue": {"comments": {"nodes": self.comments[iss["id"]], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}
-            if "inverseRelations(first:" in query:
-                return {"data": {"issue": {"inverseRelations": {"nodes": iss["_inverseRelations"], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}
-            if "children(first:" in query:
-                return {"data": {"issue": {"children": {"nodes": iss["_children"], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}
-            if "{ updatedAt }" in query:
-                return {"data": {"issue": {"updatedAt": iss["updatedAt"]}}}
-            return {"data": {"issue": {k: v for k, v in iss.items() if not k.startswith("_")}}}
-        return {"errors": [{"message": f"Unhandled fake query: {query[:120]}"}]}
-
-
-def start_fake_linear(state: FakeLinearState) -> tuple[http.server.ThreadingHTTPServer, str]:
-    lock = threading.Lock()
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length", "0"))
-            body = json.loads(self.rfile.read(length).decode("utf-8"))
-            with lock:
-                resp = state.handle(body.get("query", ""), body.get("variables") or {})
-                data = json.dumps(resp).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-        def log_message(self, format: str, *args: Any) -> None:
-            pass
-
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    port = srv.server_address[1]
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    return srv, f"http://127.0.0.1:{port}/graphql"
-
-
-# ---------------------------------------------------------------------------
-# Unit Tests: Schemas, Regexes, False Positives, Gates & Touches
-# ---------------------------------------------------------------------------
-
-class IsolatedDispatchCase(unittest.TestCase):
+class LegacyDispatchCase(IsolatedDispatchCase):
     def setUp(self) -> None:
         super().setUp()
-        sandbox = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(sandbox),
-            "PATH": os.defpath + ":/usr/local/bin",
-            "LC_ALL": "C.UTF-8",
-            "AGENT_DISPATCH_CACHE_ROOT": str(sandbox / "cache"),
-            "AGENT_DISPATCH_LINEAR_URL": "http://127.0.0.1:1/graphql",
-            "LINEAR_API_KEY": "synthetic-test-credential",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_ALLOW_PROTOCOL": "file",
-            "PYTHONDONTWRITEBYTECODE": "1",
-        }, clear=True))
-        self.enterContext(mock.patch.object(ad, "MCP_CONFIG_PATH", sandbox / "unused-mcp.json"))
+        self.enterContext(mock.patch.object(ad, "MCP_CONFIG_PATH", self.sandbox / "unused-mcp.json"))
 
 
 class TestCLIEntrypoint(IsolatedDispatchCase):
@@ -269,19 +59,7 @@ class TestCLIEntrypoint(IsolatedDispatchCase):
                     self.assertIn("usage: agent-dispatch", result.stdout)
 
 
-class TestUnitGatesAndParsing(IsolatedDispatchCase):
-    def test_api_key_headers_are_redacted_in_streamed_logs(self) -> None:
-        token = "opaque" + "-synthetic!value"
-        with tempfile.TemporaryDirectory() as td:
-            folder = Path(td)
-            for header in ("X-API-Key", "x-goog-api-key", "X-Api-kEy"):
-                event = {"request": {"headers": {header: token}}, "status": "ok"}
-                plain = f"Request header: {header}: {token}"
-                with contextlib.ExitStack() as stack:
-                    writer = ad._RedactedLog(folder / "log", stack)
-                    writer.write((plain + "\n" + json.dumps(event) + "\n").encode())
-                self.assertNotIn(token, (folder / "log").read_text())
-
+class TestUnitGatesAndParsing(LegacyDispatchCase):
     def test_raw_http_credentials_are_redacted_before_logging_and_git_write(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td) / "repo"
@@ -298,7 +76,7 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                     self.assertTrue(ad._scan_before_git_write(repo))
                     with contextlib.ExitStack() as stack:
                         log = Path(td) / "request.log"
-                        writer = ad._RedactedLog(log, stack)
+                        writer = process.RedactedLog(log, stack)
                         writer.write(line.encode())
                     self.assertNotIn(value.split()[-1], log.read_text())
 
@@ -455,7 +233,7 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                      "description": "Support bearer authentication"}
             log = folder / "log"
             with contextlib.ExitStack() as stack:
-                writer = ad._RedactedLog(log, stack)
+                writer = process.RedactedLog(log, stack)
                 writer.write((json.dumps(event) + "\n").encode())
             ad.append_session_trace(folder, event, None)
             for path in (log, folder / "sessions.jsonl"):
@@ -544,29 +322,6 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
         with self.assertRaises(ValueError):
             ad.parse_codex_ndjson("\n".join(map(json.dumps, cx)))
 
-    def test_streamed_logs_redact_credentials_before_persistence_and_on_timeout(self) -> None:
-        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"UNIT_API_KEY": "synthetic-opaque-value"}):
-            d = Path(td)
-            payload = ("Bearer invented-only-example\n" + os.environ["UNIT_API_KEY"] + "\n"
-                       + "-----BEGIN " + "PRIVATE KEY-----\n" + "example-key-body\n"
-                       + "-----END " + "PRIVATE KEY-----\n")
-            code = ("import os,sys,time\nfor line in sys.stdin.buffer:\n"
-                    " for fd in (1,2):\n  os.write(fd,line[:5]); os.write(fd,line[5:])\n")
-            for timeout in (False, True):
-                args = [sys.executable, "-B", "-c", code + ("time.sleep(10)" if timeout else "")]
-                kw = dict(stdin_text=payload, cwd=d, stdout_path=d / "out", stderr_path=d / "err",
-                          timeout=0.5 if timeout else 5)
-                if timeout:
-                    with self.assertRaises(subprocess.TimeoutExpired):
-                        ad.run_cmd(args, **kw)
-                else:
-                    ad.run_cmd(args, **kw)
-                for file in (d / "out", d / "err"):
-                    body = file.read_text()
-                    self.assertIn("<REDACTED_SECRET>", body)
-                    for secret in ("invented-only-example", "example-key-body", os.environ["UNIT_API_KEY"]):
-                        self.assertNotIn(secret, body)
-
     def test_review_prompt_result_trace_and_snapshots_are_redacted(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
@@ -593,18 +348,6 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
             _git(d, "-c", "user.name=Test", "-c", "user.email=test@example.org", "commit", "-m", "baseline")
             ad.snapshot_baseline_standards(d, "HEAD", d / "standards")
             self.assertNotIn(secret, (d / "standards" / "GLOSSARY.md").read_text())
-
-    def test_child_git_config_cannot_inherit_auth_rewrites_or_env_overrides(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            d = Path(td)
-            (d / ".gitconfig").write_text('[url "https://fictional-token@invalid.example/"]\n    insteadOf = local:!\n')
-            with mock.patch.dict(os.environ, {"HOME": td, "AGENT_DISPATCH_CACHE_ROOT": str(d / "cache"),
-                                               "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_VALUE_0": "fictional-token",
-                                               "GIT_CONFIG_KEY_0": "http.extraHeader", "GIT_TRACE": "1"}):
-                env = ad.build_child_env()
-            self.assertFalse({"GIT_CONFIG_COUNT", "GIT_CONFIG_VALUE_0", "GIT_TRACE"} & env.keys())
-            self.assertEqual(Path(env["GIT_CONFIG_GLOBAL"]).read_text(), "")
-            self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
 
     def test_pi_session_replay_preserves_native_entries_and_redacts_on_interrupt(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -718,31 +461,6 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
             self.assertFalse(line.startswith("    "), f"Broken 4-space codeblock indent: {line!r}")
         self.assertNotIn("lin_api_SECRET", body)
         self.assertIn("<REDACTED_SECRET>", body)
-
-    def test_child_env_stripping_isolated_without_polluting_os_environ(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            with mock.patch.dict(
-                os.environ,
-                {
-                    "AGENT_DISPATCH_CACHE_ROOT": td,
-                    "LINEAR_API_KEY": "lin_api_test1234567890",
-                    "GH_TOKEN": "gho_1234567890123456789012345",
-                    "GITHUB_TOKEN": "ghp_1234567890123456789012345",
-                    "SSH_AUTH_SOCK": "/tmp/fake-ssh.sock",
-                    "CODEX_SUB2API_API_KEY": "sub2api_test_key",
-                },
-            ):
-                child_env = ad.build_child_env(role="child")
-                self.assertEqual(child_env["AGENT_DISPATCH_CHILD"], "1")
-                self.assertEqual(child_env["GIT_TERMINAL_PROMPT"], "0")
-                self.assertTrue(child_env["GH_CONFIG_DIR"].startswith(td))
-                for k in ("LINEAR_API_KEY", "GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "CODEX_SUB2API_API_KEY"):
-                    self.assertNotIn(k, child_env)
-                codex_env = ad.build_child_env(role="codex")
-                self.assertIn("CODEX_SUB2API_API_KEY", codex_env)
-                self.assertNotIn("LINEAR_API_KEY", codex_env)
-                self.assertNotIn("GH_TOKEN", codex_env)
-                self.assertNotIn("SSH_AUTH_SOCK", codex_env)
 
     def test_authorization_requires_real_heading_and_matching_fence(self) -> None:
         brief = (
@@ -983,8 +701,11 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
             self.assertEqual(tracked.read_text(), "base")
             _git(repo, "reset", "--", "tracked.txt")
             (repo / "safe.txt").write_text("save me")
-            with mock.patch.object(ad, "_SHUTDOWN_SIGNAL", signal.SIGHUP):
+            process.request_shutdown(signal.SIGHUP)
+            try:
                 ad._stash_dirty_worktree_for_safe_rerun(repo, "halt")
+            finally:
+                process.reset_shutdown()
             self.assertIn("halt", _git(repo, "stash", "list"))
             self.assertEqual(_git(repo, "show", "stash^3:safe.txt"), "save me")
 
@@ -1071,14 +792,6 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
         for value, expected in [(key, key), ("Bearer " + key, key), ("test-oauth", "Bearer test-oauth")]:
             with mock.patch.dict(os.environ, {"LINEAR_API_KEY": value}):
                 self.assertEqual(ad.resolve_linear_auth(), expected)
-
-    def test_shutdown_interrupts_contended_file_lock(self) -> None:
-        path = Path(os.environ["AGENT_DISPATCH_CACHE_ROOT"]) / "verify.lock"
-        with ad.file_lock(path):
-            with mock.patch.object(ad, "_SHUTDOWN_SIGNAL", signal.SIGTERM):
-                with self.assertRaises(SystemExit):
-                    with ad.file_lock(path):
-                        self.fail("shutdown waiter acquired the lock")
 
     def test_label_pagination_and_concurrent_human_labels(self) -> None:
         client = ad.LinearClient("synthetic-test-credential")
@@ -1332,12 +1045,6 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
             with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CACHE_ROOT": str(d / "cache")}):
                 _, sec_hits2 = ad.orchestrator_commit(repo, "TST-99", "secret file test", 2)
             self.assertTrue(any("目录/.env" in x for x in sec_hits2), sec_hits2)
-
-            # Non-UTF-8 subprocess output MUST NOT raise UnicodeDecodeError!
-            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CACHE_ROOT": str(d / "cache")}):
-                res_bin = ad.run_cmd([sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'\\xffabc')"], env_role="orchestrator")
-            self.assertEqual(res_bin.returncode, 0)
-            self.assertIn("abc", res_bin.stdout)
 
     def test_pr_feedback_trust_filter_pi_timeout_trace_and_review_json_retry(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1668,8 +1375,7 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                     st["push_attempted"] = True
                     st["stage"] = "pushing"
                     ad.save_checkpoint(rd, lf, st)
-                    # Simulate REAL signal handler setting lock-free _SHUTDOWN_SIGNAL before raising!
-                    ad._SHUTDOWN_SIGNAL = signal.SIGINT
+                    process.request_shutdown(signal.SIGINT)
                     raise KeyboardInterrupt("Simulated SIGINT mid-push")
 
                 with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CACHE_ROOT": str(cache_dir)}):
@@ -1700,12 +1406,12 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                                         fresh=False,
                                     )
                             finally:
-                                ad._SHUTDOWN_SIGNAL = 0
+                                process.reset_shutdown()
                 rkey = ad.repo_cache_key(repo)
                 ckpt = json.loads((cache_dir / "runs" / rkey / "TST-SIG" / "latest.json").read_text(encoding="utf-8"))
                 self.assertEqual(ckpt["stage"], "pushing", "Publish-phase signal MUST NOT overwrite stage to 'error'!")
                 self.assertTrue(ckpt["push_attempted"])
-                # Even with REAL _SHUTDOWN_SIGNAL set, finally MUST write dispatch:publish-incomplete + comment!
+                # Even with shutdown requested, finally MUST write dispatch:publish-incomplete + comment!
                 self.assertEqual(iss["state"]["name"], "In Progress")
                 self.assertIn("dispatch:publish-incomplete", [l["name"] for l in iss["_labels"]])
                 self.assertNotIn("dispatch:failed", [l["name"] for l in iss["_labels"]])
@@ -1904,24 +1610,6 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                 with self.assertRaisesRegex(RuntimeError, "Multiple open PRs share head branch"):
                     ad.fetch_open_pr_for_branch(prepo, "org/repo", "feat/x")
 
-    def test_redacted_log_json_truncated_pem_does_not_drop_subsequent_lines(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            log_path = Path(td) / "stream.log"
-            payload = (
-                json.dumps({"type": "tool_result", "output": "-----BEGIN PRIVATE KEY-----\nMIIE_secret_body"}) + "\n"
-                + json.dumps({"type": "thread.started", "thread_id": "11111111-2222-3333-4444-555555555555"}) + "\n"
-                + "plain line after json\n"
-            )
-            with contextlib.ExitStack() as stack:
-                logger = ad._RedactedLog(log_path, stack)
-                logger.write(payload.encode("utf-8"))
-                logger.write(b"")
-            written = log_path.read_text(encoding="utf-8")
-            self.assertNotIn("MIIE_secret_body", written)
-            self.assertIn("<REDACTED_SECRET>", written)
-            self.assertIn("11111111-2222-3333-4444-555555555555", written)
-            self.assertIn("plain line after json", written)
-
     def test_harness_events_and_pi_archive_tolerate_malformed_lines_without_masking_errors(self) -> None:
         # Stray non-JSON line starting with '{' must not break NDJSON parsing
         verdict = json.dumps({"status": "completed"})
@@ -1950,42 +1638,6 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
             lines = [json.loads(line) for line in archive.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(len(lines), 2)
             self.assertEqual(lines[1]["id"], "m1")
-
-    def test_truncation_preserves_pem_redaction_and_bounds_unterminated_lines(self) -> None:
-        # Make the opening delimiter land in the discarded middle of the raw display buffer.
-        padding = "ordinary diagnostic\n" * 20
-        payload = padding + "-----BEGIN PRIVATE KEY-----\n" + "synthetic-pem-body\n" * 20 + "-----END PRIVATE KEY-----\nfinished\n"
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "verify.log"
-            with mock.patch.object(ad, "DISPLAY_OUTPUT_CAP", 256):
-                result = ad.run_cmd([sys.executable, "-B", "-c", "import sys; sys.stdout.write(sys.stdin.read())"],
-                                    stdin_text=payload, stdout_path=path)
-            for output in (path.read_text(), result.stdout):
-                self.assertNotIn("synthetic-pem-body", output)
-                self.assertIn("finished", output)
-            with contextlib.ExitStack() as stack, mock.patch.object(ad._RedactedLog, "line_limit", 64):
-                sink = ad._RedactedLog(path, stack)
-                for _ in range(100):
-                    sink.write(b"x" * 32)
-                    self.assertLessEqual(len(sink.pending), 64)
-                sink.write(b"-----BE")
-                sink.write(b"GIN PRIVATE KEY-----\nsynthetic-pem-body\n-----END PRIVATE KEY-----\nfinished\n")
-                sink.write(b"")
-            self.assertNotIn("synthetic-pem-body", path.read_text())
-            self.assertIn("oversized diagnostic line omitted", path.read_text())
-            self.assertIn("finished", path.read_text())
-
-            # Oversized CERTIFICATE block or oversized JSON containing a truncated PRIVATE KEY header
-            # must NOT permanently poison in_pem and drop subsequent lines!
-            with contextlib.ExitStack() as stack, mock.patch.object(ad._RedactedLog, "line_limit", 64):
-                sink = ad._RedactedLog(path, stack)
-                sink.write(b"x" * 70 + b"-----BEGIN CERTIFICATE-----\nkept after cert\n")
-                sink.write(b'{"type":"tool","out":"' + b"y" * 70 + b'-----BEGIN PRIVATE KEY-----\\nsecret"}\n')
-                sink.write(b'{"type":"thread.started","thread_id":"aaaa-bbbb"}\n')
-                sink.write(b"")
-            logged = path.read_text()
-            self.assertIn("kept after cert", logged)
-            self.assertIn("aaaa-bbbb", logged)
 
     def test_polyglot_python_tests_dir_does_not_block_frontend_lint_and_setup_files_edge_cases(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -2069,38 +1721,6 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
             self.assertEqual(end["status"], "error")
             self.assertEqual(end["session_id"], "11111111-2222-3333-4444")
             self.assertFalse((root / "result").exists())
-
-    def test_oversized_broken_json_hides_following_plain_pem_lines(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            log = Path(td) / "verify.log"
-            with contextlib.ExitStack() as stack:
-                sink = ad._RedactedLog(log, stack)
-                sink.write(b'{"error":"' + b"x" * sink.line_limit)
-                sink.write(b"-----BEGIN PRIV")
-                sink.write(b"ATE KEY-----\n")
-                sink.write(b"onlySyntheticBodyData\n-----END PRIVATE KEY-----\nsafe diagnostic\n")
-            self.assertNotIn("onlySyntheticBodyData", log.read_text())
-            self.assertIn("safe diagnostic", log.read_text())
-
-    def test_run_cmd_bounded_buffer_caps_memory_while_streaming_full_log(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            d = Path(td)
-            out_log = d / "out.log"
-            # Generate 16KB of numbered lines with a patched 2KB DISPLAY_OUTPUT_CAP
-            code = "for i in range(400):\n    print(f'line-{i:04d}-' + 'x' * 32)\n"
-            with mock.patch.object(ad, "DISPLAY_OUTPUT_CAP", 2048):
-                res = ad.run_cmd(
-                    [sys.executable, "-B", "-c", code],
-                    cwd=d,
-                    cap_output=True,
-                    stdout_path=out_log,
-                )
-            self.assertIn("...[truncated]...", res.stdout)
-            self.assertIn("line-0000-", res.stdout)
-            self.assertIn("line-0399-", res.stdout)
-            self.assertLessEqual(len(res.stdout), 2500)
-            # Full un-truncated output still streamed to disk log
-            self.assertEqual(len(out_log.read_text(encoding="utf-8").splitlines()), 400)
 
     def test_wildcard_touches_reserve_all_matching_descendants(self) -> None:
         for pattern, expected in [("**/shared", set()), ("*.ts", set()), ("src/*/utils", {"src"}),
@@ -2190,7 +1810,7 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
 # End-to-End Subprocess CLI Fault-Injection Suite
 # ---------------------------------------------------------------------------
 
-class TestEndToEndCLIFaultInjection(IsolatedDispatchCase):
+class TestEndToEndCLIFaultInjection(LegacyDispatchCase):
     def setUp(self) -> None:
         super().setUp()
         self.td = tempfile.TemporaryDirectory()
@@ -2759,35 +2379,6 @@ sys.exit(rc)
         success = self._run_cli(args)
         self.assertEqual(success.returncode, 0, success.stderr)
         self.assertEqual(json.loads(self.gh_state_file.read_text())[0]["body"], "Human notes")
-
-    def test_all_shutdown_signals_during_child_registration_reap_the_process(self) -> None:
-        # Deliver the signal after Popen returns and before the child is visible in the registry.
-        probe = """
-import os, runpy, signal, sys
-m = runpy.run_path(sys.argv[1])
-m['_install_signal_handlers']()
-register = m['_register_active_pgid']
-pids = []
-def interrupt_registration(pid):
-    pids.append(pid)
-    os.kill(os.getpid(), int(sys.argv[2]))
-    register(pid)
-m['run_cmd'].__globals__['_register_active_pgid'] = interrupt_registration
-try:
-    m['run_cmd']([sys.executable, '-B', '-c', 'import time; time.sleep(4)'])
-except (SystemExit, KeyboardInterrupt):
-    assert m['_is_shutdown_requested']() and pids
-    try:
-        os.kill(pids[0], 0)
-    except ProcessLookupError:
-        sys.exit(0)
-sys.exit(1)
-"""
-        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-            with self.subTest(sig=sig):
-                child = subprocess.run([sys.executable, "-B", "-c", probe, str(BIN_PATH), str(sig.value)],
-                                       cwd=self.root, capture_output=True, text=True, timeout=6)
-                self.assertEqual(child.returncode, 0, child.stderr)
 
     def test_nested_dispatch_is_blocked(self) -> None:
         res = self._run_cli(["doctor"], extra_env={"AGENT_DISPATCH_CHILD": "1"})
