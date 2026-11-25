@@ -37,6 +37,18 @@ class TestSecrets(unittest.TestCase):
                 self.assertEqual(secrets.redact_data({"message": [marked]}), {"message": [redacted]})
                 self.assertEqual(json.loads(secrets.safe_json({"message": marked})), {"message": redacted})
 
+    def test_secret_scan_allow_requires_a_token_boundary(self) -> None:
+        header = "X-API-Key: " + "synthetic.opaque.value"
+        marked = header + " # secret-scan:allow"
+        finding = ["Potential secret token in source"]
+        for suffix in ("ed", "list"):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(secrets.scan_text_for_secrets(marked + suffix, "source"), finding)
+        for suffix in ("", " explanation", "\texplanation"):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(secrets.scan_text_for_secrets(marked + suffix, "source"), [])
+                self.assertEqual(secrets.scan_text_for_secrets(marked + suffix, "source", allow_marker=False), finding)
+
     def test_api_key_headers_are_redacted_in_text_and_data(self) -> None:
         token = "opaque" + "-synthetic!value"
         for header in ("X-API-Key", "x-goog-api-key", "X-Api-kEy"):
@@ -155,6 +167,8 @@ class TestSecrets(unittest.TestCase):
             '{"Authorization": "Basic authentication is required for this endpoint."}',
             '{"Authorization": "OAuth 2.0 access token"}',
             'Authorization: Token token=${PAGERDUTY_TOKEN}',
+            "- Authorization: " + "*Optional* for access",
+            "- Authorization: " + "**Required**",
         ):
             with self.subTest(benign=benign):
                 self.assertEqual(secrets.redact_secrets(benign), benign, f"False positive on {benign!r}")
@@ -162,6 +176,7 @@ class TestSecrets(unittest.TestCase):
 
     def test_secret_scan_allow_preserves_non_bypassable_text_checks(self) -> None:
         marker = " # secret-scan:allow"
+        header = "Authorization: " + "*key"
         token = "lin_api_" + "syntheticvalue123456"
         live_value = "synthetic process credential"
         key_kind = "PRIVATE KEY"
@@ -171,6 +186,8 @@ class TestSecrets(unittest.TestCase):
                 (f"note{marker} {token}", token),
                 (pem, "synthetic-body"),
                 (f"note{marker} {live_value}", live_value),
+                (f"{header}{marker} {token}", token),
+                (f"{header}{marker} {live_value}", live_value),
             ):
                 with self.subTest(credential=credential):
                     self.assertEqual(secrets.scan_text_for_secrets(content, "source"), [
@@ -183,6 +200,7 @@ class TestSecrets(unittest.TestCase):
             ("X-API-Key", "*gateway_key", False),
             ("Authorization", "Token *gateway_key", False),
             ("Authorization", "*gateway_key", False),
+            ("Authorization", "*auth-token", False),
             ("X-API-Key", "*k", True),
             ("Authorization", "*k", True),
         ):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import codecs
 import json
 import os
 import re
@@ -419,11 +420,12 @@ def _git_text_views(data: bytes) -> Iterator[str]:
             yield "\n".join(decoded)
 
 
-def _scan_git_bytes(data: bytes, field: str) -> list[str]:
+def _scan_git_bytes(data: bytes, field: str, path: str) -> list[str]:
     for text in _git_text_views(data):
         hits = scan_text_for_secrets(text, field)
         if hits:
-            return hits
+            redacted_path = redact_secrets(path)
+            return [f"{hit} ({redacted_path})" for hit in hits]
     return []
 
 
@@ -451,12 +453,21 @@ def _scan_git_changes_for_secrets(
 
     # --text scans content even when Git would hide the patch because of NUL or attributes.
     patch = _git(
-        worktree, *command, *flags, "-p", "--text", "-U0",
+        worktree, *command, *flags, "-p", "--text", "--no-prefix", "-U0",
         attr_source=attr_source, cap_output=False, stdout_encoding="latin-1", ignore_shutdown=ignore_shutdown,
     ).stdout
     for block in ("\n" + patch).split("\ndiff --git ")[1:]:
         added = "\n".join(_added_patch_lines(block)).encode("latin-1")
-        findings.update(_scan_git_bytes(added, "added file content"))
+        if not added:
+            continue
+        # The destination header contains one path. Git C-quotes special characters
+        # and may append a tab to separate the path from an omitted timestamp.
+        header = block.partition("\n+++ ")[2].partition("\n")[0].removesuffix("\t")
+        path_bytes = header.encode("latin-1")
+        if path_bytes.startswith(b'"'):
+            path_bytes = codecs.escape_decode(path_bytes[1:-1])[0]
+        path = path_bytes.decode("utf-8", errors="replace")
+        findings.update(_scan_git_bytes(added, "added file content", path))
     return sorted(findings)
 
 
@@ -503,7 +514,7 @@ def scan_before_git_write(
             findings.extend(scan_text_for_secrets(content, "untracked symlink target", allow_marker=False))
         elif path.is_file():
             try:
-                findings.extend(_scan_git_bytes(path.read_bytes(), "untracked file content"))
+                findings.extend(_scan_git_bytes(path.read_bytes(), "untracked file content", name))
             except OSError:
                 findings.append(f"Unable to read untracked file for secret scan: {redact_secrets(name)}")
         else:
