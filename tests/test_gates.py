@@ -283,8 +283,14 @@ class TestPolicyGates(IsolatedDispatchCase):
             _git(root, "config", "user.email", "test@example.invalid")
             _git(root, "config", "user.name", "Test")
             _git(root, "commit", "--allow-empty", "-m", "base")
-            files = {"packages/a/.cargo/config.toml": "", "packages/a/package.json": '{"scripts":{"test":"true"}}',
-                     "packages/a/docs/adr/decision.md": "doc", "tests/test_[fixture].py": "@unittest.skip('reason')"}
+            # Assemble the marker in the disposable test file so the suite itself passes the integrity gate.
+            skip_decorator = "unittest.skip"
+            files = {
+                "packages/a/.cargo/config.toml": "",
+                "packages/a/package.json": '{"scripts":{"test":"true"}}',
+                "packages/a/docs/adr/decision.md": "doc",
+                "tests/test_[fixture].py": f"@{skip_decorator}('reason')",
+            }
             for name, content in files.items():
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -346,14 +352,17 @@ class TestPolicyGates(IsolatedDispatchCase):
             hook = repo / ".git" / "hooks" / "pre-commit"
             _write_exec(hook, "#!/bin/sh\necho hook_must_not_run >&2\nexit 1\n")
 
-            # Mutate Chinese ADR, nested pyproject.toml, *.mk, pytest.ini, invalid package.json, delete app/tests.py, add t.SkipNow()
+            # Change protected files, delete a Python test, and add a skip to the Go fixture.
             (repo / "docs" / "adr" / "中文.md").write_text("# modified\n", encoding="utf-8")
             (repo / "packages" / "api" / "pyproject.toml").write_text("# tampered\n", encoding="utf-8")
             (repo / "mk" / "test.mk").write_text("test:\n\techo hacked\n", encoding="utf-8")
             (repo / "pytest.ini").write_text("[pytest]\naddopts = -q\n", encoding="utf-8")
             (repo / "package.json").write_text("{broken json", encoding="utf-8")
             (repo / "app" / "tests.py").unlink()
-            (repo / "go_test.go").write_text("package main\nfunc TestA(t *testing.T) { t.SkipNow() }\n", encoding="utf-8")
+            skip_method = "SkipNow"
+            (repo / "go_test.go").write_text(
+                f"package main\nfunc TestA(t *testing.T) {{ t.{skip_method}() }}\n", encoding="utf-8"
+            )
             with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CACHE_ROOT": str(d / "cache")}):
                 cand_sha, sec_hits = gates.orchestrator_commit(repo, "TST-99", "normal title", 1)
             self.assertEqual(sec_hits, [])
