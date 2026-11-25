@@ -20,6 +20,7 @@ Pipeline:
 from __future__ import annotations
 
 import argparse
+import codecs
 import ast
 import base64
 import concurrent.futures
@@ -427,7 +428,7 @@ _AUTH_HEADER_VALUE = re.compile(
 _API_KEY_HEADERS = ("x-api-key", "x-goog-api-key")
 # Bare HTTP fields have a literal value. Source-code expressions have their own rules below.
 _RAW_CREDENTIAL_FIELD = re.compile(
-    r"^([+-]?[ \t]*(?:(?:proxy-)?authorization:[ \t]*(?:bearer|basic|token|apikey|oauth)[ \t]+|(?:%s):[ \t]*))([^\r\n]+)"
+    r"^([+ -]?\ufeff?[ \t]*(?:(?:proxy-)?authorization:[ \t]*(?:bearer|basic|token|apikey|oauth)[ \t]+|(?:%s):[ \t]*))([^\r\n]+)"
     % "|".join(_API_KEY_HEADERS), re.I | re.M,
 )
 _API_KEY_HEADER_VALUE = re.compile(
@@ -482,14 +483,44 @@ def _redact_basic(m: re.Match[str]) -> str:
     return m.group(1) + m.group(2) + _REDACTED
 
 
+def _yaml_alias_to_placeholder(m: re.Match[str], value: str) -> bool:
+    if not value.startswith("*") or not value[1:].isidentifier():
+        return False
+    start = m.string.rfind("\n", 0, m.start()) + 1
+    if m.string[start:start + 1] not in (" ", "\t"):
+        return False
+    anchor = "&" + value[1:]
+    pos = m.string.rfind(anchor, 0, m.start())
+    if pos <= 0 or not m.string[pos - 1].isspace():
+        return False
+    end = m.string.find("\n", pos, m.start())
+    if end < 0:
+        return False
+    target = m.string[pos + len(anchor):end]
+    return target.startswith((" ", "\t")) and bool(_API_KEY_PLACEHOLDER.fullmatch(target.strip()))
+
+
 def _redact_api_key_header(m: re.Match[str]) -> str:
     quoted = m[2] if m[2] is not None else m[3]
     val = quoted if quoted is not None else (m[4] or "")
     stripped = val.strip()
     if len(stripped) < 8 or stripped.lower() in _API_KEY_BENIGN_WORDS or _API_KEY_PLACEHOLDER.fullmatch(stripped):
         return m.group(0)
-    if quoted is None and _API_KEY_CODE_EXPR.fullmatch(stripped):
-        return m.group(0)
+    if quoted is None:
+        if _API_KEY_CODE_EXPR.fullmatch(stripped) or _yaml_alias_to_placeholder(m, stripped):
+            return m[0]
+        line_start = m.string.rfind("\n", 0, m.start()) + 1
+        prefix = m.string[line_start:m.start()]
+        # A dictionary assigned in source can refer to a variable. YAML flow mappings
+        # can use the same quoted key with a literal bare scalar.
+        if stripped.isidentifier() and m[1].rstrip().endswith(('":', "':")):
+            assignment, brace, _ = prefix.partition("{")
+            if brace and assignment.rstrip().endswith("="):
+                return m[0]
+        # Markdown field descriptions have a prose value spanning more than one word.
+        if (prefix.strip() == "-" and _PLAIN_ALPHA_WORD.fullmatch(stripped)
+                and m.string.startswith(" ", m.end()) and m.string[m.end() + 1:m.end() + 2].isalpha()):
+            return m[0]
     if m[2] is not None:
         return m[1] + '"' + _REDACTED + '"'
     if m[3] is not None:
@@ -503,6 +534,7 @@ def _redact_raw_credential_field(m: re.Match[str]) -> str:
         not value
         or value[0] in ("'", '"')
         or _API_KEY_PLACEHOLDER.fullmatch(value)
+        or _yaml_alias_to_placeholder(m, value)
         or value.lower() in _API_KEY_BENIGN_WORDS
         or any(ch.isspace() for ch in value)
     ):
@@ -3209,13 +3241,15 @@ def run_two_axis_review(
 ) -> dict[str, Any]:
     # Pre-generate immutable diff.patch; block added secrets (for standalone `review`) and redact deleted secret lines before any LLM sees them!
     diff_patch_path = run_dir / f"diff-r{round_num}.patch"
-    raw_diff_text = run_cmd(
+    diff_output = run_cmd(
         git_cmd("diff", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color", f"{base_sha}..{candidate_sha}"),
         cwd=worktree,
         check=True,
         env_role="orchestrator",
         cap_output=False,
-    ).stdout
+        stdout_encoding="latin-1",
+    ).stdout.encode("latin-1")
+    raw_diff_text = diff_output.decode("utf-8", errors="replace")
     if block_added_secrets:
         added_secret_hits = scan_range_for_secrets(worktree, base_sha, candidate_sha)
         if added_secret_hits:
@@ -3226,7 +3260,10 @@ def run_two_axis_review(
     diff_text = redact_secrets(raw_diff_text)
     if "\x00" in raw_diff_text:
         # A diff attribute can force UTF-16 text, including removed credentials, into the review patch.
-        ascii_view = raw_diff_text.replace("\x00", "")
+        # Preserve BOMs as such: UTF-8 replacement characters would hide a header at column one.
+        ascii_view = (diff_output.replace(codecs.BOM_UTF16_LE, codecs.BOM_UTF8)
+                      .replace(codecs.BOM_UTF16_BE, codecs.BOM_UTF8)
+                      .replace(b"\x00", b"").decode("utf-8", errors="replace"))
         safe_view = redact_secrets(ascii_view)
         if safe_view != ascii_view:
             diff_text = safe_view

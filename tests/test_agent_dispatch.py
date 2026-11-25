@@ -318,6 +318,36 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                 self.assertEqual(ad.redact_secrets(source), source, f"False positive on: {source}")
                 self.assertFalse(ad.scan_text_for_secrets(source, "template"), f"False block on: {source}")
 
+    def test_header_examples_pass_git_gates_but_literal_values_do_not(self) -> None:
+        examples = {
+            "client.py": 'headers = {"X-API-Key": API_KEY_VALUE}',
+            "client.js": 'const headers = { "X-API-Key": clientKey };',
+            "gateway.yaml": "key: &gateway_key ${GATEWAY_KEY}\nheaders:\n  X-API-Key: *gateway_key",
+            "template.yaml": 'headers:\n  X-API-Key: "{{ .Values.gateway.apiKey }}"',
+            "README.md": "- X-API-Key: Identifies the caller for authentication.",
+        }
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            _git(repo, "init", "-b", "main")
+            _git(repo, "-c", "user.name=Test", "-c", "user.email=t@example.invalid",
+                 "commit", "--allow-empty", "-m", "base")
+            for filename, example in examples.items():
+                with self.subTest(filename=filename):
+                    (repo / filename).write_text(example + "\n")
+                    self.assertFalse(ad._scan_before_git_write(repo))
+            self.assertFalse(ad.scan_text_for_secrets("Document X-API-Key header support", "title"))
+            _git(repo, "add", ".")
+            self.assertFalse(ad.scan_staged_for_secrets(repo))
+            for literal in ("clientKey", "Identifies", "*gateway_key"):
+                (repo / "request.http").write_text(f"X-API-Key: {literal}\r\n")
+                self.assertTrue(ad._scan_before_git_write(repo))
+                self.assertNotIn(literal, ad.redact_secrets(f"X-API-Key: {literal}"))
+            for source in ('headers: {"X-API-Key": clientKey}',
+                           'headers = {"X-API-Key": "clientKey"}',
+                           "key: &gateway_key clientKey\nheaders:\n  X-API-Key: *gateway_key",
+                           "- X-API-Key: Identifies"):
+                self.assertTrue(ad.scan_text_for_secrets(source, "literal"))
+
     def test_nested_authorization_headers_are_redacted_in_structured_logs(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             folder = Path(td)
@@ -790,6 +820,34 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                     self.assertIn("<REDACTED_SECRET>", patch)
                     _git(repo, "rm", "config.txt")
                     _git(repo, "commit", "-m", "remove file")
+
+    def test_review_redacts_context_and_deleted_credential_header_after_utf16_bom(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            _git(repo, "init", "-b", "main")
+            _git(repo, "config", "user.name", "Test")
+            _git(repo, "config", "user.email", "test@example.invalid")
+            (repo / ".gitattributes").write_text("request.txt diff\n")
+            path = repo / "request.txt"
+            token = "synthetic.opaque.value"
+            for encoding in ("utf-16-le", "utf-16-be"):
+                with self.subTest(encoding=encoding):
+                    header = "\ufeffAuthorization: token " + token + "\r\n"
+                    path.write_bytes((header + "old\r\n").encode(encoding))
+                    _git(repo, "add", ".")
+                    _git(repo, "commit", "-m", "synthetic fixture")
+                    for content in (header + "changed\r\n", "\ufeffremoved\r\n"):
+                        path.write_bytes(content.encode(encoding))
+                        _git(repo, "commit", "-am", "edit fixture")
+                        run_dir = Path(os.environ["AGENT_DISPATCH_CACHE_ROOT"]) / encoding
+                        with mock.patch.object(ad, "invoke_harness", side_effect=SystemExit):
+                            with self.assertRaises(SystemExit):
+                                ad.run_two_axis_review(ad.parse_harness_spec("codex"), repo, run_dir, "HEAD^",
+                                                       _git(repo, "rev-parse", "HEAD"), None, None, run_dir, {}, 1,
+                                                       block_added_secrets=True)
+                        patch = (run_dir / "diff-r1.patch").read_text()
+                        self.assertNotIn(token, patch.replace("\0", ""))
+                        self.assertIn("<REDACTED_SECRET>", patch)
 
     def test_nested_protected_files_and_literal_test_pathspecs(self) -> None:
         with tempfile.TemporaryDirectory() as td:
