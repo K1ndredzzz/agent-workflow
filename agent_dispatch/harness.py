@@ -243,6 +243,24 @@ _SESSION_PATTERNS = {
     "agy": r'"conversation_id"\s*:\s*"([0-9a-fA-F-]+)"',
     "opencode": r'"sessionID"\s*:\s*"([A-Za-z0-9_-]+)"',
 }
+_SESSION_RESUME = {
+    "codex": ("codex resume", "codex agents"),
+    "agy": ("agy --conversation", ""),
+    "opencode": ("opencode -s", "opencode session list"),
+}
+
+
+def _find_session_id(harness: str, output: str) -> str:
+    match = re.search(_SESSION_PATTERNS[harness], output)
+    return match.group(1) if match else ""
+
+
+def _check_exit(result: subprocess.CompletedProcess[str], command: str, *, include_stdout: bool = False) -> None:
+    if result.returncode != 0:
+        output = redact_secrets(result.stderr)[-2000:]
+        if include_stdout:
+            output += "\n" + redact_secrets(result.stdout)[-1000:]
+        raise RuntimeError(f"{command} exited {result.returncode}: {output}")
 
 
 def append_session_trace(run_dir: Path, entry: dict[str, Any], trace_sink: list[dict[str, Any]] | None) -> None:
@@ -298,6 +316,15 @@ class _HarnessRun:
     stderr_log: Path
     trace: dict[str, Any]
 
+    def _record_session(self, session_id: str) -> None:
+        command, fallback = _SESSION_RESUME[self.spec.harness]
+        if self.spec.harness == "agy":
+            self.trace["conversation_id"] = session_id
+            self.trace["conversation_link"] = f"conversation://{session_id}" if session_id else ""
+        else:
+            self.trace["session_id"] = session_id
+        self.trace["resume_cmd"] = f"{command} {session_id}" if session_id else fallback
+
     def _run(
         self, cmd: list[str], *, stdin_text: str | None = None, env_role: str = "child"
     ) -> subprocess.CompletedProcess[str]:
@@ -317,39 +344,21 @@ class _HarnessRun:
         sandbox = "read-only" if self.read_only else "danger-full-access"
         wt_escaped = str(self.worktree).replace('"', '\\"')
         cmd = [
-            executable,
-            "exec",
-            "-C",
-            str(self.worktree),
-            "-m",
-            self.spec.model,
-            "-c",
-            f'model_reasoning_effort="{self.spec.effort}"',
-            "-c",
-            'approval_policy="never"',
-            "-c",
-            f'projects."{wt_escaped}".trust_level="trusted"',
-            "-c",
-            "mcp_servers.linear.enabled=false",
-            "--sandbox",
-            sandbox,
-            "--output-schema",
-            str(schema_file),
-            "--json",
-            "-",
+            executable, "exec",
+            "-C", str(self.worktree),
+            "-m", self.spec.model,
+            "-c", f'model_reasoning_effort="{self.spec.effort}"',
+            "-c", 'approval_policy="never"',
+            "-c", f'projects."{wt_escaped}".trust_level="trusted"',
+            "-c", "mcp_servers.linear.enabled=false",
+            "--sandbox", sandbox,
+            "--output-schema", str(schema_file),
+            "--json", "-",
         ]
         res = self._run(cmd, stdin_text=prompt_text, env_role="codex")
-        sid_m = re.search(_SESSION_PATTERNS["codex"], res.stdout + "\n" + res.stderr)
-        sid = sid_m.group(1) if sid_m else ""
-        self.trace.update(
-            {
-                "returncode": res.returncode,
-                "session_id": sid,
-                "resume_cmd": f"codex resume {sid}" if sid else "codex agents",
-            }
-        )
-        if res.returncode != 0:
-            raise RuntimeError(f"codex exec exited {res.returncode}: {redact_secrets(res.stderr)[-2000:]}")
+        self.trace["returncode"] = res.returncode
+        self._record_session(_find_session_id("codex", res.stdout + "\n" + res.stderr))
+        _check_exit(res, "codex exec")
         return json.loads(parse_codex_ndjson(res.stdout))
 
     def agy(self, executable: str, prompt_file: Path, schema_file: Path) -> dict[str, Any]:
@@ -359,14 +368,10 @@ class _HarnessRun:
         )
         cmd = [
             executable,
-            "--model",
-            self.spec.model,
-            "--add-dir",
-            str(self.run_dir),
-            "--output-format",
-            "json",
-            "--json-schema",
-            str(schema_file),
+            "--model", self.spec.model,
+            "--add-dir", str(self.run_dir),
+            "--output-format", "json",
+            "--json-schema", str(schema_file),
         ]
         if self.read_only:
             # Keep slash expansion enabled ONLY so --mode plan actually takes effect (prompt has no leading /cmd)
@@ -377,30 +382,15 @@ class _HarnessRun:
 
         res = self._run(cmd)
         # Extract conversation_id BEFORE checking returncode so failed runs remain traceable!
-        wrapper: dict[str, Any] = {}
         try:
             wrapper = extract_json_object(res.stdout)
         except Exception:
-            cid_m = re.search(_SESSION_PATTERNS["agy"], res.stdout + "\n" + res.stderr)
-            if cid_m:
-                wrapper = {"conversation_id": cid_m.group(1)}
+            wrapper = {"conversation_id": _find_session_id("agy", res.stdout + "\n" + res.stderr)}
         cid = str(wrapper.get("conversation_id", ""))
-        if not re.fullmatch(r"[A-Za-z0-9-]+", cid):
-            cid = ""
-        self.trace.update(
-            {
-                "returncode": res.returncode,
-                "conversation_id": cid,
-                "conversation_link": f"conversation://{cid}" if cid else "",
-                "resume_cmd": f"agy --conversation {cid}" if cid else "",
-                "duration_seconds": wrapper.get("duration_seconds"),
-                "usage": wrapper.get("usage"),
-            }
-        )
-        if res.returncode != 0:
-            raise RuntimeError(
-                f"agy exited {res.returncode}: {redact_secrets(res.stderr)[-2000:]}\n{redact_secrets(res.stdout)[-1000:]}"
-            )
+        self.trace["returncode"] = res.returncode
+        self._record_session(cid if re.fullmatch(r"[A-Za-z0-9-]+", cid) else "")
+        self.trace.update(duration_seconds=wrapper.get("duration_seconds"), usage=wrapper.get("usage"))
+        _check_exit(res, "agy", include_stdout=True)
         if wrapper.get("status") not in (None, "SUCCESS"):
             raise RuntimeError(f"agy returned non-SUCCESS status: {wrapper.get('status')}")
         result = wrapper.get("structured_output")
@@ -425,18 +415,12 @@ class _HarnessRun:
             f"End your final message with ONLY a valid JSON object matching:\n{json.dumps(schema)}"
         )
         cmd = [
-            executable,
-            "run",
-            "-m",
-            self.spec.model,
-            "--variant",
-            self.spec.effort,
-            "--dir",
-            str(self.worktree),
-            "--format",
-            "json",
-            "--title",
-            self.role_name,
+            executable, "run",
+            "-m", self.spec.model,
+            "--variant", self.spec.effort,
+            "--dir", str(self.worktree),
+            "--format", "json",
+            "--title", self.role_name,
         ]
         if self.read_only:
             cmd += ["--agent", "plan"]
@@ -447,17 +431,9 @@ class _HarnessRun:
         # `--` terminates yargs `-f [array]` so the positional message is never consumed as a filename
         cmd += ["--", short_prompt]
         res = self._run(cmd)
-        sid_m = re.search(_SESSION_PATTERNS["opencode"], res.stdout)
-        sid = sid_m.group(1) if sid_m else ""
-        self.trace.update(
-            {
-                "returncode": res.returncode,
-                "session_id": sid,
-                "resume_cmd": f"opencode -s {sid}" if sid else "opencode session list",
-            }
-        )
-        if res.returncode != 0:
-            raise RuntimeError(f"opencode run exited {res.returncode}: {redact_secrets(res.stderr)[-2000:]}")
+        self.trace["returncode"] = res.returncode
+        self._record_session(_find_session_id("opencode", res.stdout))
+        _check_exit(res, "opencode run")
         return extract_json_object(parse_opencode_ndjson(res.stdout))
 
     def pi(
@@ -469,17 +445,11 @@ class _HarnessRun:
             f"End your final message with ONLY a valid JSON object matching:\n{json.dumps(schema)}"
         )
         cmd = [
-            executable,
-            "-p",
-            "--offline",
-            "--mode",
-            "json",
-            "--name",
-            self.role_name,
-            "--session-dir",
-            str(archive.parent),
-            "--model",
-            f"{self.spec.model}:{self.spec.effort}",
+            executable, "-p", "--offline",
+            "--mode", "json",
+            "--name", self.role_name,
+            "--session-dir", str(archive.parent),
+            "--model", f"{self.spec.model}:{self.spec.effort}",
         ]
         if self.read_only:
             cmd += ["--tools", "read,grep,find,ls"]
@@ -487,8 +457,7 @@ class _HarnessRun:
             cmd += ["--session", session_file, short_prompt]
             res = self._run(cmd)
         self.trace["returncode"] = res.returncode
-        if res.returncode != 0:
-            raise RuntimeError(f"pi exited {res.returncode}: {redact_secrets(res.stderr)[-2000:]}")
+        _check_exit(res, "pi")
         return extract_json_object(parse_pi_ndjson(res.stdout))
 
     def capture_partial_session(self) -> None:
@@ -501,13 +470,7 @@ class _HarnessRun:
                 with path.open(encoding="utf-8", errors="replace") as log_file:
                     match = next((m for line in log_file if (m := re.search(pattern, line))), None)
                 if match:
-                    session_id = match.group(1)
-                    if self.spec.harness == "agy":
-                        self.trace.update(conversation_id=session_id, conversation_link=f"conversation://{session_id}",
-                                         resume_cmd=f"agy --conversation {session_id}")
-                    else:
-                        command = "codex resume" if self.spec.harness == "codex" else "opencode -s"
-                        self.trace.update(session_id=session_id, resume_cmd=f"{command} {session_id}")
+                    self._record_session(match.group(1))
                     break
 
 
@@ -543,35 +506,18 @@ def invoke_harness(
     pi_session_id = str(uuid.uuid4()) if spec.harness == "pi" else ""
     pi_archive = pi_session_dir / f"{pi_session_id}.jsonl"
 
-    append_session_trace(
-        run_dir,
-        {
-            "event": "start",
-            "role": role_name,
-            "harness": spec.harness,
-            "model": spec.label,
-            "read_only": read_only,
-            **({"session_id": pi_session_id} if pi_session_id else {}),
-            "stdout_log": str(stdout_log),
-            "stderr_log": str(stderr_log),
-        },
-        trace_sink=None,
-    )
+    session = {"role": role_name, "harness": spec.harness, "model": spec.label, "read_only": read_only}
+    log_paths = {"stdout_log": str(stdout_log), "stderr_log": str(stderr_log)}
+    session_id = {"session_id": pi_session_id} if pi_session_id else {}
+    append_session_trace(run_dir, {"event": "start", **session, **session_id, **log_paths}, trace_sink=None)
 
     trace_end: dict[str, Any] = {
         "event": "end",
-        "role": role_name,
-        "harness": spec.harness,
-        "model": spec.label,
-        "read_only": read_only,
+        **session,
         "status": "error",
-        **(
-            {"session_id": pi_session_id, "resume_cmd": shlex.join(["pi", "--session", str(pi_archive)])}
-            if pi_session_id
-            else {}
-        ),
-        "stdout_log": str(stdout_log),
-        "stderr_log": str(stderr_log),
+        **session_id,
+        **({"resume_cmd": shlex.join(["pi", "--session", str(pi_archive)])} if pi_session_id else {}),
+        **log_paths,
         "output_file": str(out_file),
     }
 
