@@ -60,6 +60,19 @@ def _cache_root() -> Path:
     return Path(custom).resolve() if custom else (Path.home() / ".cache" / "agent-dispatch")
 
 
+def _worktree_cache_path(repo_key: str, name: str | None = None) -> Path:
+    """Accept the configured cache root, but never traverse symlinks below it."""
+    path = _cache_root()
+    components = ("worktrees", repo_key) if name is None else ("worktrees", repo_key, name)
+    for part in components:
+        if not part or part in (".", "..") or Path(part).name != part:
+            raise RuntimeError("Invalid managed worktree path component.")
+        path = path / part
+        if path.is_symlink():
+            raise RuntimeError(f"Refusing symlink in managed worktree path: {path}")
+    return path
+
+
 def _resolve_skills_root() -> Path:
     custom = os.environ.get("AGENT_DISPATCH_SKILLS_ROOT", "").strip()
     if custom:
@@ -92,6 +105,7 @@ def assert_required_rubrics_loaded() -> None:
         )
 
 DISPLAY_OUTPUT_CAP = 2 * 1024 * 1024
+HARNESS_OUTPUT_LIMIT = 32 * 1024 * 1024
 
 WORKER_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -411,11 +425,18 @@ _AUTH_HEADER_VALUE = re.compile(
     r"""(?i)(\bauthorization\b["']?[ \t]*[:=][ \t]*["']?(?:bearer|basic)[ \t]+)([A-Za-z0-9._~+/-]{8,}=*)"""
 )
 _API_KEY_HEADERS = ("x-api-key", "x-goog-api-key")
+# Bare HTTP fields have a literal value. Source-code expressions have their own rules below.
+_RAW_CREDENTIAL_FIELD = re.compile(
+    r"^([+-]?[ \t]*(?:(?:proxy-)?authorization:[ \t]*(?:bearer|basic|token|apikey|oauth)[ \t]+|(?:%s):[ \t]*))([^\r\n]+)"
+    % "|".join(_API_KEY_HEADERS), re.I | re.M,
+)
 _API_KEY_HEADER_VALUE = re.compile(
     r"""(\b(?:%s)\b["']?[ \t]*[:=][ \t]*)(?:"((?:\\.|[^"\\\r\n])*)"?|'((?:\\.|[^'\\\r\n])*)'?|(\$\{[^}\s]+\}|[^\s"',;})\]]+))"""
     % "|".join(_API_KEY_HEADERS), re.I,
 )
-_API_KEY_PLACEHOLDER = re.compile(r"^(?:<[^>\s]+>|\$\{[^}\s]+\}|\$[A-Z_][A-Z0-9_]*)$")
+_API_KEY_PLACEHOLDER = re.compile(
+    r"^(?:<[^>\s]+>|\$\{\{[^}]+\}\}|\{\{[^}]+\}\}|\$\{[^}\s]+\}|\$[A-Z_][A-Z0-9_]*)$"
+)
 _API_KEY_BENIGN_WORDS = frozenset({
     "string", "str", "number", "boolean", "bool", "object", "any", "unknown",
     "null", "none", "nil", "true", "false", "undefined", "required", "optional",
@@ -476,9 +497,29 @@ def _redact_api_key_header(m: re.Match[str]) -> str:
     return m[1] + _REDACTED
 
 
+def _redact_raw_credential_field(m: re.Match[str]) -> str:
+    value = re.sub(r"[ \t]+#.*$", "", m[2].strip()).strip()
+    if (
+        not value
+        or value[0] in ("'", '"')
+        or _API_KEY_PLACEHOLDER.fullmatch(value)
+        or value.lower() in _API_KEY_BENIGN_WORDS
+        or any(ch.isspace() for ch in value)
+    ):
+        return m[0]
+    return m[1] + _REDACTED
+
+
+def _redact_auth_header(m: re.Match[str]) -> str:
+    if _PLAIN_ALPHA_WORD.fullmatch(m.group(2)) and re.match(r"[ \t]+[A-Za-z]", m.string[m.end():]):
+        return m.group(0)
+    return m.group(1) + _REDACTED
+
+
 def redact_secrets(text: str) -> str:
     out = _PEM_BLOCK.sub(_REDACTED, str(text))
-    out = _AUTH_HEADER_VALUE.sub(lambda m: m.group(1) + _REDACTED, out)
+    out = _RAW_CREDENTIAL_FIELD.sub(_redact_raw_credential_field, out)
+    out = _AUTH_HEADER_VALUE.sub(_redact_auth_header, out)
     out = _API_KEY_HEADER_VALUE.sub(_redact_api_key_header, out)
     out = _BEARER_VALUE.sub(_redact_bearer, out)
     out = _BASIC_VALUE.sub(_redact_basic, out)
@@ -645,10 +686,15 @@ class _RedactedLog:
             self.capture.append(line.encode("utf-8"))
 
     def _discard_fragment(self, part: bytes) -> None:
+        text = self.marker_tail + part.decode("ascii", errors="replace")
         if self.discarding_json:
+            # A literal newline after a PEM header starts a real block even in broken JSON.
+            # Escaped newlines and the closing quote of a JSON string stay on the same line.
+            if part.strip():
+                self.in_pem = bool(re.search(_PEM_START.pattern + r"\s*\Z", text))
+            self.marker_tail = text[-128:]
             return
         # An omitted plain-text line can start/end a multiline PRIVATE KEY PEM across pipe reads.
-        text = self.marker_tail + part.decode("ascii", errors="replace")
         starts = list(_PEM_START.finditer(text))
         if starts:
             self.in_pem = True
@@ -737,9 +783,9 @@ class _BoundedBuffer:
         if len(self.tail) > self.tail_limit * 2:
             del self.tail[: len(self.tail) - self.tail_limit]
 
-    def decode(self, *, redacted: bool) -> str:
+    def decode(self, *, redacted: bool, encoding: str = "utf-8") -> str:
         if not self.truncated:
-            return self.head.decode("utf-8", errors="replace")
+            return self.head.decode(encoding, errors="replace")
         if not redacted:
             # Raw protocol bytes at a truncation boundary can contain a credential fragment.
             return "...[truncated]..."
@@ -762,6 +808,8 @@ def run_cmd(
     check: bool = False,
     env_role: str = "child",
     cap_output: bool = True,
+    output_limit: int | None = None,
+    stdout_encoding: str = "utf-8",
     stdout_path: Path | None = None,
     stderr_path: Path | None = None,
     ignore_shutdown: bool = False,
@@ -840,6 +888,10 @@ def run_cmd(
                         chunk = os.read(key.fd, 65536)
                     except BlockingIOError:
                         continue
+                    if output_limit is not None:
+                        output_limit -= len(chunk)
+                        if output_limit < 0:
+                            raise RuntimeError("Harness output limit exceeded before a complete result was accepted.")
                     if not cap_output or key.data not in logs:
                         buffers[key.data].append(chunk)
                     if key.data in logs:
@@ -869,7 +921,7 @@ def run_cmd(
             raise
         finally:
             _unregister_active_pgid(proc.pid)
-        stdout = buffers["stdout"].decode(redacted="stdout" in logs)
+        stdout = buffers["stdout"].decode(redacted="stdout" in logs, encoding=stdout_encoding)
         stderr = buffers["stderr"].decode(redacted="stderr" in logs)
 
     result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
@@ -1783,8 +1835,6 @@ def prepare_worktree(
     rkey = repo_cache_key(repo_root)
     repo_id = canonical_repo_identity(repo_root)
     branch = f"feat/{identifier.lower()}"
-    wt_dir = _cache_root() / "worktrees" / rkey / identifier.upper()
-    wt_dir.parent.mkdir(parents=True, exist_ok=True)
     repo_common = get_git_common_dir(repo_root)
 
     with file_lock(_cache_root() / "locks" / f"repo-{rkey}.lock", blocking=True):
@@ -1799,8 +1849,8 @@ def prepare_worktree(
 
         base_sha = run_cmd(git_cmd("rev-parse", base_ref), cwd=repo_root, check=True, env_role="orchestrator").stdout.strip()
 
-        if wt_dir.is_symlink():
-            raise RuntimeError(f"Symlink occupies managed worktree path {wt_dir}.")
+        wt_dir = _worktree_cache_path(rkey, identifier.upper())
+        wt_dir.parent.mkdir(parents=True, exist_ok=True)
         if wt_dir.exists():
             if not (wt_dir / ".git").exists():
                 raise RuntimeError(f"Non-git directory occupies worktree path {wt_dir}; inspect and remove manually.")
@@ -2123,19 +2173,6 @@ def _file_identity(path: Path) -> tuple[int, int, int, int]:
     return st.st_dev, st.st_ino, st.st_ctime_ns, st.st_size
 
 
-def _active_setup_files(worktree: Path, files: dict[str, tuple[int, int, int, int]]) -> dict[str, tuple[int, int, int, int]]:
-    active: dict[str, tuple[int, int, int, int]] = {}
-    for name, ident in files.items():
-        path = worktree / name
-        if os.path.lexists(path):
-            try:
-                if _file_identity(path) == ident:
-                    active[name] = ident
-            except OSError:
-                continue
-    return active
-
-
 def _release_setup_files(worktree: Path, files: dict[str, tuple[int, int, int, int]]) -> None:
     if not files:
         return
@@ -2252,7 +2289,7 @@ def check_base_baseline(
         try:
             if head != base_sha:
                 # Reused feature branch with baseline cache miss: verify base_sha in a UNIQUE temporary detached worktree!
-                temp_wt = _cache_root() / "worktrees" / repo_key / f".baseline-{base_sha[:10]}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+                temp_wt = _worktree_cache_path(repo_key, f".baseline-{base_sha[:10]}-{os.getpid()}-{uuid.uuid4().hex[:8]}")
                 owner_file = _cache_root() / "baseline-owners" / repo_key / temp_wt.name
                 with file_lock(_cache_root() / "locks" / f"repo-{repo_key}.lock", blocking=True):
                     atomic_write_text(owner_file, json.dumps({"key": lease_key, "base_sha": base_sha}))
@@ -2281,6 +2318,7 @@ def check_base_baseline(
         finally:
             if temp_wt is not None:
                 with file_lock(_cache_root() / "locks" / f"repo-{repo_key}.lock", ignore_shutdown=True):
+                    _worktree_cache_path(repo_key, temp_wt.name)
                     run_cmd(git_cmd("worktree", "remove", "--force", str(temp_wt)), cwd=repo_root, env_role="orchestrator", ignore_shutdown=True)
                     if not temp_wt.exists():
                         owner_file.unlink(missing_ok=True)
@@ -2430,6 +2468,23 @@ def _added_patch_lines(patch: str) -> Iterator[str]:
             yield line[1:]
 
 
+def _scan_git_bytes(data: bytes, field: str) -> list[str]:
+    hits = scan_text_for_secrets(data.decode("utf-8", errors="replace"), field)
+    if hits or not re.search(rb"(?:[ -~]\x00){3}|(?:\x00[ -~]){3}", data):
+        return hits
+    # Git splits a UTF-16 hunk at the LF byte, including on a code-unit boundary
+    # different from the preceding hunk. Keep each added line and try both alignments.
+    lines = data.split(b"\n")
+    for encoding in ("utf-16-le", "utf-16-be"):
+        for offset in (0, 1):
+            decoded = "\n".join(line[offset:].decode(encoding, errors="replace").lstrip("\ufeff")
+                                for line in lines)
+            hits = scan_text_for_secrets(decoded, field)
+            if hits:
+                return hits
+    return []
+
+
 def _scan_git_changes_for_secrets(worktree: Path, command: list[str], *, ignore_shutdown: bool = False) -> list[str]:
     flags = ["--no-renames", "--no-ext-diff", "--no-textconv", "--no-color"]
 
@@ -2446,9 +2501,11 @@ def _scan_git_changes_for_secrets(worktree: Path, command: list[str], *, ignore_
     # --text scans content even when Git would hide the patch because of NUL or attributes.
     patch = run_cmd(
         git_cmd(*command, *flags, "-p", "--text", "-U0"),
-        cwd=worktree, check=True, env_role="orchestrator", cap_output=False, ignore_shutdown=ignore_shutdown,
+        cwd=worktree, check=True, env_role="orchestrator", cap_output=False,
+        stdout_encoding="latin-1", ignore_shutdown=ignore_shutdown,
     ).stdout
-    findings.update(scan_text_for_secrets("\n".join(_added_patch_lines(patch)), "added file content"))
+    added = "\n".join(_added_patch_lines(patch)).encode("latin-1")
+    findings.update(_scan_git_bytes(added, "added file content"))
     return sorted(findings)
 
 
@@ -2498,16 +2555,16 @@ def _scan_before_git_write(
             if _is_secret_filename(content):
                 findings.append(f"Potential secret symlink target: {redact_secrets(name)}")
                 continue
+            findings.extend(scan_text_for_secrets(content, "untracked symlink target"))
         elif path.is_file():
             try:
-                content = path.read_bytes().decode("utf-8", errors="replace")
+                findings.extend(_scan_git_bytes(path.read_bytes(), "untracked file content"))
             except OSError:
                 findings.append(f"Unable to read untracked file for secret scan: {redact_secrets(name)}")
                 continue
         else:
             findings.append("Unable to scan untracked entry as a regular file or symbolic link")
             continue
-        findings.extend(scan_text_for_secrets(content, "untracked file content"))
     return findings
 
 
@@ -2571,8 +2628,8 @@ def orchestrator_commit(worktree: Path, identifier: str, title: str, attempt: in
 
 def extract_json_object(text: str) -> dict[str, Any]:
     """Select the last JSON object in prose, including fenced output."""
-    start = re.compile(r'\{(?=\s*(?:"|\}|\Z))')
-    tokens = re.compile(r'"(?:[^"\\]|\\.)*"|[{}"]', re.S)
+    start = re.compile(r'\{(?=\s*(?:"|\}|\Z))|\[(?=\s*(?:[{"\[\]]|\Z))')
+    tokens = re.compile(r'"(?:[^"\\]|\\.)*"|[{}\[\]"]', re.S)
     decoder = json.JSONDecoder()
     last = None
     pos = 0
@@ -2585,9 +2642,9 @@ def extract_json_object(text: str) -> dict[str, Any]:
             depth = 1
             for token in tokens.finditer(text, match.end()):
                 value = token.group()
-                if value == "{":
+                if value in ("{", "["):
                     depth += 1
-                elif value == "}":
+                elif value in ("}", "]"):
                     depth -= 1
                     if depth == 0:
                         pos = token.end()
@@ -2596,7 +2653,7 @@ def extract_json_object(text: str) -> dict[str, Any]:
                     raise ValueError("Incomplete JSON string in final object")
             else:
                 raise ValueError("Incomplete final JSON object")
-    if last is None:
+    if not isinstance(last, dict):
         raise ValueError("Missing or invalid final JSON object")
     return last
 
@@ -2641,7 +2698,9 @@ def _harness_events(stdout: str) -> Iterator[dict[str, Any]]:
         if line.lstrip().startswith("{"):
             try:
                 event = json.loads(line)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                if re.search(r'"type"\s*:', line):
+                    raise ValueError("Malformed harness protocol event") from exc
                 continue
             if isinstance(event, dict):
                 yield event
@@ -2860,7 +2919,7 @@ def invoke_harness(
                 stdin_text=prompt_text,
                 timeout=timeout,
                 env_role="codex",
-                cap_output=False,
+                cap_output=False, output_limit=HARNESS_OUTPUT_LIMIT,
                 stdout_path=stdout_log,
                 stderr_path=stderr_log,
             )
@@ -2910,7 +2969,7 @@ def invoke_harness(
                 cwd=worktree,
                 timeout=timeout,
                 env_role="child",
-                cap_output=False,
+                cap_output=False, output_limit=HARNESS_OUTPUT_LIMIT,
                 stdout_path=stdout_log,
                 stderr_path=stderr_log,
             )
@@ -2990,7 +3049,7 @@ def invoke_harness(
                 cwd=worktree,
                 timeout=timeout,
                 env_role="child",
-                cap_output=False,
+                cap_output=False, output_limit=HARNESS_OUTPUT_LIMIT,
                 stdout_path=stdout_log,
                 stderr_path=stderr_log,
             )
@@ -3036,7 +3095,7 @@ def invoke_harness(
             with _pi_session_archive(pi_archive, pi_session_id, worktree) as session_file:
                 cmd += ["--session", session_file, short_prompt]
                 res = run_cmd(
-                    cmd, cwd=worktree, timeout=timeout, env_role="child", cap_output=False,
+                    cmd, cwd=worktree, timeout=timeout, env_role="child", cap_output=False, output_limit=HARNESS_OUTPUT_LIMIT,
                     stdout_path=stdout_log, stderr_path=stderr_log,
                 )
             trace_end["returncode"] = res.returncode
@@ -3055,26 +3114,26 @@ def invoke_harness(
     finally:
         # Best-effort capture of partial session ID from streamed logs on crash/timeout
         if trace_end["status"] != "ok" and not trace_end.get("conversation_id") and not trace_end.get("session_id"):
-            partial = ""
-            for p in (stderr_log, stdout_log):
-                if p.is_file():
-                    partial += p.read_text(encoding="utf-8", errors="ignore") + "\n"
-            if spec.harness == "codex":
-                m = re.search(r'(?:\bsession id:\s*|"thread_id"\s*:\s*")([0-9a-fA-F-]+)', partial)
-                if m:
-                    trace_end["session_id"] = m.group(1)
-                    trace_end["resume_cmd"] = f"codex resume {m.group(1)}"
-            elif spec.harness == "agy":
-                m = re.search(r'"conversation_id"\s*:\s*"([0-9a-fA-F-]+)"', partial)
-                if m:
-                    trace_end["conversation_id"] = m.group(1)
-                    trace_end["conversation_link"] = f"conversation://{m.group(1)}"
-                    trace_end["resume_cmd"] = f"agy --conversation {m.group(1)}"
-            elif spec.harness == "opencode":
-                m = re.search(r'"sessionID"\s*:\s*"([A-Za-z0-9_-]+)"', partial)
-                if m:
-                    trace_end["session_id"] = m.group(1)
-                    trace_end["resume_cmd"] = f"opencode -s {m.group(1)}"
+            patterns = {
+                "codex": r'(?:\bsession id:\s*|"thread_id"\s*:\s*")([0-9a-fA-F-]+)',
+                "agy": r'"conversation_id"\s*:\s*"([0-9a-fA-F-]+)"',
+                "opencode": r'"sessionID"\s*:\s*"([A-Za-z0-9_-]+)"',
+            }
+            pattern = patterns.get(spec.harness)
+            for path in (stderr_log, stdout_log):
+                if not pattern or not path.is_file():
+                    continue
+                with path.open(encoding="utf-8", errors="replace") as log_file:
+                    match = next((m for line in log_file if (m := re.search(pattern, line))), None)
+                if match:
+                    session_id = match.group(1)
+                    if spec.harness == "agy":
+                        trace_end.update(conversation_id=session_id, conversation_link=f"conversation://{session_id}",
+                                         resume_cmd=f"agy --conversation {session_id}")
+                    else:
+                        command = "codex resume" if spec.harness == "codex" else "opencode -s"
+                        trace_end.update(session_id=session_id, resume_cmd=f"{command} {session_id}")
+                    break
         append_session_trace(run_dir, trace_end, trace_sink)
 
 
@@ -3165,6 +3224,12 @@ def run_two_axis_review(
                 + "\n".join(f"- {h}" for h in sorted(set(added_secret_hits)))
             )
     diff_text = redact_secrets(raw_diff_text)
+    if "\x00" in raw_diff_text:
+        # A diff attribute can force UTF-16 text, including removed credentials, into the review patch.
+        ascii_view = raw_diff_text.replace("\x00", "")
+        safe_view = redact_secrets(ascii_view)
+        if safe_view != ascii_view:
+            diff_text = safe_view
     diff_redacted_for_review = diff_text != raw_diff_text
     atomic_write_text(diff_patch_path, diff_text)
     diff_patch_sha256 = sha256_file(diff_patch_path)
@@ -4255,9 +4320,9 @@ def execute_ticket(
                     }
 
                 verify_worktree_branch_integrity(worktree, repo_common, branch, base_sha)
-                active_setup_paths = tuple(_active_setup_files(worktree, setup_files))
+                # The setup paths stay excluded across rework, even if verification writes to them.
                 candidate_sha, staged_secret_hits = orchestrator_commit(
-                    worktree, issue["identifier"], issue["title"], attempt, setup_paths=active_setup_paths,
+                    worktree, issue["identifier"], issue["title"], attempt, setup_paths=tuple(setup_files),
                 )
                 if staged_secret_hits:
                     if any("ticket title" in h for h in staged_secret_hits):
@@ -4732,7 +4797,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
                 or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", state.get("candidate_sha") or "")
                 or state.get("branch") != f"feat/{issue['identifier'].lower()}"):
             raise RuntimeError(f"Checkpoint at {state.get('stage')!r} lacks verified publish evidence.")
-        worktree = Path(state["worktree"])
+        worktree = _worktree_cache_path(rkey, issue["identifier"].upper())
+        if Path(state["worktree"]) != worktree:
+            raise RuntimeError("Checkpoint worktree differs from the managed ticket path.")
         if not (worktree / ".git").exists():
             raise RuntimeError(f"Worktree missing at {worktree}; cannot reconcile.")
         if get_git_common_dir(worktree) != repo_common:
@@ -5196,7 +5263,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     started = client.list_project_issues(proj["id"], state_type="started")
     runnable, blocked, skipped = collect_runnable_tickets(client, unstarted)
 
-    wt_root = _cache_root() / "worktrees" / rkey
+    wt_root = _worktree_cache_path(rkey)
     active_wts: list[dict[str, Any]] = []
     if wt_root.is_dir():
         for p in sorted(wt_root.iterdir()):
@@ -5348,6 +5415,7 @@ def cleanup_baseline(repo_root: Path, rkey: str, wt: Path, force: bool) -> None:
         if tracked_dirty and not force:
             raise RuntimeError("baseline has modified tracked files")
         # Allow reclaiming detached baselines with untracked bootstrap/verify artifacts (e.g., node_modules/.venv)
+        _worktree_cache_path(rkey, wt.name)
         run_cmd(git_cmd("worktree", "remove", "--force", str(wt)), cwd=repo_root, check=True, env_role="orchestrator")
         owner_file.unlink()
 
@@ -5359,7 +5427,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     base_branch = detect_default_branch(repo_root)
     gh_repo = parse_github_owner_repo(repo_root)
     use_gh = bool(gh_repo or os.environ.get("AGENT_DISPATCH_FORCE_GH") == "1")
-    wt_root = _cache_root() / "worktrees" / rkey
+    wt_root = _worktree_cache_path(rkey)
     removed: list[str] = []
     skipped: list[str] = []
 
@@ -5439,6 +5507,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                             if current_ref.stdout.strip() != ref or current_sha.stdout.strip() != head_sha:
                                 skipped.append(f"{wt.name} (branch or HEAD changed during cleanup)")
                                 continue
+                            _worktree_cache_path(rkey, wt.name)
                             rm_cmd = git_cmd("worktree", "remove", *(["--force"] if args.all else []), str(wt))
                             rm_res = run_cmd(rm_cmd, cwd=repo_root, env_role="orchestrator")
                             if rm_res.returncode != 0:
