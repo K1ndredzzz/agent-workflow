@@ -348,6 +348,44 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                            "- X-API-Key: Identifies"):
                 self.assertTrue(ad.scan_text_for_secrets(source, "literal"))
 
+    def test_yaml_alias_git_gates_use_the_file_at_each_revision(self) -> None:
+        for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+            with self.subTest(encoding=encoding), tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                _git(repo, "init", "-b", "main")
+                _git(repo, "config", "user.name", "Test")
+                _git(repo, "config", "user.email", "test@example.invalid")
+                safe = repo / "gateway config.yaml"
+                unsafe = repo / "other.yaml"
+                headers = "\nheaders:\n  Accept: application/json\n"
+                prefix = "" if encoding == "utf-8" else "\ufeff"
+                safe.write_bytes((prefix + "key: &gateway_key ${GATEWAY_KEY}" + headers).encode(encoding))
+                unsafe.write_bytes((prefix + "key: &gateway_key syntheticLiteral" + headers).encode(encoding))
+                _git(repo, "add", ".")
+                _git(repo, "commit", "-m", "existing anchors")
+                base = _git(repo, "rev-parse", "HEAD")
+                add_header = "  X-API-Key: *gateway_key\n"
+                with safe.open("ab") as fh:
+                    fh.write(add_header.encode(encoding))
+                self.assertFalse(ad._scan_before_git_write(repo))
+                _git(repo, "add", ".")
+                self.assertFalse(ad.scan_staged_for_secrets(repo))
+                _git(repo, "commit", "-m", "reference existing placeholder")
+                self.assertFalse(ad.scan_range_for_secrets(repo, base, "HEAD"))
+
+                # A new safe declaration in a sibling cannot authorize the literal in other.yaml.
+                (repo / "a-example.yaml").write_text("key: &gateway_key ${GATEWAY_KEY}" + headers)
+                with unsafe.open("ab") as fh:
+                    fh.write(add_header.encode(encoding))
+                _git(repo, "add", ".")
+                self.assertTrue(ad.scan_staged_for_secrets(repo))
+                _git(repo, "commit", "-m", "synthetic unsafe revision")
+                unsafe.write_bytes((prefix + "key: &gateway_key ${GATEWAY_KEY}" + headers + add_header).encode(encoding))
+                _git(repo, "commit", "-am", "replace literal")
+                self.assertTrue(ad.scan_range_for_secrets(repo, base, "HEAD"))
+                self.assertFalse(ad.scan_range_for_secrets(repo, "HEAD^", "HEAD"))
+
+
     def test_nested_authorization_headers_are_redacted_in_structured_logs(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             folder = Path(td)

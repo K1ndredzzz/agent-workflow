@@ -2500,20 +2500,54 @@ def _added_patch_lines(patch: str) -> Iterator[str]:
             yield line[1:]
 
 
-def _scan_git_bytes(data: bytes, field: str) -> list[str]:
-    hits = scan_text_for_secrets(data.decode("utf-8", errors="replace"), field)
-    if hits or not re.search(rb"(?:[ -~]\x00){3}|(?:\x00[ -~]){3}", data):
-        return hits
-    # Git splits a UTF-16 hunk at the LF byte, including on a code-unit boundary
-    # different from the preceding hunk. Keep each added line and try both alignments.
+def _git_text_views(data: bytes) -> Iterator[str]:
+    yield data.decode("utf-8", errors="replace")
+    if not re.search(rb"(?:[ -~]\x00){3}|(?:\x00[ -~]){3}", data):
+        return
+    # Git splits at the LF byte, including inside UTF-16 code units. Try each initial
+    # alignment and carry it across the physical lines so related YAML lines agree.
     lines = data.split(b"\n")
     for encoding in ("utf-16-le", "utf-16-be"):
         for offset in (0, 1):
-            decoded = "\n".join(line[offset:].decode(encoding, errors="replace").lstrip("\ufeff")
-                                for line in lines)
-            hits = scan_text_for_secrets(decoded, field)
-            if hits:
+            decoded = []
+            for line in lines:
+                end = len(line) - (len(line) - offset) % 2
+                decoded.append(line[offset:end].decode(encoding, errors="replace").lstrip("\ufeff"))
+                offset = (offset + len(line) + 1) % 2
+            yield "\n".join(decoded)
+
+
+def _scan_git_bytes(data: bytes, field: str) -> list[str]:
+    for text in _git_text_views(data):
+        hits = scan_text_for_secrets(text, field)
+        if hits:
+            return hits
+    return []
+
+
+def _scan_contextual_additions(hunk: str) -> list[str]:
+    # A full-context diff contains the exact postimage for this file revision. Remove
+    # deleted lines and Git's annotations before resolving aliases, keeping the added rows.
+    rows = [line for line in hunk.split("\n") if line.startswith((" ", "+"))]
+    added = [i for i, row in enumerate(rows) if row.startswith("+")]
+    image = "\n".join(row[1:] for row in rows).encode("latin-1")
+
+    def resolve(m: re.Match[str]) -> str:
+        if m[4] and _yaml_alias_to_placeholder(m, m[4]):
+            # Keep the referenced text available to the other credential detectors.
+            return m[4]
+        return m[0]
+
+    for text in _git_text_views(image):
+        lines = _API_KEY_HEADER_VALUE.sub(resolve, text).split("\n")
+        changed = [lines[i] for i in added]
+        # Check unresolved aliases in isolation so concatenation cannot discard a rebinding.
+        for line in changed:
+            if "*" in line and (hits := scan_text_for_secrets(line, "added file content")):
                 return hits
+        hits = scan_text_for_secrets("\n".join(changed), "added file content")
+        if hits:
+            return hits
     return []
 
 
@@ -2531,13 +2565,35 @@ def _scan_git_changes_for_secrets(worktree: Path, command: list[str], *, ignore_
             findings.add(f"Potential secret file: {redact_secrets(path)}")
 
     # --text scans content even when Git would hide the patch because of NUL or attributes.
-    patch = run_cmd(
-        git_cmd(*command, *flags, "-p", "--text", "-U0"),
-        cwd=worktree, check=True, env_role="orchestrator", cap_output=False,
-        stdout_encoding="latin-1", ignore_shutdown=ignore_shutdown,
-    ).stdout
-    added = "\n".join(_added_patch_lines(patch)).encode("latin-1")
-    findings.update(_scan_git_bytes(added, "added file content"))
+    def read_patch(*options: str) -> str:
+        return run_cmd(
+            git_cmd(*command, *flags, "--full-index", "-p", "--text", *options),
+            cwd=worktree, check=True, env_role="orchestrator", cap_output=False,
+            stdout_encoding="latin-1", ignore_shutdown=ignore_shutdown,
+        ).stdout
+
+    pending = set()
+    for block in ("\n" + read_patch("-U0")).split("\ndiff --git ")[1:]:
+        added = "\n".join(_added_patch_lines(block)).encode("latin-1")
+        if b"*" in added and any(
+            m[4] and m[4].startswith("*") and m[4][1:].isidentifier()
+            for view in _git_text_views(added) for m in _API_KEY_HEADER_VALUE.finditer(view)
+        ):
+            pending.add(block.partition("\n@@ ")[0])
+        else:
+            findings.update(_scan_git_bytes(added, "added file content"))
+
+    if pending:
+        # Only changes containing a literal asterisk can add an alias. Match the
+        # filename and full blob IDs so a second read cannot substitute a newer change.
+        contextual = read_patch("-U2147483647", "-G", r"\*")
+        for block in ("\n" + contextual).split("\ndiff --git ")[1:]:
+            header, _, hunk = block.partition("\n@@ ")
+            if header in pending:
+                findings.update(_scan_contextual_additions(hunk))
+                pending.remove(header)
+        if pending:
+            raise RuntimeError("Git change disappeared while resolving a YAML alias. Retry the scan.")
     return sorted(findings)
 
 
