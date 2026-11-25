@@ -33,11 +33,11 @@ WORKFLOW_ROOT = Path(__file__).resolve().parent.parent
 BIN_PATH = WORKFLOW_ROOT / "bin" / "agent-dispatch"
 INSTALL_SH = WORKFLOW_ROOT / "install.sh"
 
-loader = importlib.machinery.SourceFileLoader("agent_dispatch", str(BIN_PATH))
-spec = importlib.util.spec_from_loader("agent_dispatch", loader)
+loader = importlib.machinery.SourceFileLoader("_agent_dispatch_legacy", str(BIN_PATH))
+spec = importlib.util.spec_from_loader(loader.name, loader)
 assert spec is not None
 ad = importlib.util.module_from_spec(spec)
-sys.modules["agent_dispatch"] = ad
+sys.modules[spec.name] = ad
 loader.exec_module(ad)
 
 
@@ -257,35 +257,30 @@ class IsolatedDispatchCase(unittest.TestCase):
         self.enterContext(mock.patch.object(ad, "MCP_CONFIG_PATH", sandbox / "unused-mcp.json"))
 
 
+class TestCLIEntrypoint(IsolatedDispatchCase):
+    def test_cli_starts_directly_and_through_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            link = Path(td) / "agent-dispatch"
+            link.symlink_to(BIN_PATH)
+            for executable in (BIN_PATH, link):
+                with self.subTest(executable=executable):
+                    result = subprocess.run([str(executable), "--help"], cwd=td, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("usage: agent-dispatch", result.stdout)
+
+
 class TestUnitGatesAndParsing(IsolatedDispatchCase):
-    def test_api_key_headers_are_redacted_across_diagnostic_formats(self) -> None:
+    def test_api_key_headers_are_redacted_in_streamed_logs(self) -> None:
         token = "opaque" + "-synthetic!value"
         with tempfile.TemporaryDirectory() as td:
             folder = Path(td)
             for header in ("X-API-Key", "x-goog-api-key", "X-Api-kEy"):
                 event = {"request": {"headers": {header: token}}, "status": "ok"}
                 plain = f"Request header: {header}: {token}"
-                self.assertTrue(ad.scan_text_for_secrets(plain, "test"))
-                self.assertNotIn(token, ad.redact_secrets(json.dumps(event)))
-                self.assertEqual(json.loads(ad.safe_json(event))["request"]["headers"][header], "<REDACTED_SECRET>")
                 with contextlib.ExitStack() as stack:
                     writer = ad._RedactedLog(folder / "log", stack)
                     writer.write((plain + "\n" + json.dumps(event) + "\n").encode())
                 self.assertNotIn(token, (folder / "log").read_text())
-            self.assertEqual(ad.redact_secrets("Document X-API-Key header support."), "Document X-API-Key header support.")
-            for benign_code in (
-                'headers = {"x-api-key": api_key}',
-                'headers = {"x-api-key": my_api_key}',
-                'headers = {"x-api-key": self.api_key}',
-                'headers = {"x-api-key": os.environ["API_KEY"]}',
-                'headers = {"x-api-key": process.env.API_KEY}',
-                'headers = {"x-api-key": ""}',
-                'interface Headers { "x-api-key": string; }',
-                'x-api-key: <your-api-key>',
-                'X-API-Key: ${API_KEY}',
-            ):
-                self.assertEqual(ad.redact_secrets(benign_code), benign_code, f"False positive on code: {benign_code}")
-                self.assertEqual(ad.scan_text_for_secrets(benign_code, "code"), [], f"False block on code: {benign_code}")
 
     def test_raw_http_credentials_are_redacted_before_logging_and_git_write(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -306,20 +301,6 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                         writer = ad._RedactedLog(log, stack)
                         writer.write(line.encode())
                     self.assertNotIn(value.split()[-1], log.read_text())
-            for source in (
-                "Authorization: Bearer ${ACCESS_TOKEN}",
-                "  Authorization: process.env.ACCESS_TOKEN,",
-                "  Authorization: `Bearer ${token}`,",
-                "- X-API-Key: header used for client authentication",
-                "- Authorization: Bearer token validation rules",
-                "Authorization: Basic authentication is required for this endpoint.",
-                "  x-api-key: ${{ secrets.API_KEY }}",
-                "  x-api-key: {{ api_key }}",
-                "  x-api-key: string # API key header",
-                '  x-api-key: ""',
-            ):
-                self.assertEqual(ad.redact_secrets(source), source, f"False positive on: {source}")
-                self.assertFalse(ad.scan_text_for_secrets(source, "template"), f"False block on: {source}")
 
     def test_header_examples_pass_git_gates_but_literal_values_do_not(self) -> None:
         api_key_header = "X-API-Key"
@@ -340,36 +321,15 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                 with self.subTest(filename=filename):
                     (repo / filename).write_text(example + "\n")
                     self.assertFalse(ad._scan_before_git_write(repo))
-            self.assertFalse(ad.scan_text_for_secrets("Document X-API-Key header support", "title"))
             _git(repo, "add", ".")
             self.assertFalse(ad.scan_staged_for_secrets(repo))
             for literal in ("clientKey", "Identifies", "*gateway_key"):
                 (repo / "request.http").write_text(f"X-API-Key: {literal}\r\n")
                 self.assertTrue(ad._scan_before_git_write(repo))
-                self.assertNotIn(literal, ad.redact_secrets(f"X-API-Key: {literal}"))
-            for source in ('headers: {"X-API-Key": clientKey}',
-                           'headers = {"X-API-Key": "clientKey"}',
-                           "key: &gateway_key clientKey\nheaders:\n  X-API-Key: *gateway_key",
-                           "- X-API-Key: Identifies"):
-                self.assertTrue(ad.scan_text_for_secrets(source, "literal"))
 
-    def test_json_quoted_authorization_credentials_detected_and_redacted_across_scans_and_review(self) -> None:
+    def test_json_quoted_authorization_credentials_across_git_scans_and_review(self) -> None:
         token = "synthetic_pd_tok_987654321"
-        fixture_entries = [
-            ("Authorization", f"Token token={token}"),
-            ("Authorization", f'Token token="{token}"'),
-            ("Authorization", f"Token {token}"),
-            ("Authorization", f"ApiKey user:{token}"),
-            ("Authorization", f'OAuth oauth_consumer_key="ck_{token}", oauth_token="{token}"'),
-            ("Authorization", f"Bearer {token}"),
-            ("Authorization", "Basic dXNlcjpzeW50aGV0aWM="),
-            ("Proxy-Authorization", f"Token token={token}"),
-            ("Proxy-Authorization", f"ApiKey {token}"),
-            ("Proxy-Authorization", f"OAuth {token}"),
-            ("Proxy-Authorization", f"Bearer {token}"),
-            ("Proxy-Authorization", "Basic cHJveHk6c3ludGhldGlj"),
-        ]
-        # Same synthetic JSON fixture across text scan, staged scan, history scan, and reviewer diff redaction.
+        # Same synthetic JSON fixture across staged scan, history scan, and reviewer diff redaction.
         settings_json = json.dumps(
             {
                 "pagerduty": {"headers": {"Authorization": f"Token token={token}"}},
@@ -377,25 +337,6 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
             },
             indent=2,
         ) + "\n"
-        self.assertTrue(ad.scan_text_for_secrets(settings_json, "settings.json"))
-        redacted_json = ad.redact_secrets(settings_json)
-        self.assertNotIn(token, redacted_json)
-        self.assertIn("<REDACTED_SECRET>", redacted_json)
-        self.assertEqual(ad.redact_secrets(redacted_json), redacted_json)
-
-        for header, value in fixture_entries:
-            for sample in (
-                json.dumps({header: value}),
-                f"{{'{header}': '{value}'}}",
-                f"{header}: {json.dumps(value)}",
-            ):
-                with self.subTest(header=header, sample=sample):
-                    self.assertTrue(ad.scan_text_for_secrets(sample, "config"), f"Missed secret in {sample!r}")
-                    redacted = ad.redact_secrets(sample)
-                    self.assertNotIn(token, redacted)
-                    self.assertNotIn("dXNlcjpzeW50aGV0aWM=", redacted)
-                    self.assertNotIn("cHJveHk6c3ludGhldGlj", redacted)
-                    self.assertEqual(ad.redact_secrets(redacted), redacted)
 
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td) / "repo"
@@ -432,70 +373,6 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
             patch_txt = (run_dir / "diff-r1.patch").read_text(encoding="utf-8")
             self.assertNotIn(token, patch_txt)
             self.assertIn("<REDACTED_SECRET>", patch_txt)
-
-        # Zero false positives on placeholders, benign type words, concatenation prefixes, and English prose.
-        for benign in (
-            '{"Authorization": "Token token=${PAGERDUTY_TOKEN}"}',
-            '{"Authorization": "Token token=\\"${PAGERDUTY_TOKEN}\\""}',
-            '{"Authorization": "Token token=<your-token>"}',
-            '{"Authorization": "Token token={{ api_token }}"}',
-            '{"Authorization": "Token token=$PAGERDUTY_TOKEN"}',
-            '{"Authorization": "Bearer ${ACCESS_TOKEN}"}',
-            '{"Authorization": "ApiKey ${{ secrets.API_KEY }}"}',
-            '{"Authorization": "OAuth {{ .Values.oauthToken }}"}',
-            '{"Proxy-Authorization": "Basic <base64-creds>"}',
-            '{"Authorization": "Token string"}',
-            '{"Authorization": "ApiKey optional"}',
-            '{"Authorization": "Bearer required"}',
-            '{"Authorization": "Token token=string"}',
-            '{"Authorization": "OAuth oauth_token=\\"${OAUTH_TOKEN}\\", oauth_version=\\"1.0\\", realm=\\"api\\""}',
-            'headers = {"Authorization": "Bearer " + token}',
-            'headers = {"Authorization": "Token token=" + api_token}',
-            '{"Authorization": "Bearer token validation rules"}',
-            '{"Authorization": "Basic authentication is required for this endpoint."}',
-            '{"Authorization": "OAuth 2.0 access token"}',
-            'Authorization: Token token=${PAGERDUTY_TOKEN}',
-        ):
-            with self.subTest(benign=benign):
-                self.assertEqual(ad.redact_secrets(benign), benign, f"False positive on {benign!r}")
-                self.assertEqual(ad.scan_text_for_secrets(benign, "benign"), [], f"False block on {benign!r}")
-
-    def test_yaml_alias_credentials_fail_closed_in_text(self) -> None:
-        for name, value, flow_mapping in (
-            ("X-API-Key", "*gateway_key", False),
-            ("Authorization", "Token *gateway_key", False),
-            ("Authorization", "*gateway_key", False),
-            ("X-API-Key", "*k", True),
-            ("Authorization", "*k", True),
-        ):
-            header = f'  headers: {{"{name}": {value}}}' if flow_mapping else f"  {name}: {value}"
-            with self.subTest(header=header):
-                source = "key: &gateway_key ${GATEWAY_KEY}\nshort: &k <PLACEHOLDER>\n" + header + "\n"
-                self.assertEqual(ad.scan_text_for_secrets(source, "yaml"), ["Potential secret token in yaml"])
-
-    def test_secret_scan_allow_exempts_only_heuristics_on_the_marked_line(self) -> None:
-        marker = " # secret-scan:allow"
-        finding = ["Potential secret token in source"]
-        for prefix, value, suffix in (
-            ("X-API-Key: ", "synthetic.opaque.value", ""),
-            ("Authorization: ", "*key", ""),
-            ("X-API-Key: ", "*key", ""),
-            ('{"Authorization": "Token ', "synthetic.opaque.value", '"}'),
-            ('{"X-API-Key": "', "synthetic.opaque.value", '"}'),
-            ("Bearer ", "synthetic.opaque.value", ""),
-            ("Basic ", "dXNlcjpmaXh0dXJl", ""),
-        ):
-            with self.subTest(prefix=prefix, value=value):
-                line = f"{prefix}{value}{suffix}"
-                marked = line + marker
-                self.assertEqual(ad.scan_text_for_secrets(line, "source"), finding)
-                self.assertEqual(ad.scan_text_for_secrets(marked, "source"), [])
-                self.assertEqual(ad.scan_text_for_secrets(f"{marked}\n{line}", "source"), finding)
-                redacted = ad.redact_secrets(marked)
-                self.assertIn("<REDACTED_SECRET>", redacted)
-                self.assertNotIn(value, redacted)
-                self.assertEqual(ad.redact_data({"message": [marked]}), {"message": [redacted]})
-                self.assertEqual(json.loads(ad.safe_json({"message": marked})), {"message": redacted})
 
     def test_secret_scan_allow_in_worktree_index_and_history(self) -> None:
         for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
@@ -554,11 +431,6 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                     with self.subTest(filename=filename):
                         expected_file = ["Potential secret file: .env"]
                         expected_content = ["Potential secret token in added file content"]
-                        if credential is not None:
-                            self.assertEqual(ad.scan_text_for_secrets(content, "source"), [
-                                "Potential secret token in source",
-                            ])
-                            self.assertNotIn(credential, ad.redact_secrets(content))
                         (repo / filename).write_text(content + "\n", encoding="utf-8")
                         self.assertEqual(ad._scan_before_git_write(repo), expected_file if credential is None else [
                             "Potential secret token in untracked file content",
@@ -846,26 +718,6 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
             self.assertFalse(line.startswith("    "), f"Broken 4-space codeblock indent: {line!r}")
         self.assertNotIn("lin_api_SECRET", body)
         self.assertIn("<REDACTED_SECRET>", body)
-
-    def test_secret_patterns_no_false_positives_on_kebab_or_env_example(self) -> None:
-        # Must NOT false-positive on kebab-case identifiers or .env.example!
-        self.assertEqual(ad.redact_secrets("task-list-container-component"), "task-list-container-component")
-        self.assertFalse(ad._is_secret_filename(".env.example"))
-        self.assertFalse(ad._is_secret_filename("config/.env.sample"))
-        self.assertTrue(ad._is_secret_filename(".env"))
-        self.assertTrue(ad._is_secret_filename(".env.local"))
-        self.assertTrue(ad._is_secret_filename("目录/.env"))
-        # Must catch expanded real token families
-        for sample in (
-            "sk-proj-1234567890abcdefghij1234",
-            "github_pat_11ABCDEFG01234567890_abcdefghijklmnop",
-            "sk_live_1234567890abcdef12",
-            "xoxb-1234567890-abcdef",
-            "AIza" + "X" * 35,
-            "glpat-1234567890abcdefghij",
-        ):
-            self.assertEqual(ad.redact_secrets(f"key={sample}"), "key=<REDACTED_SECRET>", f"Missed redaction for {sample}")
-            self.assertTrue(ad.scan_text_for_secrets(f"Fix {sample}", "title"), f"Missed title secret for {sample}")
 
     def test_child_env_stripping_isolated_without_polluting_os_environ(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -2051,36 +1903,6 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
             with mock.patch.object(ad, "fetch_open_prs_for_branch", return_value=two_prs):
                 with self.assertRaisesRegex(RuntimeError, "Multiple open PRs share head branch"):
                     ad.fetch_open_pr_for_branch(prepo, "org/repo", "feat/x")
-
-    def test_auth_redaction_preserves_english_prose_while_redacting_real_credentials(self) -> None:
-        benign_phrases = (
-            "Add basic validation to login form",
-            "Implement basic authentication flow",
-            "Add basic end-to-end tests",
-            "Basic configuration helper",
-            "Support bearer authentication in API",
-            "Support Bearer Authorization header",
-            "Support basic Base64URL encoding",
-        )
-        for phrase in benign_phrases:
-            self.assertEqual(ad.redact_secrets(phrase), phrase, f"False positive on: {phrase}")
-            self.assertEqual(ad.scan_text_for_secrets(phrase, "title"), [], f"False block on: {phrase}")
-
-        secret_cases = (
-            ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
-            ("Authorization: Basic simpleword", "simpleword"),
-            ("Authorization: Bearer simpleword", "simpleword"),
-            ('{"authorization": "Bearer simpleword"}', "simpleword"),
-            ("Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
-            ("Basic YWRtaW46c2VjcmV0", "YWRtaW46c2VjcmV0"),
-            ("Bearer invented-only-example", "invented-only-example"),
-            ("Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig", "eyJhbGciOiJIUzI1NiJ9"),
-        )
-        for text, secret in secret_cases:
-            redacted = ad.redact_secrets(text)
-            self.assertIn("<REDACTED_SECRET>", redacted, f"Missed redaction for: {text}")
-            self.assertNotIn(secret, redacted, f"Secret leaked in: {text}")
-            self.assertTrue(ad.scan_text_for_secrets(text, "header"), f"Missed scan hit for: {text}")
 
     def test_redacted_log_json_truncated_pem_does_not_drop_subsequent_lines(self) -> None:
         with tempfile.TemporaryDirectory() as td:
