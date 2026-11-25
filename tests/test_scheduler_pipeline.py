@@ -5,13 +5,99 @@ import os
 import signal
 import subprocess
 import tempfile
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from agent_dispatch import brief, config, git_ops, harness, linear, pipeline, process, publish, recovery, review, scheduler
+from agent_dispatch import brief, cli, config, git_ops, harness, linear, pipeline, process, publish, recovery, review, scheduler
 
-from tests.helpers import FakeLinearState, IsolatedDispatchCase, _git, start_fake_linear
+from tests.helpers import FakeLinearState, IsolatedDispatchCase, _git, _write_exec, start_fake_linear
+
+
+class TestCLI(IsolatedDispatchCase):
+    def setUp(self) -> None:
+        super().setUp()
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            self.addCleanup(signal.signal, signum, signal.getsignal(signum))
+
+    def test_rework_rejects_values_outside_the_inclusive_range(self) -> None:
+        for value in ("-1", "6"):
+            with self.subTest(value=value), redirect_stderr(StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as exit_info:
+                    cli.main(["run", "TST-1", "--max-rework", value])
+                self.assertEqual(exit_info.exception.code, 2)
+                self.assertIn(f"--max-rework must be between 0 and 5 (got {value})", stderr.getvalue())
+
+    def test_positive_integer_flags_reject_zero_and_negative_values(self) -> None:
+        cases = (
+            (["frontier"], "--max-parallel", "0"),
+            (["spec", "TST-1"], "--limit", "-1"),
+            (["review"], "--review-timeout", "0"),
+            (["run", "TST-1"], "--verify-timeout", "-1"),
+            (["run", "TST-1"], "--setup-timeout", "0"),
+            (["run", "TST-1"], "--worker-timeout", "-1"),
+        )
+        for command, flag, value in cases:
+            with self.subTest(command=command, flag=flag), redirect_stderr(StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as exit_info:
+                    cli.main([*command, flag, value])
+                self.assertEqual(exit_info.exception.code, 2)
+                self.assertIn(f"argument {flag}: must be a positive integer (got {value})", stderr.getvalue())
+
+    def test_rework_accepts_both_endpoints_and_positive_timeout(self) -> None:
+        for value in ("0", "5"):
+            with self.subTest(value=value), redirect_stderr(StringIO()) as stderr:
+                status = cli.main(["run", "TST-1", "--repo", str(self.sandbox),
+                                   "--max-rework", value, "--verify-timeout", "1"])
+                self.assertEqual(status, 2)
+                error = json.loads(stderr.getvalue())
+                self.assertEqual(error["status"], "error")
+                self.assertIn("Not inside a git repository", error["error"])
+
+    def test_routes_each_subcommand(self) -> None:
+        repo = self.sandbox / "demo-repo"
+        repo.mkdir()
+        _git(repo, "init", "-b", "main")
+        _git(repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+             "commit", "--allow-empty", "-m", "base")
+        fake_bin = self.sandbox / "bin"
+        fake_bin.mkdir()
+        _write_exec(fake_bin / "gh", "#!/bin/sh\nexit 1\n")
+        state = FakeLinearState()
+        state.add_issue("TST-1", "Example ticket", "")
+        server, url = start_fake_linear(state)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.enterContext(mock.patch.dict(os.environ, {
+            "AGENT_DISPATCH_LINEAR_URL": url,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        }))
+
+        cases = (
+            (["run", "TST-1", "--worker", "unknown"], 2, "error", "Unsupported harness 'unknown'"),
+            (["resume", "TST-1"], 2, "error", "No checkpoint found"),
+            (["frontier"], 0, "status", "empty_frontier"),
+            (["spec", "TST-1"], 2, "error", "TST-1 has no child issues."),
+            (["review", "--base", "main"], 2, "error", "Empty diff between"),
+            (["status"], 0, "linear_project", "demo-repo"),
+            (["doctor"], 1, "ok", False),
+            (["cleanup"], 0, "removed", []),
+        )
+        for command, status, key, expected in cases:
+            with self.subTest(command=command), redirect_stdout(StringIO()) as stdout, redirect_stderr(StringIO()) as stderr:
+                self.assertEqual(cli.main([*command, "--repo", str(repo)]), status)
+                if status == 2:
+                    self.assertEqual(stdout.getvalue(), "")
+                    data = json.loads(stderr.getvalue())
+                    self.assertEqual(data["status"], "error")
+                    self.assertIn(expected, data[key])
+                else:
+                    data = json.loads(stdout.getvalue())
+                    self.assertEqual(data[key], expected)
+                    if command == ["doctor"]:
+                        self.assertEqual(data["checks"]["gh_auth"], {"ok": False})
 
 
 class TestRecovery(IsolatedDispatchCase):
