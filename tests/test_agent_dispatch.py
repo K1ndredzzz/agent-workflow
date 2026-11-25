@@ -385,6 +385,94 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                 self.assertTrue(ad.scan_range_for_secrets(repo, base, "HEAD"))
                 self.assertFalse(ad.scan_range_for_secrets(repo, "HEAD^", "HEAD"))
 
+    def test_yaml_anchor_edits_check_only_the_referenced_declaration(self) -> None:
+        for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+            with self.subTest(encoding=encoding), tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                _git(repo, "init", "-b", "main")
+                _git(repo, "config", "user.name", "Test")
+                _git(repo, "config", "user.email", "test@example.invalid")
+                path = repo / "gateway.yaml"
+                declaration = 'key: &gateway-key "${GATEWAY_KEY}" # supplied at deployment\n'
+                header = f"headers:\n  {ad._API_KEY_HEADERS[0]}: *gateway-key\n"
+                path.write_bytes(declaration.encode(encoding))
+                _git(repo, "add", ".")
+                _git(repo, "commit", "-m", "existing placeholder")
+                safe = declaration + header
+
+                # The reference and the later changes to its target are separate commits.
+                for content, blocked in (
+                    (safe, False),
+                    (safe.replace('"${GATEWAY_KEY}"', "fixtureValue"), True),
+                    (safe, False),
+                    (safe + "other: &gateway-key unrelated\n", False),
+                ):
+                    path.write_bytes(content.encode(encoding))
+                    self.assertEqual(bool(ad._scan_before_git_write(repo)), blocked)
+                    _git(repo, "add", ".")
+                    self.assertEqual(bool(ad.scan_staged_for_secrets(repo)), blocked)
+                    _git(repo, "commit", "-m", "change config")
+                    self.assertEqual(bool(ad.scan_range_for_secrets(repo, "HEAD^", "HEAD")), blocked)
+                self.assertTrue(ad.scan_range_for_secrets(repo, "HEAD~4", "HEAD"))
+        for spoofed in (
+            "key: &gateway_key realLiteralSecret\nnote: ok # &gateway_key ${GATEWAY_KEY}\nheaders:\n  X-API-Key: *gateway_key\n",
+            "key: &gateway_key realLiteralSecret\nnote: foo - &gateway_key ${GATEWAY_KEY}\nheaders:\n  X-API-Key: *gateway_key\n",
+            'key: &gateway_key realLiteralSecret\nnote: "prefix: &gateway_key ${GATEWAY_KEY} # "\nheaders:\n  X-API-Key: *gateway_key\n',
+            "key: &gateway_key realLiteralSecret\nnote: |\n  fake: &gateway_key ${GATEWAY_KEY}\nheaders:\n  X-API-Key: *gateway_key\n",
+            "items: [&gateway_key realLiteralSecret]\nnote: |\n  fake: &gateway_key ${GATEWAY_KEY}\nheaders:\n  X-API-Key: *gateway_key\n",
+            '"a # b": &gateway_key realLiteralSecret\noverride: &gateway_key "${GATEWAY_KEY}"\nheaders:\n  X-API-Key: *gateway_key\n',
+        ):
+            self.assertTrue(ad.scan_text_for_secrets(spoofed, "yaml"), spoofed)
+        for benign in (
+            "# define &gateway_key via env\nkey: &gateway_key ${GATEWAY_KEY}\nheaders:\n  X-API-Key: *gateway_key\n",
+            "key: &gateway_key unrelatedDoc1\n---\nkey: &gateway_key ${GATEWAY_KEY}\nheaders:\n  X-API-Key: *gateway_key\n",
+            "description: Uses anchor &gateway_key for auth\nkey: &gateway_key ${GATEWAY_KEY}\nheaders:\n  Authorization: Token *gateway_key\n",
+        ):
+            self.assertFalse(ad.scan_text_for_secrets(benign, "yaml"), benign)
+
+        # Cover indented continuation anchors, Authorization headers, and deleting a shadowing placeholder anchor.
+        for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+            with self.subTest(edge_encoding=encoding), tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                _git(repo, "init", "-b", "main")
+                _git(repo, "config", "user.name", "Test")
+                _git(repo, "config", "user.email", "test@example.invalid")
+                path = repo / "auth.yaml"
+                indented_decl = 'key:\n  &gateway-key "${GATEWAY_KEY}"\n'
+                auth_header = "headers:\n  Authorization: Token *gateway-key\n"
+                path.write_bytes(indented_decl.encode(encoding))
+                _git(repo, "add", ".")
+                _git(repo, "commit", "-m", "indented placeholder")
+
+                # Adding Authorization: Token *gateway-key referencing existing placeholder must be allowed.
+                safe_auth = indented_decl + auth_header
+                path.write_bytes(safe_auth.encode(encoding))
+                self.assertFalse(ad._scan_before_git_write(repo))
+                _git(repo, "commit", "-am", "add auth alias")
+
+                # Editing the indented anchor to a literal must block.
+                path.write_bytes(safe_auth.replace('"${GATEWAY_KEY}"', "fixtureValue").encode(encoding))
+                self.assertTrue(ad._scan_before_git_write(repo))
+                _git(repo, "add", ".")
+                self.assertTrue(ad.scan_staged_for_secrets(repo))
+                _git(repo, "commit", "-m", "unsafe indented edit")
+                self.assertTrue(ad.scan_range_for_secrets(repo, "HEAD^", "HEAD"))
+
+                # Pre-existing literal shadowed by placeholder: deleting the placeholder must block.
+                shadowed = (
+                    "key: &gateway-key fixtureValue\n"
+                    'override: &gateway-key "${GATEWAY_KEY}"\n'
+                    f"headers:\n  {ad._API_KEY_HEADERS[0]}: *gateway-key\n"
+                )
+                path.write_bytes(shadowed.encode(encoding))
+                _git(repo, "commit", "-am", "legacy shadowed state")
+                path.write_bytes(shadowed.replace('override: &gateway-key "${GATEWAY_KEY}"\n', "").encode(encoding))
+                self.assertTrue(ad._scan_before_git_write(repo))
+                _git(repo, "add", ".")
+                self.assertTrue(ad.scan_staged_for_secrets(repo))
+                _git(repo, "commit", "-m", "delete shadowing placeholder")
+                self.assertTrue(ad.scan_range_for_secrets(repo, "HEAD^", "HEAD"))
+
 
     def test_nested_authorization_headers_are_redacted_in_structured_logs(self) -> None:
         with tempfile.TemporaryDirectory() as td:

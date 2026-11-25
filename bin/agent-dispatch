@@ -438,6 +438,20 @@ _API_KEY_HEADER_VALUE = re.compile(
 _API_KEY_PLACEHOLDER = re.compile(
     r"^(?:<[^>\s]+>|\$\{\{[^}]+\}\}|\{\{[^}]+\}\}|\$\{[^}\s]+\}|\$[A-Z_][A-Z0-9_]*)$"
 )
+_YAML_ALIAS = re.compile(r"\*[\w-]+")
+_YAML_ANCHOR = re.compile(r"(?:^|[\s\[{,])(&[\w-]+)(?=[ \t\r\n,\]}]|$)", re.M)
+_YAML_DOC_BOUNDARY = re.compile(r"^(?:---|\.\.\.)(?=[ \t\r\n]|$)", re.M)
+_YAML_ANCHOR_PREFIX = re.compile(
+    r"^(?:"
+    r"[ \t]*(?:-[ \t]+)*"
+    r"(?:(?:(?:[^#\"':\r\n]|:(?![ \t\r\n]))+|\"(?:\\.|[^\"\\\r\n])*\"|'(?:''|[^'\r\n])*')?:[ \t]+)?"
+    r"|[ \t]*(?:-[ \t]+)*\?[ \t]+"
+    r"|---[ \t]+"
+    r")$"
+)
+_YAML_ANCHOR_FLOW_PREFIX = re.compile(
+    r"(?:[\[{,][ \t]*|:[ \t]+|(?:^|[\s\[{,:?-])![^\s,[\]{}]*[ \t]+)$"
+)
 _API_KEY_BENIGN_WORDS = frozenset({
     "string", "str", "number", "boolean", "bool", "object", "any", "unknown",
     "null", "none", "nil", "true", "false", "undefined", "required", "optional",
@@ -483,21 +497,76 @@ def _redact_basic(m: re.Match[str]) -> str:
     return m.group(1) + m.group(2) + _REDACTED
 
 
-def _yaml_alias_to_placeholder(m: re.Match[str], value: str) -> bool:
-    if not value.startswith("*") or not value[1:].isidentifier():
-        return False
+def _yaml_prefix_state(prefix: str) -> tuple[bool, bool]:
+    quote = ""
+    escaped = False
+    for i, ch in enumerate(prefix):
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                quote = ""
+        elif quote == "'":
+            if escaped:
+                escaped = False
+            elif ch == "'":
+                if i + 1 < len(prefix) and prefix[i + 1] == "'":
+                    escaped = True
+                else:
+                    quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#" and (i == 0 or prefix[i - 1] in " \t"):
+            return True, False
+    return False, bool(quote)
+
+
+def _yaml_alias_binding(m: re.Match[str], value: str) -> tuple[tuple[int, ...], bool, int] | None:
+    if not _YAML_ALIAS.fullmatch(value):
+        return None
     start = m.string.rfind("\n", 0, m.start()) + 1
     if m.string[start:start + 1] not in (" ", "\t"):
-        return False
+        return None
+    doc_start = 0
+    for boundary in _YAML_DOC_BOUNDARY.finditer(m.string, 0, start):
+        doc_start = boundary.start() if boundary.group(0) == "---" else boundary.end()
     anchor = "&" + value[1:]
-    pos = m.string.rfind(anchor, 0, m.start())
-    if pos <= 0 or not m.string[pos - 1].isspace():
-        return False
-    end = m.string.find("\n", pos, m.start())
-    if end < 0:
-        return False
-    target = m.string[pos + len(anchor):end]
-    return target.startswith((" ", "\t")) and bool(_API_KEY_PLACEHOLDER.fullmatch(target.strip()))
+    positions: list[int] = []
+    all_placeholders = True
+    before = start
+    while (pos := m.string.rfind(anchor, doc_start, before)) >= 0:
+        before = pos
+        if (pos and m.string[pos - 1] not in " \t\r\n[{,") or m.string[pos + len(anchor)] not in " \t\r\n,]}":
+            continue
+        line = m.string.rfind("\n", 0, pos) + 1
+        prefix = m.string[line:pos]
+        has_comment, unclosed_quote = _yaml_prefix_state(prefix)
+        if has_comment or unclosed_quote:
+            continue
+        strict_prefix = bool(_YAML_ANCHOR_PREFIX.fullmatch(prefix))
+        if not strict_prefix and not _YAML_ANCHOR_FLOW_PREFIX.search(prefix):
+            continue
+        positions.append(pos)
+        if not strict_prefix:
+            all_placeholders = False
+            continue
+        end = m.string.index("\n", pos, start)
+        target = m.string[pos + len(anchor):end].strip()
+        target = re.split(r"[ \t]+#", target, maxsplit=1)[0]
+        if len(target) >= 2 and target[0] == target[-1] and target[0] in "\"'":
+            target = target[1:-1]
+        if not _API_KEY_PLACEHOLDER.fullmatch(target):
+            all_placeholders = False
+    if not positions:
+        return None
+    return tuple(positions), all_placeholders, doc_start
+
+
+def _yaml_alias_to_placeholder(m: re.Match[str], value: str) -> bool:
+    binding = _yaml_alias_binding(m, value)
+    return bool(binding and binding[1])
 
 
 def _redact_api_key_header(m: re.Match[str]) -> str:
@@ -2488,16 +2557,20 @@ def _is_secret_filename(path: str) -> bool:
     return any(pat.search(path) for pat in SECRET_FILENAME_PATTERNS)
 
 
-def _added_patch_lines(patch: str) -> Iterator[str]:
-    # Git headers are outside hunks. An added source line may itself begin with '++'.
+def _patch_lines(patch: str, prefix: str) -> Iterator[str]:
+    # Git headers are outside hunks. A source line may itself begin with '++' or '--'.
     in_hunk = False
     for line in patch.split("\n"):
         if line.startswith("diff --git "):
             in_hunk = False
         elif line.startswith("@@ "):
             in_hunk = True
-        elif in_hunk and line.startswith("+"):
+        elif in_hunk and line.startswith(prefix):
             yield line[1:]
+
+
+def _added_patch_lines(patch: str) -> Iterator[str]:
+    return _patch_lines(patch, "+")
 
 
 def _git_text_views(data: bytes) -> Iterator[str]:
@@ -2525,21 +2598,89 @@ def _scan_git_bytes(data: bytes, field: str) -> list[str]:
     return []
 
 
+def _has_yaml_alias_or_anchor(data: bytes) -> bool:
+    for view in _git_text_views(data):
+        if _YAML_ANCHOR.search(view):
+            return True
+        if any(m[4] and _YAML_ALIAS.fullmatch(m[4]) for m in _API_KEY_HEADER_VALUE.finditer(view)):
+            return True
+        if any(
+            _YAML_ALIAS.fullmatch(re.sub(r"[ \t]+#.*$", "", m[2].strip()).strip())
+            for m in _RAW_CREDENTIAL_FIELD.finditer(view)
+        ):
+            return True
+    return False
+
+
 def _scan_contextual_additions(hunk: str) -> list[str]:
-    # A full-context diff contains the exact postimage for this file revision. Remove
-    # deleted lines and Git's annotations before resolving aliases, keeping the added rows.
-    rows = [line for line in hunk.split("\n") if line.startswith((" ", "+"))]
-    added = [i for i, row in enumerate(rows) if row.startswith("+")]
-    image = "\n".join(row[1:] for row in rows).encode("latin-1")
+    # A full-context diff contains the exact preimage and postimage for this file revision.
+    post_rows: list[str] = []
+    pre_rows: list[tuple[str, int]] = []
+    for line in hunk.split("\n")[1:]:
+        if line.startswith(" "):
+            pre_rows.append((line, len(post_rows)))
+            post_rows.append(line)
+        elif line.startswith("+"):
+            post_rows.append(line)
+        elif line.startswith("-"):
+            pre_rows.append((line, len(post_rows)))
+    if not post_rows:
+        return []
+    added = [i for i, row in enumerate(post_rows) if row.startswith("+")]
+    post_image = "\n".join(row[1:] for row in post_rows).encode("latin-1")
+    pre_image = "\n".join(row[1:] for row, _ in pre_rows).encode("latin-1")
 
-    def resolve(m: re.Match[str]) -> str:
-        if m[4] and _yaml_alias_to_placeholder(m, m[4]):
-            # Keep the referenced text available to the other credential detectors.
-            return m[4]
-        return m[0]
+    deleted_anchors: dict[str, list[int]] = {}
+    if b"&" in pre_image:
+        for pre_text in _git_text_views(pre_image):
+            for line, (row, post_idx) in zip(pre_text.split("\n"), pre_rows):
+                if row.startswith("-") and "&" in line:
+                    for m in _YAML_ANCHOR.finditer(line):
+                        has_comment, unclosed_quote = _yaml_prefix_state(line[:m.start(1)])
+                        if not has_comment and not unclosed_quote:
+                            deleted_anchors.setdefault(m.group(1), []).append(post_idx)
 
-    for text in _git_text_views(image):
-        lines = _API_KEY_HEADER_VALUE.sub(resolve, text).split("\n")
+    for text in _git_text_views(post_image):
+        edited_anchors: set[int] = set()
+        line_starts: list[int] = []
+        offset = 0
+        for line, row in zip(text.split("\n"), post_rows):
+            line_starts.append(offset)
+            if row.startswith("+") and "&" in line:
+                for m in _YAML_ANCHOR.finditer(line):
+                    has_comment, unclosed_quote = _yaml_prefix_state(line[:m.start(1)])
+                    if not has_comment and not unclosed_quote:
+                        edited_anchors.add(offset + m.start(1))
+            offset += len(line) + 1
+        line_starts.append(offset)
+        unsafe_binding = False
+
+        def resolve_alias(m: re.Match[str], raw_val: str, keep: str) -> str:
+            nonlocal unsafe_binding
+            val = re.sub(r"[ \t]+#.*$", "", raw_val.strip()).strip()
+            binding = _yaml_alias_binding(m, val)
+            if binding:
+                positions, placeholder, doc_start = binding
+                if placeholder:
+                    # Preserve exact character offsets across passes while keeping trailing text scannable.
+                    return " " * len(m[1]) + keep
+                anchor = "&" + val[1:]
+                if any(p in edited_anchors for p in positions) or any(
+                    doc_start <= line_starts[idx] <= m.start()
+                    for idx in deleted_anchors.get(anchor, ())
+                ):
+                    unsafe_binding = True
+            return m[0]
+
+        resolved = _RAW_CREDENTIAL_FIELD.sub(
+            lambda m: resolve_alias(m, m[2], m[2]), text
+        )
+        resolved = _API_KEY_HEADER_VALUE.sub(
+            lambda m: resolve_alias(m, m[4], m[4]) if m[4] else m[0], resolved
+        )
+        if unsafe_binding:
+            return ["Potential secret token in added file content"]
+        lines = resolved.split("\n")
         changed = [lines[i] for i in added]
         # Check unresolved aliases in isolation so concatenation cannot discard a rebinding.
         for line in changed:
@@ -2574,19 +2715,21 @@ def _scan_git_changes_for_secrets(worktree: Path, command: list[str], *, ignore_
 
     pending = set()
     for block in ("\n" + read_patch("-U0")).split("\ndiff --git ")[1:]:
-        added = "\n".join(_added_patch_lines(block)).encode("latin-1")
-        if b"*" in added and any(
-            m[4] and m[4].startswith("*") and m[4][1:].isidentifier()
-            for view in _git_text_views(added) for m in _API_KEY_HEADER_VALUE.finditer(view)
+        header = block.partition("\n@@ ")[0]
+        added = "\n".join(_patch_lines(block, "+")).encode("latin-1")
+        deleted = "\n".join(_patch_lines(block, "-")).encode("latin-1")
+        deleted_file = header.splitlines()[-1] == "+++ /dev/null" if header else False
+        if not deleted_file and (
+            ((b"*" in added or b"&" in added) and _has_yaml_alias_or_anchor(added))
+            or (b"&" in deleted and any(_YAML_ANCHOR.search(view) for view in _git_text_views(deleted)))
         ):
-            pending.add(block.partition("\n@@ ")[0])
+            pending.add(header)
         else:
             findings.update(_scan_git_bytes(added, "added file content"))
 
     if pending:
-        # Only changes containing a literal asterisk can add an alias. Match the
-        # filename and full blob IDs so a second read cannot substitute a newer change.
-        contextual = read_patch("-U2147483647", "-G", r"\*")
+        # Bind the second read to the same file and blob IDs as the zero-context diff.
+        contextual = read_patch("-U2147483647", "-G", "[*&]")
         for block in ("\n" + contextual).split("\ndiff --git ")[1:]:
             header, _, hunk = block.partition("\n@@ ")
             if header in pending:
