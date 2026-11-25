@@ -7,12 +7,15 @@ import signal
 import subprocess
 import sys
 import tempfile
+import unittest
 from pathlib import Path
 from unittest import mock
 
-from agent_dispatch import config, process
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from helpers import IsolatedDispatchCase, WORKFLOW_ROOT
+from agent_dispatch import config, process
+from tests.helpers import IsolatedDispatchCase, WORKFLOW_ROOT
 
 PEM_BEGIN = "-----BEGIN " + "PRIVATE KEY-----"
 PEM_END = "-----END " + "PRIVATE KEY-----"
@@ -268,3 +271,7 @@ sys.exit(1)
                     cwd=WORKFLOW_ROOT, capture_output=True, text=True, timeout=6,
                 )
                 self.assertEqual(child.returncode, 0, child.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

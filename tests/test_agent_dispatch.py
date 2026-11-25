@@ -23,10 +23,13 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from helpers import FakeLinearState, IsolatedDispatchCase, WORKFLOW_ROOT, _git, _write_exec, start_fake_linear
-
 # Prevent SourceFileLoader from leaving .pyc artifacts inside bin/__pycache__
 sys.dont_write_bytecode = True
+
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from tests.helpers import FakeLinearState, IsolatedDispatchCase, WORKFLOW_ROOT, _git, _write_exec, start_fake_linear
 
 BIN_PATH = WORKFLOW_ROOT / "bin" / "agent-dispatch"
 INSTALL_SH = WORKFLOW_ROOT / "install.sh"
