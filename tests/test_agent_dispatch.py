@@ -322,10 +322,12 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                 self.assertFalse(ad.scan_text_for_secrets(source, "template"), f"False block on: {source}")
 
     def test_header_examples_pass_git_gates_but_literal_values_do_not(self) -> None:
+        api_key_header = "X-API-Key"
         examples = {
             "client.py": 'headers = {"X-API-Key": API_KEY_VALUE}',
             "client.js": 'const headers = { "X-API-Key": clientKey };',
-            "gateway.yaml": "key: &gateway_key ${GATEWAY_KEY}\nheaders:\n  X-API-Key: *gateway_key",
+            "gateway.yaml": "key: &gateway_key ${GATEWAY_KEY}\nheaders:\n"
+                            f"  {api_key_header}: *gateway_key # secret-scan:allow",
             "template.yaml": 'headers:\n  X-API-Key: "{{ .Values.gateway.apiKey }}"',
             "README.md": "- X-API-Key: Identifies the caller for authentication.",
         }
@@ -458,131 +460,119 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                 self.assertEqual(ad.redact_secrets(benign), benign, f"False positive on {benign!r}")
                 self.assertEqual(ad.scan_text_for_secrets(benign, "benign"), [], f"False block on {benign!r}")
 
-    def test_yaml_alias_git_gates_use_the_file_at_each_revision(self) -> None:
+    def test_yaml_alias_credentials_fail_closed_in_text(self) -> None:
+        for name, value, flow_mapping in (
+            ("X-API-Key", "*gateway_key", False),
+            ("Authorization", "Token *gateway_key", False),
+            ("Authorization", "*gateway_key", False),
+            ("X-API-Key", "*k", True),
+            ("Authorization", "*k", True),
+        ):
+            header = f'  headers: {{"{name}": {value}}}' if flow_mapping else f"  {name}: {value}"
+            with self.subTest(header=header):
+                source = "key: &gateway_key ${GATEWAY_KEY}\nshort: &k <PLACEHOLDER>\n" + header + "\n"
+                self.assertEqual(ad.scan_text_for_secrets(source, "yaml"), ["Potential secret token in yaml"])
+
+    def test_secret_scan_allow_exempts_only_heuristics_on_the_marked_line(self) -> None:
+        marker = " # secret-scan:allow"
+        finding = ["Potential secret token in source"]
+        for prefix, value, suffix in (
+            ("X-API-Key: ", "synthetic.opaque.value", ""),
+            ("Authorization: ", "*key", ""),
+            ("X-API-Key: ", "*key", ""),
+            ('{"Authorization": "Token ', "synthetic.opaque.value", '"}'),
+            ('{"X-API-Key": "', "synthetic.opaque.value", '"}'),
+            ("Bearer ", "synthetic.opaque.value", ""),
+            ("Basic ", "dXNlcjpmaXh0dXJl", ""),
+        ):
+            with self.subTest(prefix=prefix, value=value):
+                line = f"{prefix}{value}{suffix}"
+                marked = line + marker
+                self.assertEqual(ad.scan_text_for_secrets(line, "source"), finding)
+                self.assertEqual(ad.scan_text_for_secrets(marked, "source"), [])
+                self.assertEqual(ad.scan_text_for_secrets(f"{marked}\n{line}", "source"), finding)
+                redacted = ad.redact_secrets(marked)
+                self.assertIn("<REDACTED_SECRET>", redacted)
+                self.assertNotIn(value, redacted)
+                self.assertEqual(ad.redact_data({"message": [marked]}), {"message": [redacted]})
+                self.assertEqual(json.loads(ad.safe_json({"message": marked})), {"message": redacted})
+
+    def test_secret_scan_allow_in_worktree_index_and_history(self) -> None:
         for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
             with self.subTest(encoding=encoding), tempfile.TemporaryDirectory() as td:
                 repo = Path(td)
                 _git(repo, "init", "-b", "main")
                 _git(repo, "config", "user.name", "Test")
                 _git(repo, "config", "user.email", "test@example.invalid")
-                safe = repo / "gateway config.yaml"
-                unsafe = repo / "other.yaml"
-                headers = "\nheaders:\n  Accept: application/json\n"
-                prefix = "" if encoding == "utf-8" else "\ufeff"
-                safe.write_bytes((prefix + "key: &gateway_key ${GATEWAY_KEY}" + headers).encode(encoding))
-                unsafe.write_bytes((prefix + "key: &gateway_key syntheticLiteral" + headers).encode(encoding))
-                _git(repo, "add", ".")
-                _git(repo, "commit", "-m", "existing anchors")
-                base = _git(repo, "rev-parse", "HEAD")
-                add_header = "  X-API-Key: *gateway_key\n"
-                with safe.open("ab") as fh:
-                    fh.write(add_header.encode(encoding))
-                self.assertFalse(ad._scan_before_git_write(repo))
-                _git(repo, "add", ".")
-                self.assertFalse(ad.scan_staged_for_secrets(repo))
-                _git(repo, "commit", "-m", "reference existing placeholder")
-                self.assertFalse(ad.scan_range_for_secrets(repo, base, "HEAD"))
-
-                # A new safe declaration in a sibling cannot authorize the literal in other.yaml.
-                (repo / "a-example.yaml").write_text("key: &gateway_key ${GATEWAY_KEY}" + headers)
-                with unsafe.open("ab") as fh:
-                    fh.write(add_header.encode(encoding))
-                _git(repo, "add", ".")
-                self.assertTrue(ad.scan_staged_for_secrets(repo))
-                _git(repo, "commit", "-m", "synthetic unsafe revision")
-                unsafe.write_bytes((prefix + "key: &gateway_key ${GATEWAY_KEY}" + headers + add_header).encode(encoding))
-                _git(repo, "commit", "-am", "replace literal")
-                self.assertTrue(ad.scan_range_for_secrets(repo, base, "HEAD"))
-                self.assertFalse(ad.scan_range_for_secrets(repo, "HEAD^", "HEAD"))
-
-    def test_yaml_anchor_edits_check_only_the_referenced_declaration(self) -> None:
-        for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
-            with self.subTest(encoding=encoding), tempfile.TemporaryDirectory() as td:
-                repo = Path(td)
-                _git(repo, "init", "-b", "main")
-                _git(repo, "config", "user.name", "Test")
-                _git(repo, "config", "user.email", "test@example.invalid")
-                path = repo / "gateway.yaml"
-                declaration = 'key: &gateway-key "${GATEWAY_KEY}" # supplied at deployment\n'
-                header = f"headers:\n  {ad._API_KEY_HEADERS[0]}: *gateway-key\n"
-                path.write_bytes(declaration.encode(encoding))
-                _git(repo, "add", ".")
+                tracked = repo / "gateway.yaml"
+                untracked = repo / "example.yaml"
+                declaration = "key: &k ${GATEWAY_KEY}\n"
+                tracked.write_bytes(declaration.encode(encoding))
+                _git(repo, "add", tracked.name)
                 _git(repo, "commit", "-m", "existing placeholder")
-                safe = declaration + header
-
-                # The reference and the later changes to its target are separate commits.
-                for content, blocked in (
-                    (safe, False),
-                    (safe.replace('"${GATEWAY_KEY}"', "fixtureValue"), True),
-                    (safe, False),
-                    (safe + "other: &gateway-key unrelated\n", False),
+                for prefix, value in (
+                    ("X-API-Key: ", "*k"),
+                    ("Authorization: ", "*k"),
+                    ("X-API-Key: ", "synthetic.opaque.value"),
                 ):
-                    path.write_bytes(content.encode(encoding))
-                    self.assertEqual(bool(ad._scan_before_git_write(repo)), blocked)
-                    _git(repo, "add", ".")
-                    self.assertEqual(bool(ad.scan_staged_for_secrets(repo)), blocked)
-                    _git(repo, "commit", "-m", "change config")
-                    self.assertEqual(bool(ad.scan_range_for_secrets(repo, "HEAD^", "HEAD")), blocked)
-                self.assertTrue(ad.scan_range_for_secrets(repo, "HEAD~4", "HEAD"))
-        for spoofed in (
-            "key: &gateway_key realLiteralSecret\nnote: ok # &gateway_key ${GATEWAY_KEY}\nheaders:\n  X-API-Key: *gateway_key\n",
-            "key: &gateway_key realLiteralSecret\nnote: foo - &gateway_key ${GATEWAY_KEY}\nheaders:\n  X-API-Key: *gateway_key\n",
-            'key: &gateway_key realLiteralSecret\nnote: "prefix: &gateway_key ${GATEWAY_KEY} # "\nheaders:\n  X-API-Key: *gateway_key\n',
-            "key: &gateway_key realLiteralSecret\nnote: |\n  fake: &gateway_key ${GATEWAY_KEY}\nheaders:\n  X-API-Key: *gateway_key\n",
-            "items: [&gateway_key realLiteralSecret]\nnote: |\n  fake: &gateway_key ${GATEWAY_KEY}\nheaders:\n  X-API-Key: *gateway_key\n",
-            '"a # b": &gateway_key realLiteralSecret\noverride: &gateway_key "${GATEWAY_KEY}"\nheaders:\n  X-API-Key: *gateway_key\n',
-        ):
-            self.assertTrue(ad.scan_text_for_secrets(spoofed, "yaml"), spoofed)
-        for benign in (
-            "# define &gateway_key via env\nkey: &gateway_key ${GATEWAY_KEY}\nheaders:\n  X-API-Key: *gateway_key\n",
-            "key: &gateway_key unrelatedDoc1\n---\nkey: &gateway_key ${GATEWAY_KEY}\nheaders:\n  X-API-Key: *gateway_key\n",
-            "description: Uses anchor &gateway_key for auth\nkey: &gateway_key ${GATEWAY_KEY}\nheaders:\n  Authorization: Token *gateway_key\n",
-        ):
-            self.assertFalse(ad.scan_text_for_secrets(benign, "yaml"), benign)
+                    for marker in ("", " # secret-scan:allow"):
+                        with self.subTest(header=prefix, value=value, marked=bool(marker)):
+                            content = f"{declaration}headers:\n  {prefix}{value}{marker}\n".encode(encoding)
+                            untracked.write_bytes(content)
+                            self.assertEqual(ad._scan_before_git_write(repo), [] if marker else [
+                                "Potential secret token in untracked file content",
+                            ])
+                            untracked.unlink()
+                            tracked.write_bytes(content)
+                            expected = [] if marker else ["Potential secret token in added file content"]
+                            self.assertEqual(ad._scan_before_git_write(repo), expected)
+                            _git(repo, "add", tracked.name)
+                            self.assertEqual(ad.scan_staged_for_secrets(repo), expected)
+                            _git(repo, "commit", "-m", "change synthetic config")
+                            self.assertEqual(ad.scan_range_for_secrets(repo, "HEAD^", "HEAD"), expected)
 
-        # Cover indented continuation anchors, Authorization headers, and deleting a shadowing placeholder anchor.
-        for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
-            with self.subTest(edge_encoding=encoding), tempfile.TemporaryDirectory() as td:
-                repo = Path(td)
-                _git(repo, "init", "-b", "main")
-                _git(repo, "config", "user.name", "Test")
-                _git(repo, "config", "user.email", "test@example.invalid")
-                path = repo / "auth.yaml"
-                indented_decl = 'key:\n  &gateway-key "${GATEWAY_KEY}"\n'
-                auth_header = "headers:\n  Authorization: Token *gateway-key\n"
-                path.write_bytes(indented_decl.encode(encoding))
-                _git(repo, "add", ".")
-                _git(repo, "commit", "-m", "indented placeholder")
+    def test_secret_scan_allow_preserves_non_bypassable_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            _git(repo, "init", "-b", "main")
+            _git(repo, "config", "user.name", "Test")
+            _git(repo, "config", "user.email", "test@example.invalid")
+            _git(repo, "commit", "--allow-empty", "-m", "base")
 
-                # Adding Authorization: Token *gateway-key referencing existing placeholder must be allowed.
-                safe_auth = indented_decl + auth_header
-                path.write_bytes(safe_auth.encode(encoding))
-                self.assertFalse(ad._scan_before_git_write(repo))
-                _git(repo, "commit", "-am", "add auth alias")
+            marker = " # secret-scan:allow"
+            token = "lin_api_" + "syntheticvalue123456"
+            live_value = "synthetic process credential"
+            key_kind = "PRIVATE KEY"
+            pem = f"-----BEGIN {key_kind}-----{marker}\nsynthetic-body\n-----END {key_kind}-----"
+            with mock.patch.dict(os.environ, {"UNIT_API_KEY": live_value}):
+                for filename, content, credential in (
+                    ("token.txt", f"note{marker} {token}", token),
+                    ("key.txt", pem, "synthetic-body"),
+                    ("live.txt", f"note{marker} {live_value}", live_value),
+                    (".env", f"SETTING=ordinary{marker}", None),
+                ):
+                    with self.subTest(filename=filename):
+                        expected_file = ["Potential secret file: .env"]
+                        expected_content = ["Potential secret token in added file content"]
+                        if credential is not None:
+                            self.assertEqual(ad.scan_text_for_secrets(content, "source"), [
+                                "Potential secret token in source",
+                            ])
+                            self.assertNotIn(credential, ad.redact_secrets(content))
+                        (repo / filename).write_text(content + "\n", encoding="utf-8")
+                        self.assertEqual(ad._scan_before_git_write(repo), expected_file if credential is None else [
+                            "Potential secret token in untracked file content",
+                        ])
+                        _git(repo, "add", filename)
+                        expected = expected_file if credential is None else expected_content
+                        self.assertEqual(ad.scan_staged_for_secrets(repo), expected)
+                        _git(repo, "commit", "-m", "introduce synthetic fixture")
+                        self.assertEqual(ad.scan_range_for_secrets(repo, "HEAD^", "HEAD"), expected)
 
-                # Editing the indented anchor to a literal must block.
-                path.write_bytes(safe_auth.replace('"${GATEWAY_KEY}"', "fixtureValue").encode(encoding))
-                self.assertTrue(ad._scan_before_git_write(repo))
-                _git(repo, "add", ".")
-                self.assertTrue(ad.scan_staged_for_secrets(repo))
-                _git(repo, "commit", "-m", "unsafe indented edit")
-                self.assertTrue(ad.scan_range_for_secrets(repo, "HEAD^", "HEAD"))
-
-                # Pre-existing literal shadowed by placeholder: deleting the placeholder must block.
-                shadowed = (
-                    "key: &gateway-key fixtureValue\n"
-                    'override: &gateway-key "${GATEWAY_KEY}"\n'
-                    f"headers:\n  {ad._API_KEY_HEADERS[0]}: *gateway-key\n"
-                )
-                path.write_bytes(shadowed.encode(encoding))
-                _git(repo, "commit", "-am", "legacy shadowed state")
-                path.write_bytes(shadowed.replace('override: &gateway-key "${GATEWAY_KEY}"\n', "").encode(encoding))
-                self.assertTrue(ad._scan_before_git_write(repo))
-                _git(repo, "add", ".")
-                self.assertTrue(ad.scan_staged_for_secrets(repo))
-                _git(repo, "commit", "-m", "delete shadowing placeholder")
-                self.assertTrue(ad.scan_range_for_secrets(repo, "HEAD^", "HEAD"))
-
+            _git(repo, "commit", "--allow-empty", "-m", "Bearer " + "synthetic.opaque.value" + marker)
+            self.assertEqual(ad.scan_range_for_secrets(repo, "HEAD^", "HEAD"), [
+                "Potential secret token in commit message",
+            ])
 
     def test_nested_authorization_headers_are_redacted_in_structured_logs(self) -> None:
         with tempfile.TemporaryDirectory() as td:
