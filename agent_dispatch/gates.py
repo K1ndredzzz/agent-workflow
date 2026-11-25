@@ -67,10 +67,7 @@ def _repo_has_js_tests(worktree: Path) -> bool:
         root = worktree / d
         if not root.is_dir():
             continue
-        files = [
-            p for p in root.rglob("*")
-            if p.is_file() and "__pycache__" not in p.parts
-        ]
+        files = [p for p in root.rglob("*") if p.is_file() and "__pycache__" not in p.parts]
         # Empty test dir or any non-Python file signals possible JS tests;
         # a tests/ dir containing exclusively Python files belongs to Python.
         if not files or any(p.suffix not in (".py", ".pyc") for p in files):
@@ -82,20 +79,18 @@ def detect_verify_command(worktree: Path, explicit_cmd: str | None) -> str | Non
     if explicit_cmd:
         return explicit_cmd
 
-    for jf in ("justfile", "Justfile"):
-        p = worktree / jf
-        if p.is_file():
-            txt = p.read_text(encoding="utf-8", errors="ignore")
+    just_params = r"(?:\s+[^:=\n]*)?"
+    for filename, tool, params in (
+        ("justfile", "just", just_params),
+        ("Justfile", "just", just_params),
+        ("Makefile", "make", r"\s*"),
+    ):
+        recipe = worktree / filename
+        if recipe.is_file():
+            text = recipe.read_text(encoding="utf-8", errors="ignore")
             for target in ("verify", "check"):
-                if re.search(rf"^{target}(?:\s+[^:=\n]*)?:(?!=)", txt, re.M):
-                    return f"just {target}"
-
-    mf = worktree / "Makefile"
-    if mf.is_file():
-        txt = mf.read_text(encoding="utf-8", errors="ignore")
-        for target in ("verify", "check"):
-            if re.search(rf"^{target}\s*:(?!=)", txt, re.M):
-                return f"make {target}"
+                if re.search(rf"^{target}{params}:(?!=)", text, re.M):
+                    return f"{tool} {target}"
 
     commands: list[str] = []
     pkg = worktree / "package.json"
@@ -145,11 +140,15 @@ def detect_verify_command(worktree: Path, explicit_cmd: str | None) -> str | Non
     return " && ".join(commands) or None
 
 
-
 def untracked_files(worktree: Path, *, ignore_shutdown: bool = False) -> set[str]:
-    listing = run_cmd(git_cmd("ls-files", "--others", "--exclude-standard", "-z"),
-                      cwd=worktree, check=True, env_role="orchestrator", cap_output=False, ignore_shutdown=ignore_shutdown)
-    return set(listing.stdout.split("\0")) - {""}
+    return set(_untracked_paths(worktree, ignore_shutdown=ignore_shutdown))
+
+
+def _untracked_paths(worktree: Path, *, ignore_shutdown: bool) -> Iterator[str]:
+    listing = _git(
+        worktree, "ls-files", "--others", "--exclude-standard", "-z", cap_output=False, ignore_shutdown=ignore_shutdown,
+    ).stdout
+    return filter(None, listing.split("\0"))
 
 
 def file_identity(path: Path) -> tuple[int, int, int, int]:
@@ -172,9 +171,7 @@ def release_setup_files(worktree: Path, files: dict[str, tuple[int, int, int, in
 
 
 def run_verify_gate(
-    worktree: Path,
-    verify_cmd: str | None,
-    *,
+    worktree: Path, verify_cmd: str | None, *,
     allow_no_verify: bool,
     log_file: Path,
     repo_key: str,
@@ -182,14 +179,10 @@ def run_verify_gate(
 ) -> dict[str, Any]:
     if not verify_cmd:
         if allow_no_verify:
-            return {"ran": False, "passed": True, "command": None, "returncode": 0, "output": "Bypassed via --allow-no-verify."}
-        return {
-            "ran": False,
-            "passed": False,
-            "command": None,
-            "returncode": 1,
-            "output": "No verification command detected. Pass --verify-cmd or configure a repo check script (or --allow-no-verify).",
-        }
+            rc, output = 0, "Bypassed via --allow-no-verify."
+        else:
+            rc, output = 1, "No verification command detected. Pass --verify-cmd or configure a repo check script (or --allow-no-verify)."
+        return {"ran": False, "passed": rc == 0, "command": None, "returncode": rc, "output": output}
     log(f"Running verification gate: {verify_cmd}")
     with file_lock(config._cache_root() / "locks" / f"verify-{repo_key}.lock", blocking=True):
         original, dirty_before = tracked_status(worktree)
@@ -212,14 +205,13 @@ def run_verify_gate(
             raise RuntimeError("Verification changed the worktree branch or HEAD. Inspect the worktree before rerunning.")
         passed = rc == 0
         if dirty_after:
-            run_cmd(git_cmd("reset", "--hard", "HEAD"), cwd=worktree, check=True, env_role="orchestrator")
+            _git(worktree, "reset", "--hard", "HEAD")
             if passed:
                 passed = False
                 output = "Verification mutated tracked files: " + repr(dirty_after[:5])
         added = sorted(untracked_files(worktree) - prior_files)
         for offset in range(0, len(added), 100):
-            run_cmd(git_cmd("--literal-pathspecs", "clean", "-fd", "-e", ".dispatch", "--", *added[offset:offset + 100]),
-                    cwd=worktree, check=True, env_role="orchestrator")
+            _git(worktree, "--literal-pathspecs", "clean", "-fd", "-e", ".dispatch", "--", *added[offset:offset + 100])
         if passed and "unittest discover" in verify_cmd and re.search(r"^Ran 0 tests? in ", output, re.M):
             passed = False
             output = "unittest discovery collected zero tests."
@@ -227,18 +219,18 @@ def run_verify_gate(
                 "output": redact_secrets(output)[-4000:]}
 
 
+def _git(
+    worktree: Path, *args: str, attr_source: str | None = None, check: bool = True, **options: Any,
+) -> subprocess.CompletedProcess[str]:
+    return run_cmd(git_cmd(*args, attr_source=attr_source), cwd=worktree, check=check, env_role="orchestrator", **options)
+
+
 def _git_head(worktree: Path) -> str:
-    return run_cmd(git_cmd("rev-parse", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
+    return _git(worktree, "rev-parse", "HEAD").stdout.strip()
 
 
 def check_base_baseline(
-    repo_root: Path,
-    repo_key: str,
-    worktree: Path,
-    base_sha: str,
-    verify_cmd: str | None,
-    run_dir: Path,
-    *,
+    repo_root: Path, repo_key: str, worktree: Path, base_sha: str, verify_cmd: str | None, run_dir: Path, *,
     setup_cmd_override: str | None = None,
     setup_timeout: int = 600,
     allow_no_verify: bool = False,
@@ -256,13 +248,15 @@ def check_base_baseline(
             return {}
         return cache if isinstance(cache, dict) else {}
 
+    def cached_success(key: str) -> bool:
+        with file_lock(baselines_lock, blocking=True):
+            return read_cache().get(key) is True
+
     with file_lock(key_lock, blocking=True):
         # The explicit command already identifies the recipe and its existing cache entries.
         cache_key = lease_key
-        if verify_cmd:
-            with file_lock(baselines_lock, blocking=True):
-                if read_cache().get(cache_key) is True:
-                    return {"checked": True, "cached": True, "passed": True}
+        if verify_cmd and cached_success(cache_key):
+            return {"checked": True, "cached": True, "passed": True}
 
         target_wt = worktree
         temp_wt: Path | None = None
@@ -274,7 +268,7 @@ def check_base_baseline(
                 owner_file = config._cache_root() / "baseline-owners" / repo_key / temp_wt.name
                 with file_lock(config._cache_root() / "locks" / f"repo-{repo_key}.lock", blocking=True):
                     atomic_write_text(owner_file, json.dumps({"key": lease_key, "base_sha": base_sha}))
-                    run_cmd(git_cmd("worktree", "add", "--detach", str(temp_wt), base_sha), cwd=repo_root, check=True, env_role="orchestrator")
+                    _git(repo_root, "worktree", "add", "--detach", str(temp_wt), base_sha)
                 bootstrap_worktree(temp_wt, setup_cmd_override, timeout=setup_timeout)
                 target_wt = temp_wt
 
@@ -283,23 +277,18 @@ def check_base_baseline(
             if not verify_cmd:
                 verify_cmd = detect_verify_command(target_wt, None)
                 cache_key = sha256_text(json.dumps([lease_key, verify_cmd]))
-                with file_lock(baselines_lock, blocking=True):
-                    if read_cache().get(cache_key) is True:
-                        return {"checked": True, "cached": True, "passed": True}
+                if cached_success(cache_key):
+                    return {"checked": True, "cached": True, "passed": True}
             log(f"Checking clean base baseline ({base_sha[:8]}): {verify_cmd}")
             res = run_verify_gate(
-                target_wt,
-                verify_cmd,
-                allow_no_verify=allow_no_verify,
-                log_file=run_dir / "baseline-verify.log",
-                repo_key=repo_key,
-                timeout=timeout,
+                target_wt, verify_cmd, allow_no_verify=allow_no_verify,
+                log_file=run_dir / "baseline-verify.log", repo_key=repo_key, timeout=timeout,
             )
         finally:
             if temp_wt is not None:
                 with file_lock(config._cache_root() / "locks" / f"repo-{repo_key}.lock", ignore_shutdown=True):
                     config._worktree_cache_path(repo_key, temp_wt.name)
-                    run_cmd(git_cmd("worktree", "remove", "--force", str(temp_wt)), cwd=repo_root, env_role="orchestrator", ignore_shutdown=True)
+                    _git(repo_root, "worktree", "remove", "--force", str(temp_wt), check=False, ignore_shutdown=True)
                     if not temp_wt.exists():
                         owner_file.unlink(missing_ok=True)
                     else:
@@ -315,28 +304,23 @@ def check_base_baseline(
 
 def _policy_diff(worktree: Path, base_sha: str, *args: str, literal_pathspecs: bool = False) -> str:
     command = ["--literal-pathspecs", "diff"] if literal_pathspecs else ["diff"]
-    return run_cmd(
-        git_cmd(*command, "--no-renames", "--no-ext-diff", "--no-textconv", *args, attr_source=base_sha),
-        cwd=worktree, check=True, env_role="orchestrator", cap_output=False,
+    return _git(
+        worktree, *command, "--no-renames", "--no-ext-diff", "--no-textconv", *args, attr_source=base_sha, cap_output=False,
     ).stdout
 
 
 def check_protected_paths(
-    worktree: Path,
-    base_sha: str,
-    candidate_sha: str,
-    *,
+    worktree: Path, base_sha: str, candidate_sha: str, *,
     allowed_patterns: list[str] | None = None,
     allow_all: bool = False,
 ) -> list[str]:
     """Use --no-renames -z (NUL-safe for non-ASCII/special paths); supports granular allowlist patterns."""
     if allow_all:
         return []
-    pats = allowed_patterns or []
     raw = _policy_diff(worktree, base_sha, "-z", "--name-only", f"{base_sha}..{candidate_sha}")
     violations: list[str] = []
     for f in filter(None, raw.split("\0")):
-        if pats and path_matches_any_pattern(f, pats):
+        if allowed_patterns and path_matches_any_pattern(f, allowed_patterns):
             continue
         base_name = Path(f).name
         if (
@@ -347,60 +331,50 @@ def check_protected_paths(
         ):
             violations.append(f"Protected gate/policy file modified: {f}")
         elif base_name == "package.json":
-            old_raw = run_cmd(git_cmd("show", f"{base_sha}:{f}"), cwd=worktree, env_role="orchestrator", cap_output=False)
-            new_raw = run_cmd(git_cmd("show", f"{candidate_sha}:{f}"), cwd=worktree, env_role="orchestrator", cap_output=False)
-            if new_raw.returncode == 0:
-                try:
-                    new_pkg = json.loads(new_raw.stdout)
-                except json.JSONDecodeError as exc:
-                    violations.append(f"Invalid JSON in `{f}`: {exc}")
-                    continue
-                if not isinstance(new_pkg, dict):
-                    violations.append(f"Invalid JSON object in `{f}`")
-                    continue
-            else:
-                new_pkg = {}
+            old_raw, new_raw = (
+                _git(worktree, "show", f"{sha}:{f}", check=False, cap_output=False)
+                for sha in (base_sha, candidate_sha)
+            )
+            try:
+                new_pkg = json.loads(new_raw.stdout) if new_raw.returncode == 0 else {}
+            except json.JSONDecodeError as exc:
+                violations.append(f"Invalid JSON in `{f}`: {exc}")
+                continue
+            if not isinstance(new_pkg, dict):
+                violations.append(f"Invalid JSON object in `{f}`")
+                continue
+            sections = ("scripts", "jest", "vitest", "eslintConfig")
             if old_raw.returncode == 0:
                 try:
                     old_pkg = json.loads(old_raw.stdout)
                 except json.JSONDecodeError:
                     old_pkg = {}
-                if not isinstance(old_pkg, dict):
-                    old_pkg = {}
-                for section in ("scripts", "jest", "vitest", "eslintConfig"):
-                    if old_pkg.get(section) != new_pkg.get(section):
+                for section in sections:
+                    old_value = old_pkg.get(section) if isinstance(old_pkg, dict) else None
+                    if old_value != new_pkg.get(section):
                         violations.append(f"Protected `{f}` `{section}` section modified")
-            else:
+            elif any(new_pkg.get(s) is not None for s in sections):
                 # Workspace packages can introduce gate scripts too.
-                if any(new_pkg.get(s) is not None for s in ("scripts", "jest", "vitest", "eslintConfig")):
-                    violations.append(f"Protected `{f}` gate/script config added")
+                violations.append(f"Protected `{f}` gate/script config added")
     return violations
 
 
-def _parse_nul_name_status(raw: str) -> Iterator[tuple[str, str]]:
-    # With renames disabled, each record contains a status and one path.
-    fields = (field for field in raw.split("\0") if field)
-    return zip(fields, fields)
-
-
 def check_test_integrity_diff(
-    worktree: Path,
-    base_sha: str,
-    candidate_sha: str,
-    *,
+    worktree: Path, base_sha: str, candidate_sha: str, *,
     allowed_patterns: list[str] | None = None,
     allow_all: bool = False,
 ) -> list[str]:
     """Deterministically detect deleted test files or added skip/only/ignore markers (NUL-safe, granular allowlist)."""
     if allow_all:
         return []
-    pats = allowed_patterns or []
     findings: list[str] = []
     revision_range = f"{base_sha}..{candidate_sha}"
     raw_status = _policy_diff(worktree, base_sha, "-z", "--name-status", revision_range)
     test_files: list[str] = []
-    for st, path in _parse_nul_name_status(raw_status):
-        if pats and path_matches_any_pattern(path, pats):
+    # With renames disabled, each record contains a status and one path.
+    fields = filter(None, raw_status.split("\0"))
+    for st, path in zip(fields, fields):
+        if allowed_patterns and path_matches_any_pattern(path, allowed_patterns):
             continue
         if st.startswith("D") and config.TEST_FILE_RE.search(path):
             findings.append(f"Deleted test file: {path}")
@@ -453,18 +427,6 @@ def _scan_git_bytes(data: bytes, field: str) -> list[str]:
     return []
 
 
-def _resolve_attr_source(worktree: Path, attr_source: str | None, *, ignore_shutdown: bool = False) -> str | None:
-    if attr_source:
-        return attr_source
-    res = run_cmd(
-        git_cmd("rev-parse", "--verify", "-q", "HEAD"),
-        cwd=worktree,
-        env_role="orchestrator",
-        ignore_shutdown=ignore_shutdown,
-    )
-    return "HEAD" if res.returncode == 0 else None
-
-
 def _scan_git_changes_for_secrets(
     worktree: Path,
     command: list[str],
@@ -473,11 +435,13 @@ def _scan_git_changes_for_secrets(
     attr_source: str | None = None,
 ) -> list[str]:
     flags = ["--no-renames", "--no-ext-diff", "--no-textconv", "--no-color"]
-    effective_attr = _resolve_attr_source(worktree, attr_source, ignore_shutdown=ignore_shutdown)
+    if not attr_source:
+        head = _git(worktree, "rev-parse", "--verify", "-q", "HEAD", check=False, ignore_shutdown=ignore_shutdown)
+        attr_source = "HEAD" if head.returncode == 0 else None
 
-    paths = run_cmd(
-        git_cmd(*command, *flags, "-z", "--diff-filter=AMT", "--name-only", attr_source=effective_attr),
-        cwd=worktree, check=True, env_role="orchestrator", cap_output=False, ignore_shutdown=ignore_shutdown,
+    paths = _git(
+        worktree, *command, *flags, "-z", "--diff-filter=AMT", "--name-only",
+        attr_source=attr_source, cap_output=False, ignore_shutdown=ignore_shutdown,
     ).stdout
     findings: set[str] = set()
     for path in set(paths.split("\0")) - {""}:
@@ -486,10 +450,9 @@ def _scan_git_changes_for_secrets(
             findings.add(f"Potential secret file: {redact_secrets(path)}")
 
     # --text scans content even when Git would hide the patch because of NUL or attributes.
-    patch = run_cmd(
-        git_cmd(*command, *flags, "-p", "--text", "-U0", attr_source=effective_attr),
-        cwd=worktree, check=True, env_role="orchestrator", cap_output=False,
-        stdout_encoding="latin-1", ignore_shutdown=ignore_shutdown,
+    patch = _git(
+        worktree, *command, *flags, "-p", "--text", "-U0",
+        attr_source=attr_source, cap_output=False, stdout_encoding="latin-1", ignore_shutdown=ignore_shutdown,
     ).stdout
     for block in ("\n" + patch).split("\ndiff --git ")[1:]:
         added = "\n".join(_added_patch_lines(block)).encode("latin-1")
@@ -499,10 +462,7 @@ def _scan_git_changes_for_secrets(
 
 def scan_range_for_secrets(worktree: Path, base_sha: str, candidate_sha: str) -> list[str]:
     revision_range = f"{base_sha}..{candidate_sha}"
-    messages = run_cmd(
-        git_cmd("log", "--pretty=format:%B%n", revision_range), cwd=worktree,
-        check=True, env_role="orchestrator", cap_output=False,
-    ).stdout
+    messages = _git(worktree, "log", "--pretty=format:%B%n", revision_range, cap_output=False).stdout
     return scan_text_for_secrets(messages, "commit message", allow_marker=False) + _scan_git_changes_for_secrets(
         worktree, ["log", "-m", "--format=", revision_range], attr_source=base_sha
     )
@@ -523,11 +483,7 @@ def scan_before_git_write(
     findings = _scan_git_changes_for_secrets(worktree, ["diff", "HEAD"], ignore_shutdown=for_stash, attr_source=attr_source)
     if for_stash:
         findings.extend(_scan_git_changes_for_secrets(worktree, ["diff", "--cached"], ignore_shutdown=True, attr_source=attr_source))
-    untracked = run_cmd(
-        git_cmd("ls-files", "--others", "--exclude-standard", "-z"),
-        cwd=worktree, check=True, env_role="orchestrator", cap_output=False, ignore_shutdown=for_stash,
-    ).stdout
-    for name in filter(None, untracked.split("\0")):
+    for name in _untracked_paths(worktree, ignore_shutdown=for_stash):
         if name in exclude_paths:
             continue
         findings.extend(scan_text_for_secrets(name, "untracked file name", allow_marker=False))
@@ -556,11 +512,7 @@ def scan_before_git_write(
 
 
 def orchestrator_commit(
-    worktree: Path,
-    identifier: str,
-    title: str,
-    attempt: int,
-    *,
+    worktree: Path, identifier: str, title: str, attempt: int, *,
     setup_paths: tuple[str, ...] = (),
     attr_source: str | None = None,
 ) -> tuple[str, list[str]]:
@@ -570,7 +522,7 @@ def orchestrator_commit(
     msg_secret_hits = scan_text_for_secrets(commit_msg, "ticket title / commit message", allow_marker=False)
     if msg_secret_hits:
         return _git_head(worktree), msg_secret_hits
-    status = run_cmd(git_cmd("status", "--porcelain"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
+    status = _git(worktree, "status", "--porcelain").stdout.strip()
     if status:
         secret_hits = scan_before_git_write(worktree, exclude_paths=frozenset(setup_paths), attr_source=attr_source)
         if secret_hits:
@@ -578,23 +530,19 @@ def orchestrator_commit(
         if setup_paths:
             # Explicit literal excludes work for names containing whitespace, glob or pathspec characters.
             pathspec = "\0".join([".", *(f":(top,exclude,literal){p}" for p in setup_paths)]) + "\0"
-            run_cmd(git_cmd("add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"), cwd=worktree,
-                    stdin_text=pathspec, check=True, env_role="orchestrator")
-            run_cmd(git_cmd("--literal-pathspecs", "reset", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"),
-                    cwd=worktree, stdin_text="\0".join(setup_paths) + "\0", check=True, env_role="orchestrator")
+            _git(worktree, "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul", stdin_text=pathspec)
+            _git(
+                worktree, "--literal-pathspecs", "reset", "-q", "--pathspec-from-file=-", "--pathspec-file-nul",
+                stdin_text="\0".join(setup_paths) + "\0",
+            )
         else:
-            run_cmd(git_cmd("add", "-A"), cwd=worktree, check=True, env_role="orchestrator")
-        run_cmd(git_cmd("reset", "-q", "--", ".dispatch"), cwd=worktree, env_role="orchestrator")
-        staged = run_cmd(git_cmd("diff", "--cached", "-z", "--name-only"), cwd=worktree, check=True, env_role="orchestrator").stdout
+            _git(worktree, "add", "-A")
+        _git(worktree, "reset", "-q", "--", ".dispatch", check=False)
+        staged = _git(worktree, "diff", "--cached", "-z", "--name-only").stdout
         if staged.strip("\x00"):
             secret_hits = scan_staged_for_secrets(worktree, attr_source=attr_source)
             if secret_hits:
-                run_cmd(git_cmd("reset", "-q"), cwd=worktree, env_role="orchestrator")
+                _git(worktree, "reset", "-q", check=False)
                 return _git_head(worktree), secret_hits
-            run_cmd(
-                git_cmd("commit", "--no-verify", "-m", commit_msg),
-                cwd=worktree,
-                check=True,
-                env_role="orchestrator",
-            )
+            _git(worktree, "commit", "--no-verify", "-m", commit_msg)
     return _git_head(worktree), []

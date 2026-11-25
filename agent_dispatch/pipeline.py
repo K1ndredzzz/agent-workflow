@@ -29,6 +29,7 @@ from .git_ops import (
 )
 from .harness import HarnessSpec, invoke_harness
 from .linear import LinearClient
+from .preflight import RunOptions, TicketRun, inspect_repository, prepare_ticket
 from .process import check_shutdown, file_lock, git_cmd, log, run_cmd
 from .publish import (
     build_pr_body,
@@ -37,7 +38,6 @@ from .publish import (
     reconcile_publish,
     validate_open_draft_pr,
 )
-from .recovery import RunOptions, TicketRun
 from .review import build_worker_prompt, run_two_axis_review
 from .secrets import redact_secrets
 
@@ -107,12 +107,12 @@ def execute_ticket(
         auto_claimed=auto_claimed,
         reserved_touches=reserved_touches,
     )
-    repo = recovery.inspect_repository(repo_root, options)
+    repo = inspect_repository(repo_root, options)
     # Resolve the canonical UUID before taking the cross-clone ticket lock.
     issue = client.get_issue(identifier)
     lock_path = ticket_lock_path(repo_root, issue["id"])
     with file_lock(lock_path, blocking=False), ExitStack() as cleanup:
-        run = recovery.prepare_ticket(client, repo, repo_project, issue, worker, reviewer, options, cleanup)
+        run = prepare_ticket(client, repo, repo_project, issue, worker, reviewer, options, cleanup)
         if isinstance(run, dict):
             return run
         try:
@@ -227,11 +227,10 @@ def _run_worker(run: TicketRun, rework: _Rework, attempt: int) -> dict[str, Any]
         _check_tampering(run, f"worker attempt {attempt}")
     else:
         # Local runs still validate Git configuration and root attributes.
-        cur_cfg = snapshot_local_git_config(run.checkout.path)
-        if cur_cfg["local_config_sha"] != run.pre_git_cfg.get("local_config_sha"):
-            raise RuntimeError(f"Unauthorized git config tampering during worker attempt {attempt} (.git/config modified).")
-        if not run.allow_root_gitattributes and cur_cfg["gitattributes_sha"] != run.pre_git_cfg.get("gitattributes_sha"):
-            raise RuntimeError(f"Unauthorized .gitattributes tampering during worker attempt {attempt}.")
+        recovery.assert_local_git_config_intact(
+            run.checkout.path, run.pre_git_cfg, f"during worker attempt {attempt}",
+            allow_gitattributes_edit=run.allow_root_gitattributes,
+        )
 
     for raw_item in result.get("discovered_issues") or []:
         norm = raw_item.strip().lower()

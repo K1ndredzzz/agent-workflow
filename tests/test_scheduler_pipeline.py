@@ -5,13 +5,15 @@ import os
 import signal
 import subprocess
 import tempfile
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from agent_dispatch import brief, cli, config, git_ops, harness, linear, pipeline, process, publish, recovery, review, scheduler
+from agent_dispatch import (
+    brief, cli, config, git_ops, harness, linear, pipeline, preflight, process, publish, recovery, review, scheduler,
+)
 
 from tests.helpers import FakeLinearState, IsolatedDispatchCase, _git, _write_exec, start_fake_linear
 
@@ -149,6 +151,40 @@ class TestTicketPipeline(IsolatedDispatchCase):
     def setUp(self) -> None:
         super().setUp()
         self.enterContext(mock.patch.object(config, "MCP_CONFIG_PATH", self.sandbox / "unused-mcp.json"))
+
+    def test_preflight_saves_checkpoint_before_claim(self) -> None:
+        remote = self.sandbox / "origin.git"
+        repo = self.sandbox / "repo"
+        _git(self.sandbox, "init", "--bare", "-b", "main", str(remote))
+        _git(self.sandbox, "clone", str(remote), str(repo))
+        _git(repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+             "commit", "--allow-empty", "-m", "base")
+        _git(repo, "push", "-u", "origin", "main")
+        state = FakeLinearState()
+        state.add_issue("TST-1", "Implement task", "## What to Build\nFeature")
+        server, url = start_fake_linear(state)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        client = linear.LinearClient("synthetic", url=url)
+        options = preflight.RunOptions(
+            verify_cmd_override="true", setup_cmd_override=None, max_rework=0,
+            verify_timeout=5, setup_timeout=5, worker_timeout=5, review_timeout=5,
+            no_push=False, allow_no_verify=False, allow_gate_edits=False, allow_test_edits=False,
+            allow_dirty_docs=False, allow_branch_only=False, skip_baseline=True, skip_project_check=False,
+            force_rerun=False, fresh=False, auto_claimed=False, reserved_touches=None,
+        )
+        with ExitStack() as cleanup:
+            run = preflight.prepare_ticket(
+                client, preflight.inspect_repository(repo, options), None, client.get_issue("TST-1"),
+                harness.parse_harness_spec("codex"), harness.parse_harness_spec("agy"), options, cleanup,
+            )
+            if isinstance(run, dict):
+                self.fail(f"Preflight returned an early result: {run}")
+            checkpoint = json.loads((run.run_dir / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(checkpoint, json.loads(run.latest_file.read_text(encoding="utf-8")))
+            self.assertEqual(checkpoint["stage"], "preflight_ok")
+            self.assertEqual(checkpoint["base_sha"], _git(repo, "rev-parse", "HEAD"))
+            self.assertEqual(client.get_issue("TST-1")["state"]["name"], "Todo")
 
     def test_worker_rechecks_immutable_brief_before_timeout_rework(self) -> None:
         with tempfile.TemporaryDirectory() as td:
