@@ -1,0 +1,5 @@
+{
+  "name": "agent-workflow",
+  "displayName": "Agent Workflow Rules",
+  "description": "Global engineering and dual-agent review convergence rules for agent-workflow."
+}

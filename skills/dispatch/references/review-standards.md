@@ -20,5 +20,5 @@ Review the exact git commit range provided in the prompt against the **baseline*
 ## Scope & Verdict Rules
 - Stay strictly on the **Standards** axis; do not evaluate feature completeness against the ticket spec (another independent reviewer owns Spec).
 - Put documented-standard breaches or clear maintainability/security defects in `hard_findings`; put optional Fowler smells in `suggestions`.
-- Set `verdict` to `"fail"` if `hard_findings` is non-empty, otherwise `"pass"`.
-- If prior-round findings are provided, verify each one is resolved and only raise genuinely blocking new issues.
+- Set `verdict` to `"fail"` if `hard_findings` is non-empty, otherwise `"pass"`. Returning `"pass"` is the preferred outcome when no documented standard breach or blocking defect remains.
+- **Convergent rework funnel**: When prior-round findings are provided, verify each prior finding is resolved and inspect only for regressions introduced by the rework—do not reopen untouched pre-existing code or invent new speculative scope. Prefer recommending simplification or fail-closed design over stacking repeated heuristic workarounds.

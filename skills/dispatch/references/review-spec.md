@@ -12,6 +12,7 @@ Review the exact git commit range provided in the prompt against the **Ticket De
 
 ## Scope & Verdict Rules
 - Stay strictly on the **Spec, Correctness, and Test Integrity** axis (another independent reviewer owns coding style / Fowler smells).
+- **Threat-model boundary**: Require concrete, realistic failure paths (missing requirements, bugs, regressions, accidental leaks, or real security flaws in the target's threat model). Do not fail a slice for speculative adversarial obfuscation by a trusted writer outside the ticket's scope.
 - Put missing requirements, bugs, security issues, major scope creep, or test-integrity violations in `hard_findings`. Put minor observations in `suggestions`.
-- Set `verdict` to `"fail"` if `hard_findings` is non-empty or `test_integrity_violation` is `true`, otherwise `"pass"`.
-- If prior-round findings are provided, verify each one is resolved and only raise genuinely blocking new issues.
+- Set `verdict` to `"fail"` if `hard_findings` is non-empty or `test_integrity_violation` is `true`, otherwise `"pass"`. Returning `"pass"` is the preferred outcome when no blocking issue remains.
+- **Convergent rework funnel**: When prior-round findings are provided, verify each prior finding is resolved and inspect only for regressions introduced by the rework—do not reopen untouched pre-existing code or invent new speculative scope. If a recurring issue stems from fragile heuristics, recommend simplifying/failing closed or using a deterministic tool rather than stacking another patch layer.

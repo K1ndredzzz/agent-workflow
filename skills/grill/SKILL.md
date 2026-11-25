@@ -36,7 +36,7 @@ When designing a high-leverage module interface or testing seam, consult [refere
 - Cross-reference user claims against actual code; surface contradictions immediately.
 
 ### 5. Completion & Next-Step Router
-Stop when the high-risk frontier is empty and the user confirms shared understanding. Output a concise **Consensus Summary** (decisions, pending doc updates, open assumptions) and recommend the single best next step:
+Stop when the high-risk frontier is empty and the user confirms shared understanding. Output a concise **Consensus Summary** (decisions, explicit Threat Model / Non-Goals for guardrails or security-sensitive logic, pending doc updates, open assumptions) and recommend the single best next step:
 - Multi-ticket feature -> **`/spec`**
 - Small, clear multi-slice change -> **`/slice`**
 - Single-slice task -> create one Linear `Todo` issue (`agent-ready`) using [dispatch/references/agent-brief.md](../dispatch/references/agent-brief.md) and run **`/dispatch <ID>`**

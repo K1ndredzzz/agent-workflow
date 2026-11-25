@@ -72,6 +72,7 @@ class FakeLinearState:
         self.comments: dict[str, list[dict[str, Any]]] = {}
         self.fail_next_comment_create = False
         self.fail_next_state_update = False
+        self.outage_flag_file: Path | None = None
         self.mutation_log: list[tuple[str, dict[str, Any]]] = []
         self._tick = 1
 
@@ -121,6 +122,8 @@ class FakeLinearState:
         return self.issues.get(key)
 
     def handle(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        if self.outage_flag_file and self.outage_flag_file.exists():
+            return {"errors": [{"message": "Simulated Linear API/network outage"}]}
         if "teams(first:" in query:
             return {"data": {"teams": {"nodes": [{"id": "team-1", "key": "TST", "name": "Test"}], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}
         if "projects(first:" in query:
@@ -347,6 +350,113 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                            "key: &gateway_key clientKey\nheaders:\n  X-API-Key: *gateway_key",
                            "- X-API-Key: Identifies"):
                 self.assertTrue(ad.scan_text_for_secrets(source, "literal"))
+
+    def test_json_quoted_authorization_credentials_detected_and_redacted_across_scans_and_review(self) -> None:
+        token = "synthetic_pd_tok_987654321"
+        fixture_entries = [
+            ("Authorization", f"Token token={token}"),
+            ("Authorization", f'Token token="{token}"'),
+            ("Authorization", f"Token {token}"),
+            ("Authorization", f"ApiKey user:{token}"),
+            ("Authorization", f'OAuth oauth_consumer_key="ck_{token}", oauth_token="{token}"'),
+            ("Authorization", f"Bearer {token}"),
+            ("Authorization", "Basic dXNlcjpzeW50aGV0aWM="),
+            ("Proxy-Authorization", f"Token token={token}"),
+            ("Proxy-Authorization", f"ApiKey {token}"),
+            ("Proxy-Authorization", f"OAuth {token}"),
+            ("Proxy-Authorization", f"Bearer {token}"),
+            ("Proxy-Authorization", "Basic cHJveHk6c3ludGhldGlj"),
+        ]
+        # Same synthetic JSON fixture across text scan, staged scan, history scan, and reviewer diff redaction.
+        settings_json = json.dumps(
+            {
+                "pagerduty": {"headers": {"Authorization": f"Token token={token}"}},
+                "proxy": {"headers": {"Proxy-Authorization": f"ApiKey {token}"}},
+            },
+            indent=2,
+        ) + "\n"
+        self.assertTrue(ad.scan_text_for_secrets(settings_json, "settings.json"))
+        redacted_json = ad.redact_secrets(settings_json)
+        self.assertNotIn(token, redacted_json)
+        self.assertIn("<REDACTED_SECRET>", redacted_json)
+        self.assertEqual(ad.redact_secrets(redacted_json), redacted_json)
+
+        for header, value in fixture_entries:
+            for sample in (
+                json.dumps({header: value}),
+                f"{{'{header}': '{value}'}}",
+                f"{header}: {json.dumps(value)}",
+            ):
+                with self.subTest(header=header, sample=sample):
+                    self.assertTrue(ad.scan_text_for_secrets(sample, "config"), f"Missed secret in {sample!r}")
+                    redacted = ad.redact_secrets(sample)
+                    self.assertNotIn(token, redacted)
+                    self.assertNotIn("dXNlcjpzeW50aGV0aWM=", redacted)
+                    self.assertNotIn("cHJveHk6c3ludGhldGlj", redacted)
+                    self.assertEqual(ad.redact_secrets(redacted), redacted)
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir()
+            _git(repo, "init", "-b", "main")
+            _git(repo, "config", "user.name", "Test")
+            _git(repo, "config", "user.email", "test@example.invalid")
+            _git(repo, "commit", "--allow-empty", "-m", "base")
+            base = _git(repo, "rev-parse", "HEAD")
+
+            cfg = repo / "settings.json"
+            cfg.write_text(settings_json, encoding="utf-8")
+            self.assertTrue(ad._scan_before_git_write(repo))
+            _git(repo, "add", "settings.json")
+            self.assertTrue(ad.scan_staged_for_secrets(repo))
+            _git(repo, "commit", "-m", "add synthetic json credentials")
+            introduced = _git(repo, "rev-parse", "HEAD")
+            self.assertTrue(ad.scan_range_for_secrets(repo, base, introduced))
+
+            # Removing the credentials clears incremental history scan, while reviewer patch redacts removed secrets.
+            cfg.write_text('{"pagerduty": {"headers": {"Authorization": "Token token=${PAGERDUTY_TOKEN}"}}}\n', encoding="utf-8")
+            _git(repo, "commit", "-am", "replace with placeholder")
+            cleaned = _git(repo, "rev-parse", "HEAD")
+            self.assertFalse(ad.scan_range_for_secrets(repo, introduced, cleaned))
+            self.assertTrue(ad.scan_range_for_secrets(repo, base, cleaned))
+
+            run_dir = Path(os.environ["AGENT_DISPATCH_CACHE_ROOT"]) / "review-json-redact"
+            with mock.patch.object(ad, "invoke_harness", side_effect=SystemExit):
+                with self.assertRaises(SystemExit):
+                    ad.run_two_axis_review(
+                        ad.parse_harness_spec("codex"), repo, run_dir, introduced, cleaned,
+                        None, None, run_dir, {}, 1, block_added_secrets=True,
+                    )
+            patch_txt = (run_dir / "diff-r1.patch").read_text(encoding="utf-8")
+            self.assertNotIn(token, patch_txt)
+            self.assertIn("<REDACTED_SECRET>", patch_txt)
+
+        # Zero false positives on placeholders, benign type words, concatenation prefixes, and English prose.
+        for benign in (
+            '{"Authorization": "Token token=${PAGERDUTY_TOKEN}"}',
+            '{"Authorization": "Token token=\\"${PAGERDUTY_TOKEN}\\""}',
+            '{"Authorization": "Token token=<your-token>"}',
+            '{"Authorization": "Token token={{ api_token }}"}',
+            '{"Authorization": "Token token=$PAGERDUTY_TOKEN"}',
+            '{"Authorization": "Bearer ${ACCESS_TOKEN}"}',
+            '{"Authorization": "ApiKey ${{ secrets.API_KEY }}"}',
+            '{"Authorization": "OAuth {{ .Values.oauthToken }}"}',
+            '{"Proxy-Authorization": "Basic <base64-creds>"}',
+            '{"Authorization": "Token string"}',
+            '{"Authorization": "ApiKey optional"}',
+            '{"Authorization": "Bearer required"}',
+            '{"Authorization": "Token token=string"}',
+            '{"Authorization": "OAuth oauth_token=\\"${OAUTH_TOKEN}\\", oauth_version=\\"1.0\\", realm=\\"api\\""}',
+            'headers = {"Authorization": "Bearer " + token}',
+            'headers = {"Authorization": "Token token=" + api_token}',
+            '{"Authorization": "Bearer token validation rules"}',
+            '{"Authorization": "Basic authentication is required for this endpoint."}',
+            '{"Authorization": "OAuth 2.0 access token"}',
+            'Authorization: Token token=${PAGERDUTY_TOKEN}',
+        ):
+            with self.subTest(benign=benign):
+                self.assertEqual(ad.redact_secrets(benign), benign, f"False positive on {benign!r}")
+                self.assertEqual(ad.scan_text_for_secrets(benign, "benign"), [], f"False block on {benign!r}")
 
     def test_yaml_alias_git_gates_use_the_file_at_each_revision(self) -> None:
         for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
@@ -1532,6 +1642,7 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
                     "publish_destination": ad.sha256_text(str(bare)),
                     "branch": "feat/tst-p",
                     "base_branch": "main",
+                    "base_sha": _git(repo, "rev-parse", "main"),
                     "candidate_sha": cand_sha,
                     "pr_body": "body",
                     "worker": "codex:sol",
@@ -2206,6 +2317,40 @@ class TestUnitGatesAndParsing(IsolatedDispatchCase):
         self.assertEqual(ad.parse_touches("## Touches\n- *\n"), set())
         self.assertEqual(ad.parse_touches("## Touches\n- **/*\n"), set())
 
+    def test_touches_numbered_lists_and_fail_closed_unparseable_entries(self) -> None:
+        self.assertEqual(ad.parse_touches("## Touches\n1. `src/auth`\n"), {"src/auth"})
+        self.assertEqual(ad.parse_touches("## Touches\n2) src/auth\n10. `./src/routes/`\n"), {"src/auth", "src/routes"})
+        self.assertEqual(ad.parse_touches("## Touches\n- src/auth\n"), ad.parse_touches("## Touches\n1. `src/auth`\n"))
+
+        # Unparseable / non-literal entries fail closed as unscoped (empty set -> exclusive repo lock).
+        for bad_entry in (
+            "1. `src/auth` (login flow)",
+            "- Touch auth and billing modules",
+            "- • src/auth",
+            "- (a) src/auth",
+            "- src/{auth,billing}",
+            "- `src/auth",
+            "1. 仅修改登录模块",
+        ):
+            with self.subTest(bad_entry=bad_entry):
+                self.assertEqual(ad.parse_touches(f"## Touches\n{bad_entry}\n"), set())
+
+        # Unordered list and numbered list for the same path MUST conflict in wave selection and local touch locks.
+        iss_bullet = {"identifier": "TST-BUL", "description": "## Touches\n- src/auth\n"}
+        iss_num = {"identifier": "TST-NUM", "description": "## Touches\n1. `src/auth`\n"}
+        iss_paren = {"identifier": "TST-PAR", "description": "## Touches\n2) `src/auth/login`\n"}
+        iss_other = {"identifier": "TST-OTH", "description": "## Touches\n10. `src/billing`\n"}
+        wave, deferred = ad.select_non_overlapping_wave([iss_bullet, iss_num, iss_paren, iss_other])
+        self.assertEqual([i["identifier"] for i in wave], ["TST-BUL", "TST-OTH"])
+        self.assertEqual([d["id"] for d in deferred], ["TST-NUM", "TST-PAR"])
+
+        t_bullet = ad.parse_touches(iss_bullet["description"])
+        t_num = ad.parse_touches(iss_num["description"])
+        with ad.reserve_touches("repo-touches-num-test", t_bullet) as locked1:
+            self.assertTrue(locked1)
+            with ad.reserve_touches("repo-touches-num-test", t_num) as locked2:
+                self.assertFalse(locked2)
+
         # package.json containing non-object valid JSON triggers violation cleanly instead of AttributeError;
         # symlink pointing to a secret filename is blocked before git write
         with tempfile.TemporaryDirectory() as td:
@@ -2347,6 +2492,28 @@ elif mode == "parallel_safe":
 elif mode == "crash":
     print("simulated codex crash", file=sys.stderr)
     sys.exit(1)
+elif mode == "crash_with_linear_outage":
+    outage_flag = os.environ.get("FAKE_OUTAGE_FLAG")
+    if outage_flag:
+        Path(outage_flag).write_text("offline", encoding="utf-8")
+    print("simulated network outage during worker", file=sys.stderr)
+    sys.exit(1)
+elif mode == "edit_gitattributes":
+    (cwd / ".gitattributes").write_text("*.py -diff\\n* text=auto\\n", encoding="utf-8")
+    (cwd / "app.py").write_text("def add(a, b):\\n    return a + b\\ndef mul(a, b):\\n    return a * b\\n", encoding="utf-8")
+    (cwd / "test_app.py").write_text(
+        "import unittest\\nfrom app import add, mul\\nclass T(unittest.TestCase):\\n"
+        "    def test_add(self): self.assertEqual(add(1,2), 3)\\n"
+        "    def test_mul(self): self.assertEqual(mul(2,3), 6)\\n",
+        encoding="utf-8",
+    )
+elif mode == "edit_gitattributes_with_secret":
+    (cwd / ".gitattributes").write_text("secret.json -diff\\n", encoding="utf-8")
+    (cwd / "secret.json").write_text(json.dumps({{"Authorization": "Token token=synthetic_hidden_secret_12345"}}) + "\\n", encoding="utf-8")
+elif mode == "tamper_git_config":
+    import subprocess
+    subprocess.run(["git", "config", "core.hooksPath", ".husky/_"], cwd=str(cwd), check=True)
+    (cwd / "app.py").write_text("def add(a, b):\\n    return a + b\\ndef mul(a, b):\\n    return a * b\\n", encoding="utf-8")
 else:
     (cwd / "app.py").write_text("def add(a, b):\\n    return a + b\\ndef mul(a, b):\\n    return a * b\\n", encoding="utf-8")
     (cwd / "test_app.py").write_text(
@@ -2540,6 +2707,71 @@ sys.exit(1)
         self.assertIn("cannot verify the publish destination", result.stderr)
         self.assertFalse(_git(other, "for-each-ref", "refs/heads/"))
         self.assertEqual(iss["state"]["name"], "In Progress")
+
+    def test_branch_only_resume_requires_the_verified_base(self) -> None:
+        issue = self.linear_state.add_issue("TST-BASE", "Resume delivery", "Work", labels=["agent-ready"])
+        self.linear_state.fail_next_comment_create = True
+        env = {"AGENT_DISPATCH_FORCE_GH": "0"}
+        run = self._run_cli(["run", issue["identifier"]], extra_env=env)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        state = json.loads((Path(json.loads(run.stdout)["run_dir"]) / "state.json").read_text())
+        self.assertEqual(state["stage"], "linear_state_synced")
+        base = _git(self.repo, "rev-parse", "HEAD")
+        # A replacement base exists but has no common history with the checked base.
+        replacement = _git(self.repo, "commit-tree", "HEAD^{tree}", "-m", "replacement")
+        _git(self.repo, "push", "--force", "origin", f"{replacement}:refs/heads/main")
+        mutations = len(self.linear_state.mutation_log)
+        args = ["resume", issue["identifier"]]
+        for missing in (False, True):
+            if missing:
+                _git(self.bare, "update-ref", "-d", "refs/heads/main")
+            resumed = self._run_cli(args, extra_env=env)
+            self.assertNotEqual(resumed.returncode, 0, resumed.stdout)
+            self.assertIn("origin/main", resumed.stderr)
+            self.assertEqual(len(self.linear_state.mutation_log), mutations)
+        _git(self.repo, "commit", "--allow-empty", "-m", "normal advance")
+        _git(self.repo, "push", "origin", "main")
+        self.assertEqual(state["target_sha"], base)
+        for readonly in (False, True):
+            resumed = self._run_cli(args, extra_env=env)
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            result = json.loads(resumed.stdout)
+            self.assertEqual(result["status"], "passed_branch_only")
+            self.assertEqual(result.get("verified_readonly", False), readonly)
+
+    def test_review_explicit_base_in_local_trunk_repo(self) -> None:
+        _git(self.repo, "remote", "remove", "origin")
+        _git(self.repo, "branch", "-m", "trunk")
+        _git(self.repo, "switch", "-c", "feature")
+        (self.repo / "app.py").write_text("# feature\n")
+        _git(self.repo, "commit", "-am", "feature")
+        result = self._run_cli(["review", "--base", "trunk"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["base_sha"], _git(self.repo, "rev-parse", "trunk"))
+
+    def test_run_fetches_current_base_with_restricted_refspec(self) -> None:
+        issue = self.linear_state.add_issue("TST-REF", "Feature", "Work", labels=["agent-ready"])
+        original = _git(self.repo, "rev-parse", "origin/main")
+        _git(self.repo, "config", "remote.origin.fetch", "+refs/heads/other:refs/remotes/origin/other")
+        _git(self.repo, "commit", "--allow-empty", "-m", "advance main")
+        _git(self.repo, "push", "origin", "main")
+        self.assertEqual(_git(self.repo, "rev-parse", "origin/main"), original)
+        result = self._run_cli(["run", issue["identifier"], "--no-push"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        candidate = json.loads(result.stdout)["commit"]
+        self.assertEqual(_git(self.repo, "rev-parse", f"{candidate}^"), _git(self.bare, "rev-parse", "main"))
+
+    def test_remote_feature_deletion_during_preflight_is_preserved(self) -> None:
+        issue = self.linear_state.add_issue("TST-MOVE", "Feature", "Work", labels=["agent-ready"])
+        ref = "refs/heads/feat/tst-move"
+        _git(self.repo, "push", "origin", f"HEAD:{ref}")
+        setup = f'git --git-dir="$TEST_BARE" update-ref -d {ref}'
+        result = self._run_cli(["run", issue["identifier"], "--setup-cmd", setup],
+                               extra_env={"TEST_BARE": str(self.bare)})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("changed during preflight", result.stderr)
+        self.assertFalse(self.linear_state.mutation_log)
+        self.assertFalse(_git(self.bare, "for-each-ref", ref))
 
     def test_cleanup_preserves_human_commit_during_merge_lookup(self) -> None:
         self.linear_state.add_issue("TST-KEEP", "Race cleanup", "Work", labels=["agent-ready"])
@@ -3014,6 +3246,18 @@ sys.exit(1)
         missing = self._run_cli(["doctor", "--project", "missing-project"])
         self.assertNotEqual(missing.returncode, 0)
         self.assertFalse(json.loads(missing.stdout)["ok"])
+        local_bin = Path.home() / ".local/bin"
+        local_bin.mkdir(parents=True)
+        codex = (self.fake_bin / "codex").rename(local_bin / "codex")
+        for tool in ("python3", "git"):
+            (self.fake_bin / tool).symlink_to(shutil.which(tool))
+        isolated_path = {"PATH": str(self.fake_bin)}
+        result = self._run_cli(["doctor"], extra_env=isolated_path)
+        harnesses = json.loads(result.stdout)["checks"]["harnesses"]
+        self.assertEqual(harnesses["codex"], {"ok": True, "path": str(codex)})
+        codex.chmod(0o644)
+        result = self._run_cli(["doctor"], extra_env=isolated_path)
+        self.assertFalse(json.loads(result.stdout)["checks"]["harnesses"]["codex"]["ok"])
 
     def test_setup_helper_available_during_checks_and_excluded_from_candidate(self) -> None:
         self.linear_state.add_issue("TST-HELP", "feature", "## Touches\n- app", labels=["agent-ready"])
@@ -3026,6 +3270,18 @@ sys.exit(1)
         wt = Path(out["worktree"])
         self.assertNotIn("helper[*]", _git(wt, "ls-tree", "-r", "--name-only", out["commit"]).splitlines())
         self.assertEqual(_git(wt, "status", "--porcelain"), "")
+
+    def test_setup_cannot_change_candidate_source_before_claim(self) -> None:
+        for n, setup in enumerate(("echo setup >> app.py", "git commit --allow-empty -m setup",
+                                   "git switch --detach HEAD")):
+            with self.subTest(setup=setup):
+                ident = f"TST-{n + 100}"
+                self.linear_state.add_issue(ident, "Feature", "Work", labels=["agent-ready"])
+                result = self._run_cli(["run", ident, "--setup-cmd", setup, "--skip-baseline"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Bootstrap changed", result.stderr)
+                self.assertEqual(self.linear_state.mutation_log, [])
+                self.assertFalse((self.root / "codex_calls.count").exists())
 
     def test_worker_changes_trigger_new_verification_recipe_on_each_candidate(self) -> None:
         issue = self.linear_state.add_issue("TST-CAND", "Backend checks", "## Touches\n- tests", labels=["agent-ready"])
@@ -3209,23 +3465,251 @@ sys.exit(res.returncode)
         )
         self.assertTrue(sig_marker.exists(), f"Push did not reach SIGTERM injection (exit {res1.returncode}): {res1.stdout} {res1.stderr}")
         self.assertEqual(res1.returncode, 128 + signal.SIGTERM, res1.stderr + res1.stdout)
-        # Checkpoint MUST keep resumable stage (pushing/pushed), NOT 'error'!
+        # Checkpoint MUST persist pushed=True and stage='pushed' immediately once remote read-back confirms push!
         rkey = ad.repo_cache_key(self.repo)
         ckpt = json.loads((self.cache_dir / "runs" / rkey / "TST-TERM" / "latest.json").read_text(encoding="utf-8"))
-        self.assertIn(ckpt["stage"], ("pushing", "pushed"))
+        state_json = json.loads((Path(ckpt["run_dir"]) / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(ckpt["stage"], "pushed")
+        self.assertTrue(ckpt["pushed"])
+        self.assertEqual(state_json["stage"], "pushed")
+        self.assertTrue(state_json["pushed"])
         # Linear MUST have dispatch:publish-incomplete + comment and MUST NOT have rolled back to Todo!
         self.assertEqual(iss["state"]["name"], "In Progress")
         self.assertIn("dispatch:publish-incomplete", [l["name"] for l in iss["_labels"]])
         self.assertNotIn("dispatch:failed", [l["name"] for l in iss["_labels"]])
-        self.assertTrue(any("Publish Interrupted" in c["body"] for c in self.linear_state.comments[iss["id"]]))
+        self.assertTrue(any("Publish Interrupted" in c["body"] and "confirmed" in c["body"] for c in self.linear_state.comments[iss["id"]]))
 
-        # Now `resume` converges cleanly to passed!
+        # Maintainer deletes remote branch after seeing confirmed push -> `resume` MUST refuse and NOT recreate the branch!
+        branch_ref = f"refs/heads/{ckpt['branch']}"
+        pushed_sha = ckpt["candidate_sha"]
+        _git(self.bare, "update-ref", "-d", branch_ref)
+        self.assertEqual(_git(self.bare, "for-each-ref", branch_ref), "")
+        res_del = self._run_cli(["resume", "TST-TERM", "--repo", str(self.repo)])
+        self.assertNotEqual(res_del.returncode, 0)
+        self.assertIn("human action preserved", res_del.stderr)
+        self.assertEqual(_git(self.bare, "for-each-ref", branch_ref), "", "resume MUST NOT recreate human-deleted branch!")
+
+        # Restore remote branch ref -> normal `resume` converges cleanly to passed!
+        _git(self.bare, "update-ref", branch_ref, pushed_sha)
         res2 = self._run_cli(["resume", "TST-TERM", "--repo", str(self.repo)])
         self.assertEqual(res2.returncode, 0, res2.stderr + res2.stdout)
         out2 = json.loads(res2.stdout)
         self.assertEqual(out2["status"], "passed")
         self.assertEqual(iss["state"]["name"], "In Review")
         self.assertNotIn("dispatch:publish-incomplete", [l["name"] for l in iss["_labels"]])
+
+    def test_e2e_pre_publish_rollback_outage_persists_rollback_pending_and_resumes_safely(self) -> None:
+        """Linear outage during pre-publish cleanup persists rollback_pending; resume unlocks owned issue without overwriting human edits."""
+        iss = self.linear_state.add_issue(
+            "TST-RB",
+            "Outage during rollback",
+            "## What to Build\nWork\n\n## Touches\n- src/auth\n",
+            labels=["agent-ready"],
+        )
+        outage_flag = self.root / "linear_offline.flag"
+        self.linear_state.outage_flag_file = outage_flag
+
+        res_fail = self._run_cli(
+            ["run", "TST-RB", "--repo", str(self.repo), "--skip-baseline"],
+            extra_env={"FAKE_CODEX_MODE": "crash_with_linear_outage", "FAKE_OUTAGE_FLAG": str(outage_flag)},
+        )
+        self.assertNotEqual(res_fail.returncode, 0)
+        self.assertTrue(outage_flag.exists())
+        # Ticket stayed In Progress because Linear was unreachable during cleanup; checkpoint recorded rollback_pending.
+        self.assertEqual(iss["state"]["name"], "In Progress")
+        rkey = ad.repo_cache_key(self.repo)
+        ckpt = json.loads((self.cache_dir / "runs" / rkey / "TST-RB" / "latest.json").read_text(encoding="utf-8"))
+        self.assertEqual(ckpt["stage"], "rollback_pending")
+        self.assertEqual(ckpt["pre_claim_state_id"], "st-todo")
+        self.assertEqual(ckpt["claimed_state_id"], "st-prog")
+
+        # Restore Linear connectivity.
+        outage_flag.unlink()
+        self.linear_state.outage_flag_file = None
+
+        # Plain `run` directs user to `resume` instead of blindly rerunning.
+        res_run = self._run_cli(["run", "TST-RB", "--repo", str(self.repo), "--skip-baseline"])
+        self.assertNotEqual(res_run.returncode, 0)
+        self.assertIn("resume TST-RB", res_run.stderr)
+
+        # Human edits (Done / Canceled / Todo / assignee / description) MUST NEVER be overwritten by `resume`.
+        orig_state = iss["state"]
+        orig_desc = iss["description"]
+        mut_before = len(self.linear_state.mutation_log)
+        for label, mutate, restore in (
+            ("Done", lambda: iss.__setitem__("state", next(s for s in self.linear_state.states if s["name"] == "Done")),
+             lambda: iss.__setitem__("state", orig_state)),
+            ("Canceled", lambda: iss.__setitem__("state", next(s for s in self.linear_state.states if s["name"] == "Canceled")),
+             lambda: iss.__setitem__("state", orig_state)),
+            ("Todo", lambda: iss.__setitem__("state", next(s for s in self.linear_state.states if s["name"] == "Todo")),
+             lambda: iss.__setitem__("state", orig_state)),
+            ("assignee", lambda: iss.__setitem__("assignee", {"id": "human-1", "name": "Alice"}),
+             lambda: iss.__setitem__("assignee", None)),
+            ("description", lambda: iss.__setitem__("description", orig_desc + "\nEdited by human"),
+             lambda: iss.__setitem__("description", orig_desc)),
+        ):
+            with self.subTest(human_change=label):
+                mutate()
+                try:
+                    res_guard = self._run_cli(["resume", "TST-RB", "--repo", str(self.repo)])
+                    self.assertNotEqual(res_guard.returncode, 0)
+                    self.assertEqual(len(self.linear_state.mutation_log), mut_before)
+                finally:
+                    restore()
+
+        # With original ownership intact, `resume` adds `dispatch:failed` FIRST, reverts to `Todo`, and posts diagnostic comment.
+        res_rec = self._run_cli(["resume", "TST-RB", "--repo", str(self.repo)])
+        self.assertEqual(res_rec.returncode, 0, res_rec.stderr + res_rec.stdout)
+        out_rec = json.loads(res_rec.stdout)
+        self.assertEqual(out_rec["status"], "rollback_completed")
+        self.assertEqual(iss["state"]["name"], "Todo")
+        self.assertIn("dispatch:failed", [l["name"] for l in iss["_labels"]])
+        new_muts = self.linear_state.mutation_log[mut_before:]
+        lbl_idx = next(i for i, (k, d) in enumerate(new_muts) if k == "addLabels" and "dispatch:failed" in d["labels"])
+        todo_idx = next(i for i, (k, d) in enumerate(new_muts) if k == "state" and d["state"] == "Todo")
+        self.assertLess(lbl_idx, todo_idx)
+        self.assertTrue(any("recovered via resume" in c["body"] for c in self.linear_state.comments[iss["id"]]))
+
+        # Second `resume` is idempotent with zero additional mutations; ticket no longer blocks Touches in frontier.
+        mut_after = len(self.linear_state.mutation_log)
+        res_rec2 = self._run_cli(["resume", "TST-RB", "--repo", str(self.repo)])
+        self.assertEqual(res_rec2.returncode, 0, res_rec2.stderr)
+        self.assertEqual(len(self.linear_state.mutation_log), mut_after)
+
+        self.linear_state.add_issue("TST-RB-SIB", "Sibling on auth", "## Touches\n- src/auth\n", labels=["agent-ready"])
+        res_front = self._run_cli(["frontier", "--repo", str(self.repo), "--skip-baseline"])
+        self.assertEqual(res_front.returncode, 0, res_front.stderr + res_front.stdout)
+        out_front = json.loads(res_front.stdout)
+        self.assertEqual([r["issue"] for r in out_front["results"]], ["TST-RB-SIB"])
+
+    def test_e2e_bootstrap_disables_husky_and_blocks_shared_git_config_tampering(self) -> None:
+        """Auto dependency bootstrap sets HUSKY=0 and aborts before claim if shared .git/config is modified (candidate & baseline)."""
+        (self.repo / "package.json").write_text('{"name":"demo"}\n', encoding="utf-8")
+        (self.repo / "package-lock.json").write_text('{"lockfileVersion":3}\n', encoding="utf-8")
+        _git(self.repo, "add", "package.json", "package-lock.json")
+        _git(self.repo, "commit", "-m", "add node lockfile")
+        _git(self.repo, "push", "origin", "main")
+
+        husky_log = self.root / "husky_env.log"
+        _write_exec(
+            self.fake_bin / "npm",
+            f"""#!/usr/bin/env python3
+import os, subprocess, sys
+from pathlib import Path
+Path({str(husky_log)!r}).write_text(os.environ.get("HUSKY", ""), encoding="utf-8")
+if os.environ.get("FAKE_NPM_TAMPER_GIT_CONFIG") == "1":
+    subprocess.run(["git", "config", "core.hooksPath", ".husky/_"], check=True)
+(Path.cwd() / "node_modules").mkdir(exist_ok=True)
+""",
+        )
+
+        # 1. Candidate worktree bootstrap tampering shared core.hooksPath MUST abort before Linear claim!
+        self.linear_state.add_issue("TST-BOOT1", "Node bootstrap tamper", "## Touches\n- app\n", labels=["agent-ready"])
+        res_tamper = self._run_cli(
+            ["run", "TST-BOOT1", "--repo", str(self.repo), "--skip-baseline"],
+            extra_env={"FAKE_NPM_TAMPER_GIT_CONFIG": "1"},
+        )
+        self.assertNotEqual(res_tamper.returncode, 0)
+        self.assertIn("shared git config", res_tamper.stderr)
+        self.assertEqual(husky_log.read_text(encoding="utf-8"), "0")
+        self.assertEqual(self.linear_state.mutation_log, [])
+        self.assertFalse((self.root / "codex_calls.count").exists())
+        # Restore shared git config after simulated tamper so subsequent assertions start clean.
+        _git(self.repo, "config", "--unset", "core.hooksPath", check=False)
+
+        # 2. Detached baseline bootstrap tampering shared core.hooksPath MUST ALSO abort before Linear claim!
+        iss_base = self.linear_state.add_issue("TST-BOOT2", "Baseline bootstrap tamper", "## Touches\n- app\n", labels=["agent-ready"])
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CACHE_ROOT": str(self.cache_dir)}):
+            wt2, _, _ = ad.prepare_worktree(self.repo, iss_base["identifier"], "main", issue_uuid=iss_base["id"])
+        # Pre-populate node_modules on candidate so candidate skips npm ci, while feature branch is ahead so detached baseline runs npm ci!
+        (wt2 / "node_modules").mkdir()
+        _git(wt2, "commit", "--allow-empty", "-m", "ahead of base")
+        res_base_tamper = self._run_cli(
+            ["run", "TST-BOOT2", "--repo", str(self.repo)],
+            extra_env={"FAKE_NPM_TAMPER_GIT_CONFIG": "1"},
+        )
+        self.assertNotEqual(res_base_tamper.returncode, 0)
+        self.assertIn("shared git config", res_base_tamper.stderr)
+        self.assertEqual(self.linear_state.mutation_log, [])
+        self.assertFalse((self.root / "codex_calls.count").exists())
+        _git(self.repo, "config", "--unset", "core.hooksPath", check=False)
+
+        # 3. Clean auto bootstrap passes and saw HUSKY=0.
+        self.linear_state.add_issue("TST-BOOT3", "Clean node bootstrap", "## Touches\n- app\n", labels=["agent-ready"])
+        res_ok = self._run_cli(["run", "TST-BOOT3", "--repo", str(self.repo), "--no-push", "--skip-baseline"])
+        self.assertEqual(res_ok.returncode, 0, res_ok.stderr + res_ok.stdout)
+        self.assertEqual(husky_log.read_text(encoding="utf-8"), "0")
+
+    def test_e2e_root_gitattributes_authorization_and_trusted_baseline_diff_scans(self) -> None:
+        """Authorized root .gitattributes edits pass while unauthorized edits and .git/config tampering fail; diff/secret scans use baseline attributes."""
+        # 1. Unauthorized edit to root .gitattributes is blocked immediately.
+        self.linear_state.add_issue(
+            "TST-GA1", "Unauthorized gitattributes", "## What to Build\nUpdate attrs\n", labels=["agent-ready"]
+        )
+        res_unauth = self._run_cli(
+            ["run", "TST-GA1", "--repo", str(self.repo), "--skip-baseline"],
+            extra_env={"FAKE_CODEX_MODE": "edit_gitattributes"},
+        )
+        self.assertNotEqual(res_unauth.returncode, 0)
+        self.assertIn("Unauthorized .gitattributes tampering", res_unauth.stderr)
+
+        # 2. Explicitly authorized via `- gate: .gitattributes` passes, AND reviewer diff still uses trusted baseline attributes!
+        self.linear_state.add_issue(
+            "TST-GA2",
+            "Authorized gitattributes via brief",
+            "## What to Build\nUpdate attrs\n\n## Authorized Gate/Test Changes\n- gate: .gitattributes\n",
+            labels=["agent-ready"],
+        )
+        res_brief = self._run_cli(
+            ["run", "TST-GA2", "--repo", str(self.repo), "--skip-baseline"],
+            extra_env={"FAKE_CODEX_MODE": "edit_gitattributes"},
+        )
+        self.assertEqual(res_brief.returncode, 0, res_brief.stderr + res_brief.stdout)
+        out_brief = json.loads(res_brief.stdout)
+        self.assertEqual(out_brief["status"], "passed")
+        patch_txt = (Path(out_brief["run_dir"]) / "diff-r1.patch").read_text(encoding="utf-8")
+        self.assertIn("+def mul(a, b):", patch_txt, "Reviewer diff must use baseline attributes and ignore worker `*.py -diff`!")
+        self.assertNotIn("Binary files a/app.py and b/app.py differ", patch_txt)
+
+        # 3. Explicitly authorized via CLI `--allow-gate-edits` also passes.
+        self.linear_state.add_issue(
+            "TST-GA3", "Authorized gitattributes via CLI", "## What to Build\nUpdate attrs\n", labels=["agent-ready"]
+        )
+        res_cli = self._run_cli(
+            ["run", "TST-GA3", "--repo", str(self.repo), "--allow-gate-edits", "--no-push", "--skip-baseline"],
+            extra_env={"FAKE_CODEX_MODE": "edit_gitattributes"},
+        )
+        self.assertEqual(res_cli.returncode, 0, res_cli.stderr + res_cli.stdout)
+        self.assertEqual(json.loads(res_cli.stdout)["status"], "passed_local")
+
+        # 4. Authorized `.gitattributes` adding `-diff` cannot hide secrets from pre-commit / range scans.
+        self.linear_state.add_issue(
+            "TST-GA4",
+            "Authorized gitattributes secret hiding",
+            "## Authorized Gate/Test Changes\n- gate: .gitattributes\n",
+            labels=["agent-ready"],
+        )
+        res_sec = self._run_cli(
+            ["run", "TST-GA4", "--repo", str(self.repo), "--max-rework", "0", "--no-push", "--skip-baseline"],
+            extra_env={"FAKE_CODEX_MODE": "edit_gitattributes_with_secret"},
+        )
+        self.assertNotEqual(res_sec.returncode, 0)
+        self.assertEqual(json.loads(res_sec.stdout)["status"], "failed_max_rework")
+
+        # 5. Even with `- gate: .gitattributes` and `--allow-gate-edits`, `.git/config` tampering is ALWAYS blocked!
+        self.linear_state.add_issue(
+            "TST-GA5",
+            "Git config remains immutable",
+            "## Authorized Gate/Test Changes\n- gate: .gitattributes\n",
+            labels=["agent-ready"],
+        )
+        res_cfg = self._run_cli(
+            ["run", "TST-GA5", "--repo", str(self.repo), "--allow-gate-edits", "--skip-baseline"],
+            extra_env={"FAKE_CODEX_MODE": "tamper_git_config"},
+        )
+        self.assertNotEqual(res_cfg.returncode, 0)
+        self.assertIn("Unauthorized git config tampering", res_cfg.stderr)
+        _git(self.repo, "config", "--unset", "core.hooksPath", check=False)
 
     def test_e2e_resume_linear_state_synced_respects_closed_pr_and_human_todo_and_cleanup_branch_owner(self) -> None:
         """Respect human PR, Linear and branch changes during recovery and cleanup."""
@@ -3345,12 +3829,20 @@ sys.exit(res.returncode)
             src_copy = d / "workflow_src"
             shutil.copytree(WORKFLOW_ROOT, src_copy, ignore=shutil.ignore_patterns(".git", "__pycache__"))
             ag_skills = d / "agent_skills"
+            ag_plugins = d / "agy_plugins"
             cx_skills = d / "codex_skills"
             cx_agents = d / "codex" / "AGENTS.md"
             bin_dst = d / "bin" / "agent-dispatch"
             (ag_skills / "my-custom-skill").mkdir(parents=True)
             (ag_skills / "my-custom-skill" / "SKILL.md").write_text("keep me", encoding="utf-8")
             (ag_skills / "my-grill").symlink_to(src_copy / "skills" / "grill")
+            (ag_plugins / "unrelated-plugin").mkdir(parents=True)
+            (ag_plugins / "unrelated-plugin" / "plugin.json").write_text('{"name":"unrelated"}\n', encoding="utf-8")
+            (ag_plugins / "agent-workflow").mkdir(parents=True)
+            (ag_plugins / "agent-workflow" / "plugin.json").write_text(
+                '{"name":"agent-workflow","displayName":"Old Workflow Plugin"}\n', encoding="utf-8"
+            )
+            (ag_plugins / "agent-workflow" / "custom.txt").write_text("backup plugin", encoding="utf-8")
             cx_agents.parent.mkdir(parents=True)
             cx_agents.write_text("custom real AGENTS.md", encoding="utf-8")
 
@@ -3358,18 +3850,49 @@ sys.exit(res.returncode)
             env.update(
                 {
                     "AGENT_SKILLS_DIR": str(ag_skills),
+                    "AGY_PLUGINS_DIR": str(ag_plugins),
                     "CODEX_SKILLS_DIR": str(cx_skills),
                     "CODEX_AGENTS_MD": str(cx_agents),
                     "BIN_TARGET": str(bin_dst),
                 }
             )
+            env.pop("AGY_PLUGINS_BACKUP_DIR", None)
             subprocess.run([str(src_copy / "install.sh")], check=True, env=env, capture_output=True)
             initial_links = {p: p.lstat().st_ino for p in ag_skills.iterdir()}
+            plugin_inode = (ag_plugins / "agent-workflow").lstat().st_ino
             subprocess.run([str(src_copy / "install.sh")], check=True, env=env, capture_output=True)
             self.assertEqual(initial_links, {p: p.lstat().st_ino for p in ag_skills.iterdir()})
+            self.assertEqual((ag_plugins / "agent-workflow").lstat().st_ino, plugin_inode)
             self.assertEqual((ag_skills / "my-grill").resolve(), src_copy / "skills" / "grill")
-            # Unrelated skill preserved!
+            # Unrelated skill and plugin preserved!
             self.assertTrue((ag_skills / "my-custom-skill" / "SKILL.md").is_file())
+            self.assertTrue((ag_plugins / "unrelated-plugin" / "plugin.json").is_file())
+            # Global Antigravity rules plugin linked and conflicting plugin moved OUTSIDE auto-discovery dir!
+            self.assertEqual((ag_plugins / "agent-workflow").resolve(), src_copy / "agy" / "plugin")
+            self.assertTrue((ag_plugins / "agent-workflow" / "rules" / "AGENTS.md").is_file())
+            self.assertEqual(list(ag_plugins.glob("*.bak.*")), [], "Plugin backup must NOT remain inside AGY_PLUGINS_DIR!")
+            plugin_bak_root = d / "plugins.bak"
+            plugin_backups = list(plugin_bak_root.glob("agent-workflow.bak.*"))
+            self.assertEqual(len(plugin_backups), 1)
+            self.assertEqual(
+                json.loads((plugin_backups[0] / "plugin.json").read_text(encoding="utf-8"))["displayName"],
+                "Old Workflow Plugin",
+            )
+            self.assertEqual((plugin_backups[0] / "custom.txt").read_text(encoding="utf-8"), "backup plugin")
+            # Conflicting symlink to an old checkout is also moved out of AGY_PLUGINS_DIR into plugins.bak!
+            old_checkout = d / "old_checkout_plugin"
+            old_checkout.mkdir()
+            (old_checkout / "plugin.json").write_text('{"name":"agent-workflow","displayName":"Relocated"}\n', encoding="utf-8")
+            (ag_plugins / "agent-workflow").unlink()
+            (ag_plugins / "agent-workflow").symlink_to(old_checkout)
+            subprocess.run([str(src_copy / "install.sh")], check=True, env=env, capture_output=True)
+            self.assertEqual(list(ag_plugins.glob("*.bak.*")), [])
+            self.assertEqual((ag_plugins / "agent-workflow").resolve(), src_copy / "agy" / "plugin")
+            self.assertEqual(len(list(plugin_bak_root.glob("agent-workflow.bak.*"))), 2)
+            # Setting AGY_PLUGINS_BACKUP_DIR inside AGY_PLUGINS_DIR fails closed!
+            bad_env = dict(env, AGY_PLUGINS_BACKUP_DIR=str(ag_plugins / "nested-bak"))
+            bad_res = subprocess.run([str(src_copy / "install.sh")], env=bad_env, capture_output=True, text=True)
+            self.assertNotEqual(bad_res.returncode, 0)
             # Real AGENTS.md backed up, not destroyed!
             backups = list(cx_agents.parent.glob("AGENTS.md.bak.*"))
             self.assertEqual(len(backups), 1)
@@ -3379,6 +3902,39 @@ sys.exit(res.returncode)
             self.assertFalse((cx_skills / "slice").exists())
             self.assertTrue((cx_skills / "grill").is_symlink())
             self.assertTrue((ag_skills / "dispatch").is_symlink())
+
+    def test_installer_resolves_script_and_registry_aliases(self) -> None:
+        source = self.root / "source"
+        shutil.copytree(WORKFLOW_ROOT, source, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+        script = self.root / "relink"
+        script.symlink_to(source / "install.sh")
+        agent_skills = self.root / "agent-skills"
+        agent_skills.symlink_to(source / "skills")
+        agy_plugins = self.root / "agy-plugins"
+        worker_skills = self.root / "worker-skills"
+        worker_skills.mkdir()
+        relative = worker_skills / "research"
+        relative.symlink_to("../source/skills/research")
+        inode = relative.lstat().st_ino
+        retired = worker_skills / "dispatch"
+        retired.symlink_to("../source/skills/dispatch")
+        env = dict(os.environ, AGENT_SKILLS_DIR=str(agent_skills), AGY_PLUGINS_DIR=str(agy_plugins),
+                   CODEX_SKILLS_DIR=str(worker_skills), CODEX_AGENTS_MD=str(self.root / "AGENTS.md"),
+                   BIN_TARGET=str(self.root / "agent-dispatch"))
+        subprocess.run([str(script)], env=env, check=True, capture_output=True)
+        self.assertTrue((agent_skills / "dispatch/SKILL.md").is_file())
+        self.assertFalse((source / "skills/dispatch").is_symlink())
+        self.assertFalse(retired.is_symlink())
+        self.assertEqual(relative.lstat().st_ino, inode)
+        self.assertEqual((agy_plugins / "agent-workflow").resolve(), source / "agy/plugin")
+        self.assertEqual((self.root / "agent-dispatch").resolve(), source / "bin/agent-dispatch")
+        self.assertFalse(list(source.rglob("*.bak.*")))
+
+        # Both rosters cannot be installed into the same physical directory.
+        env["CODEX_SKILLS_DIR"] = str(source / "skills")
+        conflict = subprocess.run([str(script)], env=env, capture_output=True)
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertTrue((agent_skills / "dispatch/SKILL.md").is_file())
 
     def test_cleanup_reclaims_bootstrapped_baseline_with_untracked_files_and_protects_tracked_edits(self) -> None:
         base = _git(self.repo, "rev-parse", "HEAD")

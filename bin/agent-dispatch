@@ -422,9 +422,38 @@ def default_reviewer_for(worker: HarnessSpec) -> HarnessSpec:
 _PEM_START = re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")
 _PEM_END = re.compile(r"-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")
 _PEM_BLOCK = re.compile(_PEM_START.pattern + r".*?(?:" + _PEM_END.pattern + r"|\Z)", re.S)
-_AUTH_HEADER_VALUE = re.compile(
-    r"""(?i)(\bauthorization\b["']?[ \t]*[:=][ \t]*["']?(?:bearer|basic)[ \t]+)([A-Za-z0-9._~+/-]{8,}=*)"""
+_AUTH_HEADER_SCHEMES = r"(?:bearer|basic|token|apikey|oauth)"
+_AUTH_PARAM_VAL = (
+    r"""(?:"[^"\r\n]*"|'[^'\r\n]*'|\$\{\{[^}\r\n]+\}\}|\{\{[^}\r\n]+\}\}"""
+    r"""|\$\{[^}\s\r\n]+\}|<[^>\s\r\n]+>|[^=\s,"';}\]][^\s,"';}\]]*)"""
 )
+_AUTH_PARAM_PAIR = re.compile(
+    rf"""([A-Za-z_][A-Za-z0-9_-]*)[ \t]*=[ \t]*(?:"([^"\r\n]*)"|'([^'\r\n]*)'|(\$\{{\{{[^}}\r\n]+\}}\}}|\{{\{{[^}}\r\n]+\}}\}}|\$\{{[^}}\s\r\n]+\}}|<[^>\s\r\n]+>|[^=\s,"';}}\]][^\s,"';}}\]]*))"""
+)
+_AUTH_PARAM_LIST_QUOTED = re.compile(
+    rf"""^(?:[A-Za-z_][A-Za-z0-9_-]*[ \t]*=[ \t]*{_AUTH_PARAM_VAL})(?:(?:[ \t]*,[ \t]*|[ \t]+)[A-Za-z_][A-Za-z0-9_-]*[ \t]*=[ \t]*{_AUTH_PARAM_VAL})*$"""
+)
+_AUTH_PARAM_LIST_UNQUOTED = (
+    rf"""[A-Za-z_][A-Za-z0-9_-]*[ \t]*=[ \t]*{_AUTH_PARAM_VAL}(?:[ \t]*,[ \t]*[A-Za-z_][A-Za-z0-9_-]*[ \t]*=[ \t]*{_AUTH_PARAM_VAL})*"""
+)
+_AUTH_HEADER_VALUE = re.compile(
+    rf"""(\b(?:proxy-)?authorization\b["']?[ \t]*[:=][ \t]*)"""
+    rf"""(?:"""
+    rf""""({_AUTH_HEADER_SCHEMES}[ \t]+)((?:\\.|[^"\\\r\n])*)"?"""
+    rf"""|'({_AUTH_HEADER_SCHEMES}[ \t]+)((?:\\.|[^'\\\r\n])*)'?"""
+    rf"""|({_AUTH_HEADER_SCHEMES}[ \t]+)({_AUTH_PARAM_LIST_UNQUOTED}|\$\{{\{{[^}}\r\n]+\}}\}}|\{{\{{[^}}\r\n]+\}}\}}|\$\{{[^}}\s\r\n]+\}}|[^\s"',;}}\]]+)"""
+    rf""")""",
+    re.I,
+)
+_AUTH_NONSECRET_PARAMS = frozenset({
+    "realm", "version", "algorithm", "qop", "charset",
+    "oauth_version", "oauth_signature_method",
+})
+_AUTH_EMPTY_PARAM_KEYS = frozenset({
+    "token", "key", "apikey", "api_key", "secret", "password",
+    "credential", "access_token", "oauth_token", "oauth_consumer_key",
+    "oauth_signature",
+})
 _API_KEY_HEADERS = ("x-api-key", "x-goog-api-key")
 # Bare HTTP fields have a literal value. Source-code expressions have their own rules below.
 _RAW_CREDENTIAL_FIELD = re.compile(
@@ -597,12 +626,40 @@ def _redact_api_key_header(m: re.Match[str]) -> str:
     return m[1] + _REDACTED
 
 
+def _is_benign_auth_token(tok: str) -> bool:
+    s = tok.strip()
+    if not s or s.lower() in _API_KEY_BENIGN_WORDS or _API_KEY_PLACEHOLDER.fullmatch(s):
+        return True
+    if len(s) < 6:
+        return True
+    if len(s) < 8 and _PLAIN_ALPHA_WORD.fullmatch(s):
+        return True
+    return False
+
+
+def _is_benign_auth_param_list(value: str) -> bool:
+    empty_param = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_-]*)[ \t]*=", value)
+    if empty_param and empty_param.group(1).lower() in _AUTH_EMPTY_PARAM_KEYS:
+        return True
+    if not _AUTH_PARAM_LIST_QUOTED.fullmatch(value):
+        return False
+    for pm in _AUTH_PARAM_PAIR.finditer(value):
+        pkey = pm.group(1).lower()
+        pval = pm.group(2) if pm.group(2) is not None else (pm.group(3) if pm.group(3) is not None else (pm.group(4) or ""))
+        if pkey in _AUTH_NONSECRET_PARAMS:
+            continue
+        if not _is_benign_auth_token(pval):
+            return False
+    return True
+
+
 def _redact_raw_credential_field(m: re.Match[str]) -> str:
     value = re.sub(r"[ \t]+#.*$", "", m[2].strip()).strip()
     if (
         not value
         or value[0] in ("'", '"')
         or _API_KEY_PLACEHOLDER.fullmatch(value)
+        or _is_benign_auth_param_list(value)
         or _yaml_alias_to_placeholder(m, value)
         or value.lower() in _API_KEY_BENIGN_WORDS
         or any(ch.isspace() for ch in value)
@@ -612,9 +669,32 @@ def _redact_raw_credential_field(m: re.Match[str]) -> str:
 
 
 def _redact_auth_header(m: re.Match[str]) -> str:
-    if _PLAIN_ALPHA_WORD.fullmatch(m.group(2)) and re.match(r"[ \t]+[A-Za-z]", m.string[m.end():]):
-        return m.group(0)
-    return m.group(1) + _REDACTED
+    if m[2] is not None:
+        quote, scheme, raw_val = '"', m[2], m[3] or ""
+        unescaped = raw_val.replace('\\"', '"').strip()
+    elif m[4] is not None:
+        quote, scheme, raw_val = "'", m[4], m[5] or ""
+        unescaped = raw_val.replace("\\'", "'").strip()
+    else:
+        quote, scheme, raw_val = "", m[6], m[7] or ""
+        unescaped = raw_val.strip()
+
+    if not unescaped:
+        return m[0]
+    if not quote and _yaml_alias_to_placeholder(m, unescaped):
+        return m[0]
+    if _is_benign_auth_param_list(unescaped):
+        return m[0]
+    if not _AUTH_PARAM_LIST_QUOTED.fullmatch(unescaped):
+        if any(ch.isspace() for ch in unescaped):
+            return m[0]
+        if _is_benign_auth_token(unescaped):
+            return m[0]
+        if not quote and _PLAIN_ALPHA_WORD.fullmatch(unescaped) and re.match(r"[ \t]+[A-Za-z]", m.string[m.end():]):
+            return m[0]
+    if quote:
+        return m[1] + quote + scheme + _REDACTED + quote
+    return m[1] + scheme + _REDACTED
 
 
 def redact_secrets(text: str) -> str:
@@ -680,9 +760,9 @@ def scan_text_for_secrets(text: str, field_name: str) -> list[str]:
     return []
 
 
-def git_cmd(*args: str) -> list[str]:
+def git_cmd(*args: str, attr_source: str | None = None) -> list[str]:
     """Safe orchestrator git invocation: disables repo hooks, fsmonitor, pager, and path quoting."""
-    return [
+    cmd = [
         "git",
         "-c",
         "core.hooksPath=/dev/null",
@@ -691,8 +771,11 @@ def git_cmd(*args: str) -> list[str]:
         "-c",
         "core.quotePath=false",
         "--no-pager",
-        *args,
     ]
+    if attr_source:
+        cmd.append(f"--attr-source={attr_source}")
+    cmd.extend(args)
+    return cmd
 
 
 def ensure_sanitized_gitconfig() -> tuple[Path, Path]:
@@ -765,6 +848,14 @@ def build_child_env(*, role: str = "child") -> dict[str, str]:
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
+
+
+def find_harness_binary(name: str) -> str | None:
+    path = build_child_env(role="orchestrator")["PATH"]
+    executable = shutil.which(name, path=path)
+    if not executable and name in ("agy", "pi"):
+        executable = shutil.which(f"/root/.local/bin/{name}")
+    return executable
 
 
 class _RedactedLog:
@@ -908,6 +999,7 @@ def run_cmd(
     shell: bool = False,
     check: bool = False,
     env_role: str = "child",
+    extra_env: dict[str, str] | None = None,
     cap_output: bool = True,
     output_limit: int | None = None,
     stdout_encoding: str = "utf-8",
@@ -919,6 +1011,8 @@ def run_cmd(
     if not ignore_shutdown:
         _check_shutdown()
     env = build_child_env(role=env_role)
+    if extra_env:
+        env.update(extra_env)
 
     def _terminate_proc(proc: subprocess.Popen[bytes]) -> None:
         try:
@@ -1567,9 +1661,20 @@ def resolve_project(client: LinearClient, repo_root: Path, explicit: str | None 
     )
 
 
+_TOUCH_LITERAL_SEGMENT = re.compile(r"^[a-z0-9._@+-]+$")
+
+
 def _normalize_touch_token(raw: str) -> str | None:
-    """Normalize a Touches entry to lowercase POSIX relative path; return None for broad wildcards (fail-closed unscoped)."""
-    tok = raw.strip().strip("`").replace("\\", "/").lower()
+    """Normalize a Touches entry to lowercase POSIX relative path; return None for broad wildcards or non-literal entries (fail-closed)."""
+    tok = raw.strip()
+    if not tok:
+        return ""
+    if "`" in tok:
+        if len(tok) >= 2 and tok[0] == "`" and tok[-1] == "`":
+            tok = tok[1:-1].strip()
+        if "`" in tok:
+            return None
+    tok = tok.replace("\\", "/").lower()
     if not tok or tok in ("none", "n/a", "nil"):
         return ""
     while tok.startswith("./"):
@@ -1583,6 +1688,8 @@ def _normalize_touch_token(raw: str) -> str | None:
     for i, part in enumerate(parts):
         if any(char in part for char in "*?["):
             return "/".join(parts[:i]) or None
+        if not _TOUCH_LITERAL_SEGMENT.fullmatch(part):
+            return None
     return "/".join(parts)
 
 
@@ -1608,13 +1715,13 @@ def parse_touches(description: str) -> set[str]:
             continue
         if not in_section or not stripped or stripped.startswith(">"):
             continue
-        cleaned = re.sub(r"^[-*+]\s+", "", stripped, count=1)
+        cleaned = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", stripped, count=1)
         if not cleaned or cleaned.lower() in ("none", "n/a", "nil"):
             continue
         for part in re.split(r"[,;]+", cleaned):
             norm = _normalize_touch_token(part)
             if norm is None:
-                # Wildcard / root scope -> fail closed as unscoped (exclusive lock on repo root)
+                # Wildcard / root scope / unparseable entry -> fail closed as unscoped (exclusive lock on repo root)
                 return set()
             if norm:
                 tokens.add(norm)
@@ -1794,6 +1901,15 @@ def detect_default_branch(repo_root: Path) -> str:
     raise RuntimeError(f"Cannot determine default branch (main/master) for {repo_root}")
 
 
+def fetch_base_ref(repo_root: Path, branch: str) -> str:
+    if run_cmd(git_cmd("remote", "get-url", "origin"), cwd=repo_root, env_role="orchestrator").returncode != 0:
+        return f"refs/heads/{branch}"
+    ref = f"refs/remotes/origin/{branch}"
+    run_cmd(git_cmd("fetch", "origin", f"+refs/heads/{branch}:{ref}"),
+            cwd=repo_root, check=True, env_role="orchestrator")
+    return ref
+
+
 def parse_github_owner_repo_url(url: str) -> str | None:
     """Parse GitHub owner/repo across HTTPS, SSH, ssh://git@ssh.github.com:443/..., and trailing .git/ variants."""
     u = (url or "").strip().rstrip("/")
@@ -1858,12 +1974,39 @@ def get_remote_branch_sha(repo_root: Path, branch: str, *, ignore_shutdown: bool
     return line[0].split()[0] if line else ""
 
 
+def check_remote_base(repo_root: Path, branch: str, expected_sha: str, phase: str) -> None:
+    current_sha = get_remote_branch_sha(repo_root, branch)
+    if not current_sha:
+        raise RuntimeError(f"Remote base origin/{branch} was deleted during {phase}.")
+    if current_sha == expected_sha:
+        return
+    run_cmd(git_cmd("fetch", "origin", f"refs/heads/{branch}"), cwd=repo_root, check=True, env_role="orchestrator")
+    ancestry = run_cmd(git_cmd("merge-base", "--is-ancestor", expected_sha, current_sha),
+                       cwd=repo_root, env_role="orchestrator")
+    if ancestry.returncode != 0:
+        raise RuntimeError(f"Remote base origin/{branch} was rewritten during {phase} "
+                           f"({expected_sha[:8]} is no longer an ancestor of {current_sha[:8]}).")
+
+
+def _snapshot_shared_git_config(worktree: Path) -> str:
+    """Hash effective local git config and raw shared <git-common-dir>/config bytes."""
+    cfg_res = run_cmd(git_cmd("config", "--local", "--list"), cwd=worktree, env_role="orchestrator", cap_output=False)
+    cfg_list = cfg_res.stdout if cfg_res.returncode == 0 else ""
+    raw_cfg_sha = ""
+    try:
+        cfg_file = get_git_common_dir(worktree) / "config"
+        if cfg_file.is_file():
+            raw_cfg_sha = sha256_file(cfg_file)
+    except Exception:
+        pass
+    return sha256_text(f"{cfg_list}\x00{raw_cfg_sha}")
+
+
 def snapshot_local_git_config(worktree: Path) -> dict[str, str]:
     """Snapshot local git config and .gitattributes hash to detect worker tampering (filter.clean, pushurl, sshCommand)."""
-    cfg_res = run_cmd(git_cmd("config", "--local", "--list"), cwd=worktree, env_role="orchestrator", cap_output=False)
     attr_path = worktree / ".gitattributes"
     return {
-        "local_config_sha": sha256_text(cfg_res.stdout if cfg_res.returncode == 0 else ""),
+        "local_config_sha": _snapshot_shared_git_config(worktree),
         "gitattributes_sha": sha256_file(attr_path) if attr_path.is_file() else "",
     }
 
@@ -1941,13 +2084,7 @@ def prepare_worktree(
     with file_lock(_cache_root() / "locks" / f"repo-{rkey}.lock", blocking=True):
         run_cmd(git_cmd("worktree", "prune"), cwd=repo_root, env_role="orchestrator")
 
-        has_origin = run_cmd(git_cmd("remote", "get-url", "origin"), cwd=repo_root, env_role="orchestrator").returncode == 0
-        if has_origin:
-            run_cmd(git_cmd("fetch", "origin", base_branch), cwd=repo_root, check=True, env_role="orchestrator")
-            base_ref = f"origin/{base_branch}"
-        else:
-            base_ref = base_branch
-
+        base_ref = fetch_base_ref(repo_root, base_branch)
         base_sha = run_cmd(git_cmd("rev-parse", base_ref), cwd=repo_root, check=True, env_role="orchestrator").stdout.strip()
 
         wt_dir = _worktree_cache_path(rkey, identifier.upper())
@@ -1998,11 +2135,11 @@ def prepare_worktree(
         return wt_dir, branch, base_sha
 
 
-def check_remote_fast_forward_ready(repo_root: Path, worktree: Path, branch: str) -> None:
+def check_remote_fast_forward_ready(repo_root: Path, worktree: Path, branch: str) -> str:
     """Fail fast BEFORE starting a long worker if origin/<branch> already diverged from local HEAD."""
     remote_sha = get_remote_branch_sha(repo_root, branch)
     if not remote_sha:
-        return
+        return ""
     run_cmd(git_cmd("fetch", "origin", f"refs/heads/{branch}"), cwd=repo_root, check=True, env_role="orchestrator")
     local_head = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
     anc = run_cmd(git_cmd("merge-base", "--is-ancestor", remote_sha, local_head), cwd=worktree, env_role="orchestrator")
@@ -2011,6 +2148,15 @@ def check_remote_fast_forward_ready(repo_root: Path, worktree: Path, branch: str
             f"Remote branch origin/{branch} ({remote_sha[:8]}) has diverged from local HEAD ({local_head[:8]}). "
             f"Rebase/reconcile manually before dispatching to avoid post-run push rejection."
         )
+    return remote_sha
+
+
+def tracked_status(worktree: Path) -> tuple[list[str], list[str]]:
+    status = run_cmd(git_cmd("status", "--porcelain=v2", "--branch", "--untracked-files=no",
+                             "--no-renames", "-z"),
+                     cwd=worktree, check=True, env_role="orchestrator", cap_output=False)
+    records = list(filter(None, status.stdout.split("\0")))
+    return [r for r in records if r.startswith("# branch.")], [r for r in records if not r.startswith("# ")]
 
 
 def bootstrap_worktree(worktree: Path, setup_cmd_override: str | None, *, timeout: int = 600) -> dict[str, Any]:
@@ -2033,9 +2179,26 @@ def bootstrap_worktree(worktree: Path, setup_cmd_override: str | None, *, timeou
 
     if not cmds:
         return {"ran": False, "commands": []}
+    branch, dirty = tracked_status(worktree)
+    if dirty:
+        raise RuntimeError("Bootstrap requires a clean index and tracked files.")
+    before_git_cfg = _snapshot_shared_git_config(worktree)
     for c in cmds:
         log(f"Bootstrapping worktree dependencies: {c}")
-        run_cmd(c, cwd=worktree, shell=True, check=True, timeout=timeout, env_role="child")
+        run_cmd(
+            c,
+            cwd=worktree,
+            shell=True,
+            check=True,
+            timeout=timeout,
+            env_role="child",
+            extra_env={"HUSKY": "0", "HUSKY_SKIP_INSTALL": "1"},
+        )
+        if _snapshot_shared_git_config(worktree) != before_git_cfg:
+            raise RuntimeError(f"Bootstrap modified shared git config (.git/config) in {worktree}; refusing to proceed.")
+    after, dirty = tracked_status(worktree)
+    if after != branch or dirty:
+        raise RuntimeError(f"Bootstrap changed the branch, HEAD or tracked files in {worktree}.")
     return {"ran": True, "commands": cmds}
 
 
@@ -2308,15 +2471,8 @@ def run_verify_gate(
             "output": "No verification command detected. Pass --verify-cmd or configure a repo check script (or --allow-no-verify).",
         }
     log(f"Running verification gate: {verify_cmd}")
-    def tracked_status() -> tuple[list[str], list[str]]:
-        status = run_cmd(git_cmd("status", "--porcelain=v2", "--branch", "--untracked-files=no",
-                                 "--no-renames", "-z"),
-                         cwd=worktree, check=True, env_role="orchestrator", cap_output=False)
-        records = list(filter(None, status.stdout.split("\0")))
-        return [r for r in records if r.startswith("# branch.")], [r for r in records if not r.startswith("# ")]
-
     with file_lock(_cache_root() / "locks" / f"verify-{repo_key}.lock", blocking=True):
-        original, dirty_before = tracked_status()
+        original, dirty_before = tracked_status(worktree)
         if dirty_before:
             raise RuntimeError("Verification requires tracked files to match the candidate commit. Existing edits were preserved.")
         prior_files = _untracked_files(worktree)
@@ -2331,7 +2487,7 @@ def run_verify_gate(
             rc = 124
             output = f"Verification timed out after {timeout}s (see {log_file})."
 
-        branch, dirty_after = tracked_status()
+        branch, dirty_after = tracked_status(worktree)
         if branch != original:
             raise RuntimeError("Verification changed the worktree branch or HEAD. Inspect the worktree before rerunning.")
         passed = rc == 0
@@ -2447,7 +2603,10 @@ def check_protected_paths(
         return []
     pats = allowed_patterns or []
     raw = run_cmd(
-        git_cmd("diff", "--no-renames", "--no-ext-diff", "--no-textconv", "-z", "--name-only", f"{base_sha}..{candidate_sha}"),
+        git_cmd(
+            "diff", "--no-renames", "--no-ext-diff", "--no-textconv", "-z", "--name-only", f"{base_sha}..{candidate_sha}",
+            attr_source=base_sha,
+        ),
         cwd=worktree,
         check=True,
         env_role="orchestrator",
@@ -2521,7 +2680,10 @@ def check_test_integrity_diff(
     pats = allowed_patterns or []
     findings: list[str] = []
     raw_status = run_cmd(
-        git_cmd("diff", "--no-renames", "--no-ext-diff", "--no-textconv", "-z", "--name-status", f"{base_sha}..{candidate_sha}"),
+        git_cmd(
+            "diff", "--no-renames", "--no-ext-diff", "--no-textconv", "-z", "--name-status", f"{base_sha}..{candidate_sha}",
+            attr_source=base_sha,
+        ),
         cwd=worktree,
         check=True,
         env_role="orchestrator",
@@ -2539,7 +2701,11 @@ def check_test_integrity_diff(
     if test_files:
         for tf in test_files:
             diff_txt = run_cmd(
-                git_cmd("--literal-pathspecs", "diff", "--text", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color", "-U0", f"{base_sha}..{candidate_sha}", "--", tf),
+                git_cmd(
+                    "--literal-pathspecs", "diff", "--text", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color",
+                    "-U0", f"{base_sha}..{candidate_sha}", "--", tf,
+                    attr_source=base_sha,
+                ),
                 cwd=worktree,
                 check=True,
                 env_role="orchestrator",
@@ -2692,11 +2858,30 @@ def _scan_contextual_additions(hunk: str) -> list[str]:
     return []
 
 
-def _scan_git_changes_for_secrets(worktree: Path, command: list[str], *, ignore_shutdown: bool = False) -> list[str]:
+def _resolve_attr_source(worktree: Path, attr_source: str | None, *, ignore_shutdown: bool = False) -> str | None:
+    if attr_source:
+        return attr_source
+    res = run_cmd(
+        git_cmd("rev-parse", "--verify", "-q", "HEAD"),
+        cwd=worktree,
+        env_role="orchestrator",
+        ignore_shutdown=ignore_shutdown,
+    )
+    return "HEAD" if res.returncode == 0 else None
+
+
+def _scan_git_changes_for_secrets(
+    worktree: Path,
+    command: list[str],
+    *,
+    ignore_shutdown: bool = False,
+    attr_source: str | None = None,
+) -> list[str]:
     flags = ["--no-renames", "--no-ext-diff", "--no-textconv", "--no-color"]
+    effective_attr = _resolve_attr_source(worktree, attr_source, ignore_shutdown=ignore_shutdown)
 
     paths = run_cmd(
-        git_cmd(*command, *flags, "-z", "--diff-filter=AMT", "--name-only"),
+        git_cmd(*command, *flags, "-z", "--diff-filter=AMT", "--name-only", attr_source=effective_attr),
         cwd=worktree, check=True, env_role="orchestrator", cap_output=False, ignore_shutdown=ignore_shutdown,
     ).stdout
     findings: set[str] = set()
@@ -2708,7 +2893,7 @@ def _scan_git_changes_for_secrets(worktree: Path, command: list[str], *, ignore_
     # --text scans content even when Git would hide the patch because of NUL or attributes.
     def read_patch(*options: str) -> str:
         return run_cmd(
-            git_cmd(*command, *flags, "--full-index", "-p", "--text", *options),
+            git_cmd(*command, *flags, "--full-index", "-p", "--text", *options, attr_source=effective_attr),
             cwd=worktree, check=True, env_role="orchestrator", cap_output=False,
             stdout_encoding="latin-1", ignore_shutdown=ignore_shutdown,
         ).stdout
@@ -2747,12 +2932,12 @@ def scan_range_for_secrets(worktree: Path, base_sha: str, candidate_sha: str) ->
         check=True, env_role="orchestrator", cap_output=False,
     ).stdout
     return scan_text_for_secrets(messages, "commit message") + _scan_git_changes_for_secrets(
-        worktree, ["log", "-m", "--format=", revision_range]
+        worktree, ["log", "-m", "--format=", revision_range], attr_source=base_sha
     )
 
 
-def scan_staged_for_secrets(worktree: Path) -> list[str]:
-    return _scan_git_changes_for_secrets(worktree, ["diff", "--cached"])
+def scan_staged_for_secrets(worktree: Path, *, attr_source: str | None = None) -> list[str]:
+    return _scan_git_changes_for_secrets(worktree, ["diff", "--cached"], attr_source=attr_source)
 
 
 def _scan_before_git_write(
@@ -2760,11 +2945,12 @@ def _scan_before_git_write(
     *,
     for_stash: bool = False,
     exclude_paths: set[str] | frozenset[str] = frozenset(),
+    attr_source: str | None = None,
 ) -> list[str]:
     # stash -u records three trees: index, tracked working copy, and untracked files.
-    findings = _scan_git_changes_for_secrets(worktree, ["diff", "HEAD"], ignore_shutdown=for_stash)
+    findings = _scan_git_changes_for_secrets(worktree, ["diff", "HEAD"], ignore_shutdown=for_stash, attr_source=attr_source)
     if for_stash:
-        findings.extend(_scan_git_changes_for_secrets(worktree, ["diff", "--cached"], ignore_shutdown=True))
+        findings.extend(_scan_git_changes_for_secrets(worktree, ["diff", "--cached"], ignore_shutdown=True, attr_source=attr_source))
     untracked = run_cmd(
         git_cmd("ls-files", "--others", "--exclude-standard", "-z"),
         cwd=worktree, check=True, env_role="orchestrator", cap_output=False, ignore_shutdown=for_stash,
@@ -2812,7 +2998,15 @@ def verify_worktree_branch_integrity(worktree: Path, expected_common_dir: Path, 
         raise RuntimeError(f"Worker rewrote git history so base_sha {base_sha[:8]} is no longer an ancestor of HEAD.")
 
 
-def orchestrator_commit(worktree: Path, identifier: str, title: str, attempt: int, *, setup_paths: tuple[str, ...] = ()) -> tuple[str, list[str]]:
+def orchestrator_commit(
+    worktree: Path,
+    identifier: str,
+    title: str,
+    attempt: int,
+    *,
+    setup_paths: tuple[str, ...] = (),
+    attr_source: str | None = None,
+) -> tuple[str, list[str]]:
     """Stage & commit changes safely (hooks/fsmonitor disabled; scans commit msg + staged diff). Returns (head_sha, violations)."""
     ensure_dispatch_excluded(worktree)
     commit_msg = f"{identifier}: {title} (attempt {attempt})"
@@ -2822,7 +3016,7 @@ def orchestrator_commit(worktree: Path, identifier: str, title: str, attempt: in
         return head, msg_secret_hits
     status = run_cmd(git_cmd("status", "--porcelain"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
     if status:
-        secret_hits = _scan_before_git_write(worktree, exclude_paths=frozenset(setup_paths))
+        secret_hits = _scan_before_git_write(worktree, exclude_paths=frozenset(setup_paths), attr_source=attr_source)
         if secret_hits:
             head = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
             return head, secret_hits
@@ -2838,7 +3032,7 @@ def orchestrator_commit(worktree: Path, identifier: str, title: str, attempt: in
         run_cmd(git_cmd("reset", "-q", "--", ".dispatch"), cwd=worktree, env_role="orchestrator")
         staged = run_cmd(git_cmd("diff", "--cached", "-z", "--name-only"), cwd=worktree, check=True, env_role="orchestrator").stdout
         if staged.strip("\x00"):
-            secret_hits = scan_staged_for_secrets(worktree)
+            secret_hits = scan_staged_for_secrets(worktree, attr_source=attr_source)
             if secret_hits:
                 run_cmd(git_cmd("reset", "-q"), cwd=worktree, env_role="orchestrator")
                 head = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
@@ -3119,11 +3313,12 @@ def invoke_harness(
     }
 
     try:
+        executable = find_harness_binary(spec.harness) or spec.harness
         if spec.harness == "codex":
             sandbox = "read-only" if read_only else "danger-full-access"
             wt_escaped = str(worktree).replace('"', '\\"')
             cmd = [
-                "codex",
+                executable,
                 "exec",
                 "-C",
                 str(worktree),
@@ -3172,13 +3367,12 @@ def invoke_harness(
             return validated
 
         if spec.harness == "agy":
-            agy_bin = shutil.which("agy") or "/root/.local/bin/agy"
             short_prompt = (
                 f"Read and execute all instructions in {prompt_file} (read-only reference). "
                 f"Do NOT modify {prompt_file}. Return ONLY valid JSON matching the required schema."
             )
             cmd = [
-                agy_bin,
+                executable,
                 "--model",
                 spec.model,
                 "--add-dir",
@@ -3254,7 +3448,7 @@ def invoke_harness(
                 f"End your final message with ONLY a valid JSON object matching:\n{json.dumps(schema)}"
             )
             cmd = [
-                "opencode",
+                executable,
                 "run",
                 "-m",
                 spec.model,
@@ -3302,14 +3496,13 @@ def invoke_harness(
             return validated
 
         if spec.harness == "pi":
-            pi_bin = shutil.which("pi") or "/root/.local/bin/pi"
             pi_session_dir.mkdir(parents=True, exist_ok=True)
             short_prompt = (
                 f"Read and execute all instructions in {prompt_file}. "
                 f"End your final message with ONLY a valid JSON object matching:\n{json.dumps(schema)}"
             )
             cmd = [
-                pi_bin,
+                executable,
                 "-p",
                 "--offline",
                 "--mode",
@@ -3441,7 +3634,10 @@ def run_two_axis_review(
     # Pre-generate immutable diff.patch; block added secrets (for standalone `review`) and redact deleted secret lines before any LLM sees them!
     diff_patch_path = run_dir / f"diff-r{round_num}.patch"
     diff_output = run_cmd(
-        git_cmd("diff", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color", f"{base_sha}..{candidate_sha}"),
+        git_cmd(
+            "diff", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color", f"{base_sha}..{candidate_sha}",
+            attr_source=base_sha,
+        ),
         cwd=worktree,
         check=True,
         env_role="orchestrator",
@@ -3482,7 +3678,10 @@ def run_two_axis_review(
         git_cmd("log", f"{base_sha}..{candidate_sha}", "--oneline"), cwd=worktree, check=True, env_role="orchestrator"
     ).stdout.strip()
     diff_stat = run_cmd(
-        git_cmd("diff", "--no-ext-diff", "--no-textconv", "--no-color", "--stat", f"{base_sha}..{candidate_sha}"),
+        git_cmd(
+            "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--stat", f"{base_sha}..{candidate_sha}",
+            attr_source=base_sha,
+        ),
         cwd=worktree,
         check=True,
         env_role="orchestrator",
@@ -3907,6 +4106,11 @@ def reconcile_publish(
 
     remote_sha = get_remote_branch_sha(repo_root, branch)
     already_pushed = cur_stage in ("pushed", "pr_ready", "linear_state_synced") or state.get("pushed")
+    # Older checkpoints recorded only the merge base used for review.
+    expected_base = state.get("target_sha") or state.get("base_sha")
+    if not expected_base:
+        raise RuntimeError("Publish checkpoint is missing the reviewed base commit.")
+    check_remote_base(repo_root, base_branch, expected_base, "publication")
     if remote_sha != candidate_sha and already_pushed:
         raise RuntimeError(f"Remote origin/{branch} moved or was deleted after push; human action preserved.")
     if remote_sha != candidate_sha:
@@ -4055,7 +4259,7 @@ def verify_completed_publish_readonly(
         )
     return {
         "issue": live_issue["identifier"],
-        "status": "passed",
+        "status": "passed_branch_only" if state["stage"] == "completed_branch_only" else "passed",
         "reconciled": False,
         "verified_readonly": True,
         "commit": candidate_sha,
@@ -4082,19 +4286,21 @@ def _assert_no_external_tampering(
     expected_git_cfg: dict[str, str],
     expected_ownership: dict[str, str],
     phase: str,
+    *,
+    allow_gitattributes_edit: bool = False,
 ) -> None:
     """
     Parallel-safe external tampering check:
       - Checks ONLY this ticket's remote branch SHA (never fails when a parallel brother ticket pushes feat/<other>!)
       - Checks monotonic ancestry of origin/<base_branch> (normal merges/pushes to main are allowed; force-push/deletion fails!)
-      - Checks local git config and .gitattributes SHA-256 unchanged
+      - Checks local git config SHA-256 unchanged (always) and root .gitattributes unchanged (unless explicitly authorized)
       - Checks Linear ownership fields (state, assignee, description hash)
     """
     if expected_git_cfg:
         cur_cfg = snapshot_local_git_config(worktree)
         if cur_cfg["local_config_sha"] != expected_git_cfg.get("local_config_sha"):
             raise RuntimeError(f"Unauthorized git config tampering detected during {phase} (.git/config modified).")
-        if cur_cfg["gitattributes_sha"] != expected_git_cfg.get("gitattributes_sha"):
+        if not allow_gitattributes_edit and cur_cfg["gitattributes_sha"] != expected_git_cfg.get("gitattributes_sha"):
             raise RuntimeError(f"Unauthorized .gitattributes tampering detected during {phase}.")
     cur_branch_sha = get_remote_branch_sha(repo_root, branch)
     if cur_branch_sha != expected_branch_sha:
@@ -4102,18 +4308,7 @@ def _assert_no_external_tampering(
             f"Unauthorized external mutation during {phase}: origin/{branch} changed "
             f"from {expected_branch_sha[:8] or 'none'} to {cur_branch_sha[:8] or 'none'}."
         )
-    if expected_base_sha:
-        cur_base_sha = get_remote_branch_sha(repo_root, base_branch)
-        if not cur_base_sha:
-            raise RuntimeError(f"Unauthorized external mutation during {phase}: origin/{base_branch} was deleted.")
-        if cur_base_sha != expected_base_sha:
-            run_cmd(git_cmd("fetch", "origin", base_branch), cwd=repo_root, env_role="orchestrator")
-            anc = run_cmd(git_cmd("merge-base", "--is-ancestor", expected_base_sha, cur_base_sha), cwd=worktree, env_role="orchestrator")
-            if anc.returncode != 0:
-                raise RuntimeError(
-                    f"Unauthorized external mutation during {phase}: origin/{base_branch} was force-pushed/rewritten "
-                    f"({expected_base_sha[:8]} is no longer an ancestor of {cur_base_sha[:8]})."
-                )
+    check_remote_base(repo_root, base_branch, expected_base_sha, phase)
     if expected_ownership:
         cur = client.get_issue_ownership_snapshot(issue_uuid)
         if cur.get("state_type") in ("completed", "canceled"):
@@ -4133,13 +4328,13 @@ def _assert_no_external_tampering(
             log(f"Note: benign Linear metadata update detected during {phase} (state/assignee/description unchanged).")
 
 
-def _stash_dirty_worktree_for_safe_rerun(worktree: Path, label: str) -> None:
+def _stash_dirty_worktree_for_safe_rerun(worktree: Path, label: str, *, attr_source: str | None = None) -> None:
     """Stash safe edits, leaving potentially sensitive working files and index entries untouched."""
     try:
         ensure_dispatch_excluded(worktree, ignore_shutdown=True)
         dirty = run_cmd(git_cmd("status", "--porcelain"), cwd=worktree, check=True, env_role="orchestrator", ignore_shutdown=True).stdout.strip()
         if dirty:
-            if _scan_before_git_write(worktree, for_stash=True):
+            if _scan_before_git_write(worktree, for_stash=True, attr_source=attr_source):
                 log("Secret scan blocked automatic stash. Working files and index were preserved for manual inspection.")
                 return
             run_cmd(
@@ -4270,7 +4465,7 @@ def execute_ticket(
                 raise RuntimeError(
                     f"Corrupt checkpoint at {latest_file} ({exc}); inspect manually or pass --force-rerun."
                 ) from exc
-            if previous.get("stage") in ("claim_pending", *PUBLISH_STAGES):
+            if previous.get("stage") in ("claim_pending", "rollback_pending", *PUBLISH_STAGES):
                 raise RuntimeError(f"Checkpoint at {previous['stage']}; run agent-dispatch resume {issue['identifier']} first.")
         # 1. Initial eligibility check inside lock
         issue = client.get_issue(issue["id"])
@@ -4299,9 +4494,10 @@ def execute_ticket(
         base_sha = run_cmd(git_cmd("merge-base", target_sha, "HEAD"), cwd=worktree,
                            check=True, env_role="orchestrator").stdout.strip()
         preflight_pr = None
+        pre_branch_sha = ""
         gh_repo = parse_github_owner_repo(repo_root)
         if not no_push:
-            check_remote_fast_forward_ready(repo_root, worktree, branch)
+            pre_branch_sha = check_remote_fast_forward_ready(repo_root, worktree, branch)
             if gh_repo or os.environ.get("AGENT_DISPATCH_FORCE_GH") == "1":
                 preflight_pr = fetch_open_pr_for_branch(repo_root, gh_repo, branch)
                 if preflight_pr:
@@ -4381,6 +4577,7 @@ def execute_ticket(
         worker_artifacts[auth_brief_path] = auth_brief_sha256
 
         brief_gate_pats, brief_test_pats = parse_authorized_changes(issue.get("description") or "")
+        allow_root_gitattributes = allow_gate_edits or path_matches_any_pattern(".gitattributes", brief_gate_pats)
         gate_authorizations = {
             "cli_allow_gate_edits": allow_gate_edits,
             "cli_allow_test_edits": allow_test_edits,
@@ -4400,6 +4597,7 @@ def execute_ticket(
             "branch": branch,
             "base_branch": base_branch,
             "base_sha": base_sha,
+            "target_sha": target_sha,
             "worker": worker.label,
             "reviewer": reviewer.label,
             "no_push": no_push,
@@ -4426,6 +4624,9 @@ def execute_ticket(
         failure_reason = ""
         try:
             if not no_push:
+                check_remote_base(repo_root, base_branch, target_sha, "preflight")
+                if get_remote_branch_sha(repo_root, branch) != pre_branch_sha:
+                    raise RuntimeError(f"Remote origin/{branch} changed during preflight.")
                 # Persist claim_pending BEFORE sending mutation so lost ACK never strands an untracked In Progress ticket!
                 state["stage"] = "claim_pending"
                 save_checkpoint(run_dir, latest_file, state)
@@ -4449,9 +4650,6 @@ def execute_ticket(
                 raise RuntimeError("Linear ownership changed while claiming the reviewed brief.")
             save_checkpoint(run_dir, latest_file, state)
 
-            # Capture ticket-scoped remote baselines & local git config ONCE before attempts (NOT reset across retries/timeouts!)
-            pre_branch_sha = get_remote_branch_sha(repo_root, branch) if not no_push else ""
-            pre_base_sha = get_remote_branch_sha(repo_root, base_branch) if not no_push else ""
             pre_git_cfg = snapshot_local_git_config(worktree)
 
             pr_feedback = None
@@ -4509,7 +4707,8 @@ def execute_ticket(
                     if not no_push:
                         _assert_no_external_tampering(
                             client, repo_root, worktree, branch, base_branch, issue["id"],
-                            pre_branch_sha, pre_base_sha, pre_git_cfg, expected_ownership, f"worker timeout attempt {attempt}",
+                            pre_branch_sha, target_sha, pre_git_cfg, expected_ownership, f"worker timeout attempt {attempt}",
+                            allow_gitattributes_edit=allow_root_gitattributes,
                         )
                     feedback = (
                         f"Previous worker attempt timed out after {worker_timeout}s. "
@@ -4521,13 +4720,16 @@ def execute_ticket(
                 if not no_push:
                     _assert_no_external_tampering(
                         client, repo_root, worktree, branch, base_branch, issue["id"],
-                        pre_branch_sha, pre_base_sha, pre_git_cfg, expected_ownership, f"worker attempt {attempt}",
+                        pre_branch_sha, target_sha, pre_git_cfg, expected_ownership, f"worker attempt {attempt}",
+                        allow_gitattributes_edit=allow_root_gitattributes,
                     )
                 else:
                     # Even in --no-push mode, verify local git config / .gitattributes were not tampered with!
                     cur_cfg = snapshot_local_git_config(worktree)
-                    if cur_cfg != pre_git_cfg:
-                        raise RuntimeError(f"Unauthorized git config or .gitattributes tampering during worker attempt {attempt}.")
+                    if cur_cfg["local_config_sha"] != pre_git_cfg.get("local_config_sha"):
+                        raise RuntimeError(f"Unauthorized git config tampering during worker attempt {attempt} (.git/config modified).")
+                    if not allow_root_gitattributes and cur_cfg["gitattributes_sha"] != pre_git_cfg.get("gitattributes_sha"):
+                        raise RuntimeError(f"Unauthorized .gitattributes tampering during worker attempt {attempt}.")
 
                 for raw_item in w_res.get("discovered_issues") or []:
                     norm = raw_item.strip().lower()
@@ -4537,7 +4739,7 @@ def execute_ticket(
 
                 if w_res["status"] == "blocked":
                     _release_setup_files(worktree, setup_files)
-                    _stash_dirty_worktree_for_safe_rerun(worktree, f"{run_id}-blocked")
+                    _stash_dirty_worktree_for_safe_rerun(worktree, f"{run_id}-blocked", attr_source=base_sha)
                     failure_reason = f"Worker reported blocked: {redact_secrets(w_res['blockers'])}"
                     state["stage"] = "worker_blocked"
                     state["sessions"] = sessions
@@ -4559,11 +4761,12 @@ def execute_ticket(
                 # The setup paths stay excluded across rework, even if verification writes to them.
                 candidate_sha, staged_secret_hits = orchestrator_commit(
                     worktree, issue["identifier"], issue["title"], attempt, setup_paths=tuple(setup_files),
+                    attr_source=base_sha,
                 )
                 if staged_secret_hits:
                     if any("ticket title" in h for h in staged_secret_hits):
                         _release_setup_files(worktree, setup_files)
-                        _stash_dirty_worktree_for_safe_rerun(worktree, f"{run_id}-title-secret")
+                        _stash_dirty_worktree_for_safe_rerun(worktree, f"{run_id}-title-secret", attr_source=base_sha)
                         failure_reason = "Secret detected in ticket title / commit message:\n" + "\n".join(f"- {s}" for s in staged_secret_hits)
                         state["stage"] = "secret_in_metadata"
                         state["sessions"] = sessions
@@ -4584,7 +4787,7 @@ def execute_ticket(
                     continue
 
                 diff_nonempty = run_cmd(
-                    git_cmd("diff", "-z", "--name-only", f"{base_sha}..{candidate_sha}"),
+                    git_cmd("diff", "-z", "--name-only", f"{base_sha}..{candidate_sha}", attr_source=base_sha),
                     cwd=worktree,
                     check=True,
                     env_role="orchestrator",
@@ -4664,7 +4867,8 @@ def execute_ticket(
                 if not no_push:
                     _assert_no_external_tampering(
                         client, repo_root, worktree, branch, base_branch, issue["id"],
-                        pre_branch_sha, pre_base_sha, pre_git_cfg, expected_ownership, f"verify attempt {attempt}",
+                        pre_branch_sha, target_sha, pre_git_cfg, expected_ownership, f"verify attempt {attempt}",
+                        allow_gitattributes_edit=allow_root_gitattributes,
                     )
 
                 # Cross-vendor read-only two-axis review
@@ -4688,7 +4892,8 @@ def execute_ticket(
                 if not no_push:
                     _assert_no_external_tampering(
                         client, repo_root, worktree, branch, base_branch, issue["id"],
-                        pre_branch_sha, pre_base_sha, pre_git_cfg, expected_ownership, f"review attempt {attempt}",
+                        pre_branch_sha, target_sha, pre_git_cfg, expected_ownership, f"review attempt {attempt}",
+                        allow_gitattributes_edit=allow_root_gitattributes,
                     )
 
                 if last_review_res["passed"]:
@@ -4753,6 +4958,15 @@ def execute_ticket(
                     try:
                         reconcile_publish(client, issue, repo_root, run_dir, latest_file, state, allow_branch_only=allow_branch_only)
                     except Exception as pub_exc:
+                        if not state.get("pushed") and state.get("push_attempted"):
+                            try:
+                                if get_remote_branch_sha(repo_root, branch, ignore_shutdown=True) == state.get("candidate_sha"):
+                                    state["pushed"] = True
+                                    if state.get("stage") in ("verified_and_reviewed", "pushing"):
+                                        state["stage"] = "pushed"
+                                    save_checkpoint(run_dir, latest_file, state)
+                            except BaseException:
+                                pass
                         failure_reason = (
                             f"Publish interrupted at stage '{state['stage']}' (fix & run `agent-dispatch resume {issue['identifier']}`): {pub_exc}"
                         )
@@ -4811,7 +5025,7 @@ def execute_ticket(
                 log(f"{issue['identifier']} review FAILED on attempt {attempt}.")
 
             _release_setup_files(worktree, setup_files)
-            _stash_dirty_worktree_for_safe_rerun(worktree, f"{run_id}-max-rework")
+            _stash_dirty_worktree_for_safe_rerun(worktree, f"{run_id}-max-rework", attr_source=base_sha)
             failure_reason = f"Exhausted {max_attempts} attempts ({max_rework} rework rounds). Last feedback:\n{feedback or 'unknown'}"
             state["stage"] = "failed_max_rework"
             state["sessions"] = sessions
@@ -4835,10 +5049,14 @@ def execute_ticket(
             if not publish_started and (state["stage"] != "claim_pending" or not claim_attempted):
                 state["stage"] = "error"
                 if (worktree / ".git").exists() and pre_git_cfg and not _is_shutdown_requested():
-                    if (snapshot_local_git_config(worktree) == pre_git_cfg and
+                    cur_cfg = snapshot_local_git_config(worktree)
+                    cfg_ok = cur_cfg["local_config_sha"] == pre_git_cfg.get("local_config_sha") and (
+                        allow_root_gitattributes or cur_cfg["gitattributes_sha"] == pre_git_cfg.get("gitattributes_sha")
+                    )
+                    if (cfg_ok and
                             run_cmd(git_cmd("branch", "--show-current"), cwd=worktree, env_role="orchestrator").stdout.strip() == branch):
                         _release_setup_files(worktree, setup_files)
-                        _stash_dirty_worktree_for_safe_rerun(worktree, f"{run_id}-error")
+                        _stash_dirty_worktree_for_safe_rerun(worktree, f"{run_id}-error", attr_source=base_sha)
             state["error"] = redact_secrets(str(exc))
             state["sessions"] = sessions
             try:
@@ -4848,6 +5066,20 @@ def execute_ticket(
             raise
         finally:
             if (moved_in_progress or claim_attempted) and not terminal_ok and not no_push:
+                # Signal-safe remote push fact check BEFORE any Linear I/O: persist `pushed: True` immediately once confirmed!
+                if not state.get("pushed") and (publish_started or state.get("push_attempted")):
+                    try:
+                        if get_remote_branch_sha(repo_root, branch, ignore_shutdown=True) == state.get("candidate_sha"):
+                            state["pushed"] = True
+                            state["push_attempted"] = True
+                            if state.get("stage") in ("verified_and_reviewed", "pushing"):
+                                state["stage"] = "pushed"
+                            save_checkpoint(run_dir, latest_file, state)
+                    except BaseException as probe_exc:
+                        log(f"Warning: remote push probe failed during cleanup for {issue['identifier']}: {redact_secrets(str(probe_exc))}")
+
+                rollback_reverted = False
+                human_conflict_in_rollback = False
                 try:
                     live_iss = client.get_issue(issue["id"])
                     live_st = live_iss.get("state") or {}
@@ -4860,16 +5092,6 @@ def execute_ticket(
                         human_took_over = not _claim_metadata_matches(live_iss, state) or (live_st_type in ("completed", "canceled")) or (
                             bool(claimed_state_id) and live_st_id != claimed_state_id
                         )
-
-                        # Signal-safe remote fact check (ignore_shutdown=True + BaseException catch!)
-                        remote_touched = bool(state.get("pushed"))
-                        if not remote_touched and (publish_started or state.get("push_attempted")):
-                            try:
-                                if get_remote_branch_sha(repo_root, branch, ignore_shutdown=True) == state.get("candidate_sha"):
-                                    remote_touched = True
-                                    state["pushed"] = True
-                            except BaseException:
-                                remote_touched = True
 
                         if publish_started:
                             if live_st_type not in ("completed", "canceled") and _claim_metadata_matches(live_iss, state):
@@ -4889,6 +5111,7 @@ def execute_ticket(
                                 ),
                             )
                         elif human_took_over:
+                            human_conflict_in_rollback = True
                             client.add_comment(
                                 live_iss["id"],
                                 "\n".join(
@@ -4906,16 +5129,20 @@ def execute_ticket(
                             client.ensure_label_and_add(live_iss, "dispatch:failed")
                             live_iss = client.get_issue(issue["id"])
                             if live_iss["state"]["id"] != claimed_state_id or not _claim_metadata_matches(live_iss, state):
+                                human_conflict_in_rollback = True
                                 raise RuntimeError("Human Linear ownership changed during rollback.")
                             if pre_claim_state_id:
                                 client.update_issue_state_by_id(live_iss, pre_claim_state_id, label_hint=pre_claim_state_name)
                             else:
                                 client.update_issue_state(live_iss, "Todo")
+                            rollback_reverted = True
+                            rollback_marker = f"<!-- agent-dispatch-rollback:{run_id} -->"
                             sess_lines = [
                                 f"- `{s.get('role')}` ({s.get('harness')}): `{s.get('resume_cmd') or s.get('conversation_link') or s.get('stdout_log')}`"
                                 for s in sessions
                             ]
                             comment_parts = [
+                                rollback_marker,
                                 f"### [agent-dispatch] Halted -> Reverted to `{pre_claim_state_name}` (`dispatch:failed`)",
                                 f"- **Worktree (local, NOT pushed by this run)**: `{worktree}` (`{branch}`)",
                                 f"- **Run Logs**: `{run_dir}`",
@@ -4925,7 +5152,18 @@ def execute_ticket(
                                 comment_parts += ["", "**Sessions:**", *sess_lines]
                             client.add_comment(live_iss["id"], "\n".join(comment_parts))
                 except BaseException as cleanup_exc:
-                    log(f"Warning: failed Linear cleanup for {issue['identifier']}: {cleanup_exc}")
+                    log(f"Warning: failed Linear cleanup for {issue['identifier']}: {redact_secrets(str(cleanup_exc))}")
+                    if not publish_started and moved_in_progress and not human_conflict_in_rollback:
+                        state["rollback_from_stage"] = state.get("rollback_from_stage") or state.get("stage")
+                        state["stage"] = "rollback_pending"
+                        state["rollback_state_reverted"] = rollback_reverted
+                        state["failure_reason"] = redact_secrets(failure_reason)[:2500]
+                        state["rollback_error"] = redact_secrets(str(cleanup_exc))[:1000]
+                        state["sessions"] = sessions
+                        try:
+                            save_checkpoint(run_dir, latest_file, state)
+                        except Exception as save_exc:
+                            log(f"Warning: failed persisting rollback_pending checkpoint for {issue['identifier']}: {redact_secrets(str(save_exc))}")
 
 
 # ---------------------------------------------------------------------------
@@ -5026,6 +5264,59 @@ def cmd_resume(args: argparse.Namespace) -> int:
                 state["stage"] = "claim_released"
                 save_checkpoint(run_dir, latest_file, state)
             print(safe_json({"issue": issue["identifier"], "status": "claim_released", "rerun": f"agent-dispatch run {issue['identifier']}"}))
+            return 0
+        if state.get("stage") in ("rollback_pending", "rollback_completed"):
+            pre_state_id = state.get("pre_claim_state_id")
+            pre_state_name = state.get("pre_claim_state_name") or "Todo"
+            if state["stage"] == "rollback_pending":
+                live = client.get_issue(issue["id"])
+                if not state.get("rollback_state_reverted"):
+                    if not state.get("claimed_ownership") or not state.get("claimed_state_id"):
+                        raise RuntimeError("Cannot verify ownership of pending rollback; human state preserved.")
+                    _require_publish_ownership(live, state)
+                    # CRITICAL ORDERING: add `dispatch:failed` label FIRST, THEN revert state!
+                    client.ensure_label_and_add(live, "dispatch:failed")
+                    live = client.get_issue(issue["id"])
+                    _require_publish_ownership(live, state)
+                    if pre_state_id:
+                        client.update_issue_state_by_id(live, pre_state_id, label_hint=pre_state_name)
+                    else:
+                        client.update_issue_state(live, "Todo")
+                    state["rollback_state_reverted"] = True
+                    save_checkpoint(run_dir, latest_file, state)
+                rollback_marker = f"<!-- agent-dispatch-rollback:{state.get('run_id', '')} -->"
+                existing_comments = (live.get("comments") or {}).get("nodes", [])
+                if not any(rollback_marker in (c.get("body") or "") for c in existing_comments):
+                    sess_lines = [
+                        f"- `{s.get('role')}` ({s.get('harness')}): `{s.get('resume_cmd') or s.get('conversation_link') or s.get('stdout_log')}`"
+                        for s in (state.get("sessions") or [])
+                    ]
+                    reason_text = state.get("failure_reason") or state.get("error") or "Pre-publish failure (rollback recovered via resume)."
+                    comment_parts = [
+                        rollback_marker,
+                        f"### [agent-dispatch] Halted -> Reverted to `{pre_state_name}` (`dispatch:failed`, recovered via resume)",
+                        f"- **Worktree (local, NOT pushed by this run)**: `{state.get('worktree', '')}` (`{state.get('branch', '')}`)",
+                        f"- **Run Logs**: `{run_dir}`",
+                        f"- **Reason**:\n{redact_secrets(str(reason_text))[:2500]}",
+                    ]
+                    if sess_lines:
+                        comment_parts += ["", "**Sessions:**", *sess_lines]
+                    client.add_comment(live["id"], "\n".join(comment_parts))
+                state["stage"] = "rollback_completed"
+                state.pop("rollback_error", None)
+                save_checkpoint(run_dir, latest_file, state)
+            print(
+                safe_json(
+                    {
+                        "issue": issue["identifier"],
+                        "status": "rollback_completed",
+                        "linear_state": pre_state_name,
+                        "rerun": f"agent-dispatch run {issue['identifier']}",
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
             return 0
         if (state.get("stage") not in (*PUBLISH_STAGES, *COMPLETED_STAGES)
                 or (state.get("review") or {}).get("passed") is not True
@@ -5384,18 +5675,13 @@ def cmd_spec(args: argparse.Namespace) -> int:
 def cmd_review(args: argparse.Namespace) -> int:
     assert_required_rubrics_loaded()
     repo_root = get_repo_root(args.repo)
-    base_branch = detect_default_branch(repo_root)
-    if not args.base and run_cmd(git_cmd("remote", "get-url", "origin"), cwd=repo_root, env_role="orchestrator").returncode == 0:
-        run_cmd(git_cmd("fetch", "origin", base_branch), cwd=repo_root, check=True, env_role="orchestrator")
-        base_ref = f"origin/{base_branch}"
-    else:
-        base_ref = args.base or base_branch
+    base_ref = args.base or fetch_base_ref(repo_root, detect_default_branch(repo_root))
 
     base_sha = run_cmd(git_cmd("merge-base", base_ref, "HEAD"), cwd=repo_root, check=True, env_role="orchestrator").stdout.strip()
     candidate_sha = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=repo_root, check=True, env_role="orchestrator").stdout.strip()
     if run_cmd(git_cmd("status", "--porcelain"), cwd=repo_root, env_role="orchestrator").stdout.strip():
         raise RuntimeError("Working tree has uncommitted changes; commit or stash before running SHA-locked `review`.")
-    if not run_cmd(git_cmd("diff", "-z", "--name-only", f"{base_sha}..{candidate_sha}"), cwd=repo_root, check=True, env_role="orchestrator").stdout.strip("\x00"):
+    if not run_cmd(git_cmd("diff", "-z", "--name-only", f"{base_sha}..{candidate_sha}", attr_source=base_sha), cwd=repo_root, check=True, env_role="orchestrator").stdout.strip("\x00"):
         raise RuntimeError(f"Empty diff between {base_sha[:8]} and {candidate_sha[:8]}.")
 
     reviewer = parse_harness_spec(args.reviewer or "agy:neon")
@@ -5592,7 +5878,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     harnesses: dict[str, Any] = {}
     for name in ("codex", "agy", "opencode", "pi"):
-        p = shutil.which(name) or (f"/root/.local/bin/{name}" if Path(f"/root/.local/bin/{name}").exists() else None)
+        p = find_harness_binary(name)
         harnesses[name] = {"ok": bool(p), "path": p}
         if name in ("codex", "agy") and not p:
             ok_all = False
@@ -5668,12 +5954,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     skipped: list[str] = []
 
     with file_lock(_cache_root() / "locks" / f"repo-{rkey}.lock", blocking=True):
-        if run_cmd(git_cmd("remote", "get-url", "origin"), cwd=repo_root, env_role="orchestrator").returncode == 0:
-            run_cmd(git_cmd("fetch", "origin", base_branch), cwd=repo_root, check=True, env_role="orchestrator")
-            base_ref = f"origin/{base_branch}"
-        else:
-            base_ref = base_branch
-
+        base_ref = fetch_base_ref(repo_root, base_branch)
         base_sha = run_cmd(git_cmd("rev-parse", base_ref), cwd=repo_root, check=True, env_role="orchestrator").stdout.strip()
 
         if wt_root.is_dir():

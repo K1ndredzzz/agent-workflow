@@ -11,9 +11,12 @@ Version-controlled custom engineering skills, global Codex rules, and the cross-
 The installer creates the following links. Existing matching links keep their inode. Conflicting files or links receive a uniquely named backup.
 
 - `skills/*` -> `/root/.agent/skills/*` (all 7 skills)
+- `agy/plugin` -> `/root/.gemini/config/plugins/agent-workflow` (global Antigravity engineering & dual-agent review convergence rules)
 - Worker-safe skills (`grill`, `diagnose`, `research`, `retro`) -> `/root/.codex/skills/*` (excludes orchestrator-only `dispatch`/`slice`/`spec` to prevent recursive dispatch)
 - `codex/AGENTS.md` -> `/root/.codex/AGENTS.md`
 - `bin/agent-dispatch` -> `/usr/local/bin/agent-dispatch`
+
+When overriding the installation paths, give Codex worker skills their own directory so they receive the worker roster. You can invoke the installer through a symlink to this checkout.
 
 ## Verify
 
