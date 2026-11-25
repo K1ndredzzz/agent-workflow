@@ -25,19 +25,15 @@ import ast
 import concurrent.futures
 import contextlib
 import fcntl
-import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
 import signal
 import subprocess
 import sys
-import threading
 import time
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -61,7 +57,6 @@ from agent_dispatch.brief import (
     touches_overlap,
 )
 from agent_dispatch.config import (
-    HARNESS_ALIASES,
     PRELOADED_REFS,
     PROTECTED_BASENAMES,
     PROTECTED_EXACT_FILES,
@@ -77,8 +72,43 @@ from agent_dispatch.config import (
     _worktree_cache_path,
     assert_required_rubrics_loaded,
 )
-# Legacy callers and tests still look up this value on this module.
-from agent_dispatch.config import HARNESS_OUTPUT_LIMIT
+from agent_dispatch.git_ops import (
+    bootstrap_worktree,
+    canonical_repo_identity,
+    check_dirty_docs_in_main_repo,
+    check_remote_base,
+    check_remote_fast_forward_ready,
+    classify_origin_remote,
+    detect_default_branch,
+    ensure_dispatch_excluded,
+    fetch_base_ref,
+    get_git_common_dir,
+    get_remote_branch_sha,
+    get_repo_root,
+    parse_github_owner_repo,
+    parse_github_owner_repo_url,
+    prepare_worktree,
+    read_worktree_lock_owner,
+    repo_cache_key,
+    snapshot_local_git_config,
+    ticket_lock_path,
+    tracked_status,
+    verify_worktree_branch_integrity,
+    write_worktree_owner,
+)
+from agent_dispatch.harness import (
+    HarnessSpec,
+    _pi_session_archive,
+    append_session_trace,
+    default_reviewer_for,
+    extract_json_object,
+    invoke_harness,
+    parse_codex_ndjson,
+    parse_harness_spec,
+    parse_opencode_ndjson,
+    parse_pi_ndjson,
+    validate_schema,
+)
 from agent_dispatch.linear import LinearClient, normalize_name, resolve_linear_auth, resolve_project
 # Transitional L2 exports for callers still using the monolith.
 from agent_dispatch.process import (
@@ -111,425 +141,6 @@ from agent_dispatch.secrets import (
     safe_json,
     scan_text_for_secrets,
 )
-
-
-# ---------------------------------------------------------------------------
-# Harness Specification
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class HarnessSpec:
-    harness: str
-    model: str
-    effort: str
-
-    @property
-    def label(self) -> str:
-        return f"{self.harness}:{self.model}@{self.effort}" if self.effort else f"{self.harness}:{self.model}"
-
-    @property
-    def vendor(self) -> str:
-        m = self.model.lower()
-        if "gemini" in m or self.harness == "agy":
-            return "google"
-        if "gpt" in m or self.harness == "codex":
-            return "openai"
-        return self.harness
-
-
-def parse_harness_spec(raw: str) -> HarnessSpec:
-    raw = raw.strip()
-    effort = ""
-    if "@" in raw:
-        raw, effort = raw.rsplit("@", 1)
-        effort = effort.strip().lower()
-    if ":" in raw:
-        harness, model_key = raw.split(":", 1)
-    else:
-        harness, model_key = raw, ""
-    harness = harness.lower().strip()
-    model_key = model_key.strip()
-    if harness not in HARNESS_ALIASES:
-        raise ValueError(f"Unsupported harness '{harness}'. Choose from: {', '.join(HARNESS_ALIASES)}")
-    model = HARNESS_ALIASES[harness].get(model_key, model_key)
-
-    if harness == "agy":
-        if model not in HARNESS_ALIASES[harness].values():
-            raise ValueError("Unsupported Gemini 4 model or tier")
-        if effort:
-            base = re.sub(r"-(low|medium|high|xhigh)$", "", model)
-            tier = "medium" if effort == "med" else effort
-            model = f"{base}-{tier}"
-            effort = ""
-            if model not in HARNESS_ALIASES[harness].values():
-                raise ValueError("Unsupported Gemini 4 model or tier")
-    else:
-        if harness in ("opencode", "pi") and "/" not in model:
-            model = f"sub2api/{model}"
-        if model not in HARNESS_ALIASES[harness].values():
-            raise ValueError("Unsupported GPT model for this harness")
-        if effort and effort not in ("low", "medium", "high", "xhigh"):
-            raise ValueError("Unsupported GPT reasoning effort")
-        if not effort:
-            effort = "xhigh"
-    return HarnessSpec(harness=harness, model=model, effort=effort)
-
-
-def default_reviewer_for(worker: HarnessSpec) -> HarnessSpec:
-    if worker.vendor == "openai":
-        return parse_harness_spec("agy:neon")
-    return parse_harness_spec("codex:sol@xhigh")
-
-
-def repo_cache_key(repo_root: Path) -> str:
-    digest = hashlib.sha256(str(repo_root.resolve()).encode("utf-8")).hexdigest()[:8]
-    return f"{repo_root.name}-{digest}"
-
-
-def canonical_repo_identity(repo_root: Path) -> str:
-    """Canonical identity shared across clones of the same GitHub remote (or git-common-dir)."""
-    gh_repo = parse_github_owner_repo(repo_root)
-    if gh_repo:
-        return hashlib.sha256(f"github:{gh_repo.lower()}".encode("utf-8")).hexdigest()[:12]
-    common = get_git_common_dir(repo_root)
-    return hashlib.sha256(f"local:{common}".encode("utf-8")).hexdigest()[:12]
-
-
-def ticket_lock_path(repo_root: Path, issue_uuid: str) -> Path:
-    return _cache_root() / "locks" / f"ticket-{canonical_repo_identity(repo_root)}-{issue_uuid}.lock"
-
-
-# ---------------------------------------------------------------------------
-# Git, Worktree, Preflight & Bootstrap
-# ---------------------------------------------------------------------------
-
-def get_repo_root(repo_arg: str | None) -> Path:
-    start = Path(repo_arg).resolve() if repo_arg else Path.cwd().resolve()
-    res = run_cmd(git_cmd("rev-parse", "--show-toplevel"), cwd=start, env_role="orchestrator")
-    if res.returncode != 0:
-        raise RuntimeError(f"Not inside a git repository: {start}")
-    return Path(res.stdout.strip()).resolve()
-
-
-def get_git_common_dir(path: Path) -> Path:
-    res = run_cmd(git_cmd("rev-parse", "--git-common-dir"), cwd=path, check=True, env_role="orchestrator")
-    p = Path(res.stdout.strip())
-    return p.resolve() if p.is_absolute() else (path / p).resolve()
-
-
-def detect_default_branch(repo_root: Path) -> str:
-    res = run_cmd(git_cmd("symbolic-ref", "refs/remotes/origin/HEAD"), cwd=repo_root, env_role="orchestrator")
-    if res.returncode == 0:
-        ref = res.stdout.strip()
-        if ref.startswith("refs/remotes/origin/"):
-            return ref.removeprefix("refs/remotes/origin/")
-    for cand in ("main", "master"):
-        if run_cmd(git_cmd("rev-parse", "--verify", f"refs/remotes/origin/{cand}"), cwd=repo_root, env_role="orchestrator").returncode == 0:
-            return cand
-        if run_cmd(git_cmd("rev-parse", "--verify", f"refs/heads/{cand}"), cwd=repo_root, env_role="orchestrator").returncode == 0:
-            return cand
-    raise RuntimeError(f"Cannot determine default branch (main/master) for {repo_root}")
-
-
-def fetch_base_ref(repo_root: Path, branch: str) -> str:
-    if run_cmd(git_cmd("remote", "get-url", "origin"), cwd=repo_root, env_role="orchestrator").returncode != 0:
-        return f"refs/heads/{branch}"
-    ref = f"refs/remotes/origin/{branch}"
-    run_cmd(git_cmd("fetch", "origin", f"+refs/heads/{branch}:{ref}"),
-            cwd=repo_root, check=True, env_role="orchestrator")
-    return ref
-
-
-def parse_github_owner_repo_url(url: str) -> str | None:
-    """Parse GitHub owner/repo across HTTPS, SSH, ssh://git@ssh.github.com:443/..., and trailing .git/ variants."""
-    u = (url or "").strip().rstrip("/")
-    if not u:
-        return None
-    m = re.match(
-        r"^(?:https?://(?:[^/@]+@)?github\.com/|ssh://(?:[^/@]+@)?(?:ssh\.)?github\.com(?::\d+)?/|git@(?:ssh\.)?github\.com:)([^/\s]+/[^/\s]+?)(?:\.git)?$",
-        u,
-        re.I,
-    )
-    return m.group(1) if m else None
-
-
-def parse_github_owner_repo(repo_root: Path) -> str | None:
-    res = run_cmd(git_cmd("remote", "get-url", "origin"), cwd=repo_root, env_role="orchestrator")
-    if res.returncode != 0:
-        return None
-    return parse_github_owner_repo_url(res.stdout.strip())
-
-
-def classify_origin_remote(repo_root: Path) -> tuple[str, str | None, str]:
-    """
-    Classify origin remote as:
-      - ("github", "owner/repo", raw_url)
-      - ("local_path", None, raw_url)      # local filesystem bare repo or file://
-      - ("unknown_remote", None, raw_url)  # unrecognized remote host/alias -> fail closed unless --allow-branch-only!
-      - ("none", None, "")
-    """
-    res = run_cmd(git_cmd("remote", "get-url", "origin"), cwd=repo_root, env_role="orchestrator")
-    if res.returncode != 0 or not res.stdout.strip():
-        return "none", None, ""
-    raw_url = res.stdout.strip()
-    gh = parse_github_owner_repo_url(raw_url)
-    push_urls = run_cmd(git_cmd("remote", "get-url", "--push", "--all", "origin"), cwd=repo_root,
-                        env_role="orchestrator", check=True, cap_output=False).stdout.splitlines()
-    if len(push_urls) != 1 or not (
-        push_urls[0] == raw_url or (gh and (parse_github_owner_repo_url(push_urls[0]) or "").lower() == gh.lower())
-    ):
-        raise RuntimeError("Origin fetch and push destinations differ or multiple push destinations are configured.")
-    if gh:
-        return "github", gh, raw_url
-    if raw_url.startswith("file://"):
-        return "local_path", None, raw_url
-    if raw_url.startswith(("/", "./", "../")) or (repo_root / raw_url).exists():
-        return "local_path", None, str((repo_root / raw_url).resolve())
-    return "unknown_remote", None, raw_url
-
-
-def get_remote_branch_sha(repo_root: Path, branch: str, *, ignore_shutdown: bool = False) -> str:
-    """Return 40-char remote SHA for origin/refs/heads/<branch>, or '' if branch does not exist remotely."""
-    if run_cmd(git_cmd("remote", "get-url", "origin"), cwd=repo_root, env_role="orchestrator", ignore_shutdown=ignore_shutdown).returncode != 0:
-        return ""
-    res = run_cmd(
-        git_cmd("ls-remote", "origin", f"refs/heads/{branch}"),
-        cwd=repo_root,
-        env_role="orchestrator",
-        ignore_shutdown=ignore_shutdown,
-    )
-    if res.returncode != 0:
-        raise RuntimeError(f"git ls-remote origin {branch} failed: {redact_secrets(res.stderr)}")
-    line = res.stdout.strip().splitlines()
-    return line[0].split()[0] if line else ""
-
-
-def check_remote_base(repo_root: Path, branch: str, expected_sha: str, phase: str) -> None:
-    current_sha = get_remote_branch_sha(repo_root, branch)
-    if not current_sha:
-        raise RuntimeError(f"Remote base origin/{branch} was deleted during {phase}.")
-    if current_sha == expected_sha:
-        return
-    run_cmd(git_cmd("fetch", "origin", f"refs/heads/{branch}"), cwd=repo_root, check=True, env_role="orchestrator")
-    ancestry = run_cmd(git_cmd("merge-base", "--is-ancestor", expected_sha, current_sha),
-                       cwd=repo_root, env_role="orchestrator")
-    if ancestry.returncode != 0:
-        raise RuntimeError(f"Remote base origin/{branch} was rewritten during {phase} "
-                           f"({expected_sha[:8]} is no longer an ancestor of {current_sha[:8]}).")
-
-
-def _snapshot_shared_git_config(worktree: Path) -> str:
-    """Hash effective local git config and raw shared <git-common-dir>/config bytes."""
-    cfg_res = run_cmd(git_cmd("config", "--local", "--list"), cwd=worktree, env_role="orchestrator", cap_output=False)
-    cfg_list = cfg_res.stdout if cfg_res.returncode == 0 else ""
-    raw_cfg_sha = ""
-    try:
-        cfg_file = get_git_common_dir(worktree) / "config"
-        if cfg_file.is_file():
-            raw_cfg_sha = sha256_file(cfg_file)
-    except Exception:
-        pass
-    return sha256_text(f"{cfg_list}\x00{raw_cfg_sha}")
-
-
-def snapshot_local_git_config(worktree: Path) -> dict[str, str]:
-    """Snapshot local git config and .gitattributes hash to detect worker tampering (filter.clean, pushurl, sshCommand)."""
-    attr_path = worktree / ".gitattributes"
-    return {
-        "local_config_sha": _snapshot_shared_git_config(worktree),
-        "gitattributes_sha": sha256_file(attr_path) if attr_path.is_file() else "",
-    }
-
-
-def check_dirty_docs_in_main_repo(repo_root: Path, base_branch: str) -> list[str]:
-    """Flag ONLY uncommitted local doc changes or locally unpushed commits (includes monorepo **/GLOSSARY.md)."""
-    issues: list[str] = []
-    doc_paths = ["GLOSSARY.md", ":(glob)**/GLOSSARY.md", "GLOSSARY-MAP.md", "CODING_STANDARDS.md", "docs/adr"]
-    st = run_cmd(git_cmd("status", "--porcelain", "--", *doc_paths), cwd=repo_root, env_role="orchestrator").stdout.strip()
-    if st:
-        issues.append(f"Uncommitted domain/standard docs in main repo:\n{st}")
-    if run_cmd(git_cmd("rev-parse", "--verify", f"refs/remotes/origin/{base_branch}"), cwd=repo_root, env_role="orchestrator").returncode == 0:
-        unpushed = run_cmd(
-            git_cmd("log", "--oneline", f"origin/{base_branch}..HEAD", "--", *doc_paths),
-            cwd=repo_root,
-            env_role="orchestrator",
-        ).stdout.strip()
-        if unpushed:
-            issues.append(
-                f"Unpushed domain/standard doc commits in main repo (worktrees branch from origin/{base_branch}):\n{unpushed}"
-            )
-    return issues
-
-
-def ensure_dispatch_excluded(worktree: Path, *, ignore_shutdown: bool = False) -> None:
-    res = run_cmd(git_cmd("rev-parse", "--git-path", "info/exclude"), cwd=worktree, env_role="orchestrator", ignore_shutdown=ignore_shutdown)
-    if res.returncode != 0:
-        return
-    exclude_path = Path(res.stdout.strip())
-    if not exclude_path.is_absolute():
-        exclude_path = (worktree / exclude_path).resolve()
-    exclude_path.parent.mkdir(parents=True, exist_ok=True)
-    existing = exclude_path.read_text(encoding="utf-8") if exclude_path.is_file() else ""
-    if ".dispatch/" not in existing.splitlines():
-        with exclude_path.open("a", encoding="utf-8") as fh:
-            if existing and not existing.endswith("\n"):
-                fh.write("\n")
-            fh.write(".dispatch/\n")
-
-
-def write_worktree_owner(worktree: Path, identifier: str, issue_uuid: str, repo_identity: str, branch: str) -> None:
-    """Persist worktree lock-owner metadata inside repo lock so cleanup can NEVER race before first checkpoint."""
-    owner_path = worktree / ".dispatch" / "owner.json"
-    if worktree.is_symlink() or owner_path.parent.is_symlink() or owner_path.is_symlink():
-        raise RuntimeError("Symlink in worktree ownership path; refusing to write metadata.")
-    atomic_write_text(
-        owner_path,
-        json.dumps(
-            {
-                "issue": identifier,
-                "issue_uuid": issue_uuid,
-                "repo_identity": repo_identity,
-                "branch": branch,
-            },
-            indent=2,
-            ensure_ascii=False,
-        ),
-    )
-
-
-def prepare_worktree(
-    repo_root: Path,
-    identifier: str,
-    base_branch: str,
-    *,
-    fresh: bool = False,
-    issue_uuid: str = "",
-) -> tuple[Path, str, str]:
-    """Create or safely reuse an isolated worktree under repo flock; writes owner.json before releasing repo lock."""
-    rkey = repo_cache_key(repo_root)
-    repo_id = canonical_repo_identity(repo_root)
-    branch = f"feat/{identifier.lower()}"
-    repo_common = get_git_common_dir(repo_root)
-
-    with file_lock(_cache_root() / "locks" / f"repo-{rkey}.lock", blocking=True):
-        run_cmd(git_cmd("worktree", "prune"), cwd=repo_root, env_role="orchestrator")
-
-        base_ref = fetch_base_ref(repo_root, base_branch)
-        base_sha = run_cmd(git_cmd("rev-parse", base_ref), cwd=repo_root, check=True, env_role="orchestrator").stdout.strip()
-
-        wt_dir = _worktree_cache_path(rkey, identifier.upper())
-        wt_dir.parent.mkdir(parents=True, exist_ok=True)
-        if wt_dir.exists():
-            if not (wt_dir / ".git").exists():
-                raise RuntimeError(f"Non-git directory occupies worktree path {wt_dir}; inspect and remove manually.")
-            wt_common = get_git_common_dir(wt_dir)
-            if wt_common != repo_common:
-                raise RuntimeError(f"Worktree ownership mismatch at {wt_dir}: belongs to {wt_common}, not {repo_common}")
-            cur_br = run_cmd(git_cmd("rev-parse", "--abbrev-ref", "HEAD"), cwd=wt_dir, check=True, env_role="orchestrator").stdout.strip()
-            if cur_br != branch:
-                raise RuntimeError(f"Worktree {wt_dir} is on branch '{cur_br}', expected '{branch}'")
-            if issue_uuid:
-                owner_uuid, owner_branch, _, error = _read_worktree_lock_owner(repo_root, rkey, wt_dir)
-                if error or owner_uuid != issue_uuid or owner_branch != branch:
-                    raise RuntimeError(f"Worktree ownership mismatch at {wt_dir}: {error or 'issue or branch changed'}")
-            if fresh:
-                run_cmd(git_cmd("worktree", "remove", "--force", str(wt_dir)), cwd=repo_root, check=True, env_role="orchestrator")
-                run_cmd(git_cmd("branch", "-D", branch), cwd=repo_root, env_role="orchestrator")
-            else:
-                dirty = run_cmd(git_cmd("status", "--porcelain"), cwd=wt_dir, env_role="orchestrator").stdout.strip()
-                if dirty:
-                    raise RuntimeError(
-                        f"Existing worktree {wt_dir} has uncommitted changes; pass --fresh to recreate cleanly:\n{dirty}"
-                    )
-                ensure_dispatch_excluded(wt_dir)
-                if issue_uuid:
-                    write_worktree_owner(wt_dir, identifier, issue_uuid, repo_id, branch)
-                return wt_dir, branch, base_sha
-
-        branch_exists = run_cmd(git_cmd("rev-parse", "--verify", f"refs/heads/{branch}"), cwd=repo_root, env_role="orchestrator").returncode == 0
-        if branch_exists and fresh:
-            run_cmd(git_cmd("branch", "-D", branch), cwd=repo_root, check=True, env_role="orchestrator")
-            branch_exists = False
-
-        if branch_exists:
-            run_cmd(git_cmd("worktree", "add", str(wt_dir), branch), cwd=repo_root, check=True, env_role="orchestrator")
-            ensure_dispatch_excluded(wt_dir)
-            if issue_uuid:
-                write_worktree_owner(wt_dir, identifier, issue_uuid, repo_id, branch)
-            return wt_dir, branch, base_sha
-
-        run_cmd(git_cmd("worktree", "add", "-b", branch, str(wt_dir), base_sha), cwd=repo_root, check=True, env_role="orchestrator")
-        ensure_dispatch_excluded(wt_dir)
-        if issue_uuid:
-            write_worktree_owner(wt_dir, identifier, issue_uuid, repo_id, branch)
-        return wt_dir, branch, base_sha
-
-
-def check_remote_fast_forward_ready(repo_root: Path, worktree: Path, branch: str) -> str:
-    """Fail fast BEFORE starting a long worker if origin/<branch> already diverged from local HEAD."""
-    remote_sha = get_remote_branch_sha(repo_root, branch)
-    if not remote_sha:
-        return ""
-    run_cmd(git_cmd("fetch", "origin", f"refs/heads/{branch}"), cwd=repo_root, check=True, env_role="orchestrator")
-    local_head = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
-    anc = run_cmd(git_cmd("merge-base", "--is-ancestor", remote_sha, local_head), cwd=worktree, env_role="orchestrator")
-    if anc.returncode != 0:
-        raise RuntimeError(
-            f"Remote branch origin/{branch} ({remote_sha[:8]}) has diverged from local HEAD ({local_head[:8]}). "
-            f"Rebase/reconcile manually before dispatching to avoid post-run push rejection."
-        )
-    return remote_sha
-
-
-def tracked_status(worktree: Path) -> tuple[list[str], list[str]]:
-    status = run_cmd(git_cmd("status", "--porcelain=v2", "--branch", "--untracked-files=no",
-                             "--no-renames", "-z"),
-                     cwd=worktree, check=True, env_role="orchestrator", cap_output=False)
-    records = list(filter(None, status.stdout.split("\0")))
-    return [r for r in records if r.startswith("# branch.")], [r for r in records if not r.startswith("# ")]
-
-
-def bootstrap_worktree(worktree: Path, setup_cmd_override: str | None, *, timeout: int = 600) -> dict[str, Any]:
-    """Install dependencies for fresh worktree (supports mixed Node + Python repos)."""
-    cmds: list[str] = []
-    if setup_cmd_override:
-        cmds.append(setup_cmd_override)
-    else:
-        if (worktree / "package.json").is_file() and not (worktree / "node_modules").exists():
-            if (worktree / "pnpm-lock.yaml").is_file() and shutil.which("pnpm"):
-                cmds.append("pnpm install --frozen-lockfile")
-            elif ((worktree / "bun.lockb").is_file() or (worktree / "bun.lock").is_file()) and shutil.which("bun"):
-                cmds.append("bun install --frozen-lockfile")
-            elif (worktree / "yarn.lock").is_file() and shutil.which("yarn"):
-                cmds.append("yarn install --frozen-lockfile")
-            elif (worktree / "package-lock.json").is_file() and shutil.which("npm"):
-                cmds.append("npm ci")
-        if (worktree / "uv.lock").is_file() and not (worktree / ".venv").exists() and shutil.which("uv"):
-            cmds.append("uv sync --frozen")
-
-    if not cmds:
-        return {"ran": False, "commands": []}
-    branch, dirty = tracked_status(worktree)
-    if dirty:
-        raise RuntimeError("Bootstrap requires a clean index and tracked files.")
-    before_git_cfg = _snapshot_shared_git_config(worktree)
-    for c in cmds:
-        log(f"Bootstrapping worktree dependencies: {c}")
-        run_cmd(
-            c,
-            cwd=worktree,
-            shell=True,
-            check=True,
-            timeout=timeout,
-            env_role="child",
-            extra_env={"HUSKY": "0", "HUSKY_SKIP_INSTALL": "1"},
-        )
-        if _snapshot_shared_git_config(worktree) != before_git_cfg:
-            raise RuntimeError(f"Bootstrap modified shared git config (.git/config) in {worktree}; refusing to proceed.")
-    after, dirty = tracked_status(worktree)
-    if after != branch or dirty:
-        raise RuntimeError(f"Bootstrap changed the branch, HEAD or tracked files in {worktree}.")
-    return {"ran": True, "commands": cmds}
 
 
 # ---------------------------------------------------------------------------
@@ -1094,19 +705,6 @@ def _scan_before_git_write(
     return findings
 
 
-def verify_worktree_branch_integrity(worktree: Path, expected_common_dir: Path, expected_branch: str, base_sha: str) -> None:
-    """Guard against worker switching branches or rewriting history away from base_sha before orchestrator commit."""
-    actual_common = get_git_common_dir(worktree)
-    if actual_common != expected_common_dir:
-        raise RuntimeError(f"Worktree common-dir mismatch after worker: {actual_common} != {expected_common_dir}")
-    actual_branch = run_cmd(git_cmd("rev-parse", "--abbrev-ref", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
-    if actual_branch != expected_branch:
-        raise RuntimeError(f"Worker switched branch from '{expected_branch}' to '{actual_branch}'; refusing to commit.")
-    anc = run_cmd(git_cmd("merge-base", "--is-ancestor", base_sha, "HEAD"), cwd=worktree, env_role="orchestrator")
-    if anc.returncode != 0:
-        raise RuntimeError(f"Worker rewrote git history so base_sha {base_sha[:8]} is no longer an ancestor of HEAD.")
-
-
 def orchestrator_commit(
     worktree: Path,
     identifier: str,
@@ -1159,516 +757,6 @@ def orchestrator_commit(
 # ---------------------------------------------------------------------------
 # Strict JSON Extraction, Schema Validation & Headless Harness Drivers
 # ---------------------------------------------------------------------------
-
-def extract_json_object(text: str) -> dict[str, Any]:
-    """Select the last JSON object in prose, including fenced output."""
-    start = re.compile(r'\{(?=\s*(?:"|\}|\Z))|\[(?=\s*(?:[{"\[\]]|\Z))')
-    tokens = re.compile(r'"(?:[^"\\]|\\.)*"|[{}\[\]"]', re.S)
-    decoder = json.JSONDecoder()
-    last = None
-    pos = 0
-    while match := start.search(text, pos):
-        try:
-            last, pos = decoder.raw_decode(text, match.start())
-        except json.JSONDecodeError:
-            # Skip a complete malformed draft as one object. Its children cannot be verdicts.
-            last = None
-            depth = 1
-            for token in tokens.finditer(text, match.end()):
-                value = token.group()
-                if value in ("{", "["):
-                    depth += 1
-                elif value in ("}", "]"):
-                    depth -= 1
-                    if depth == 0:
-                        pos = token.end()
-                        break
-                elif value == '"':
-                    raise ValueError("Incomplete JSON string in final object")
-            else:
-                raise ValueError("Incomplete final JSON object")
-    if not isinstance(last, dict):
-        raise ValueError("Missing or invalid final JSON object")
-    return last
-
-
-def validate_schema(obj: Any, schema: dict[str, Any], *, expected_axis: str | None = None) -> dict[str, Any]:
-    if not isinstance(obj, dict):
-        raise ValueError(f"Expected JSON object, got {type(obj).__name__}")
-    props = schema.get("properties", {})
-    for key in schema.get("required", []):
-        if key not in obj:
-            raise ValueError(f"Missing required JSON field: '{key}'")
-    if schema.get("additionalProperties") is False:
-        extra = set(obj.keys()) - set(props.keys())
-        if extra:
-            raise ValueError(f"Unexpected JSON fields: {sorted(extra)}")
-    for key, spec in props.items():
-        if key not in obj:
-            continue
-        val = obj[key]
-        t = spec.get("type")
-        if t == "string":
-            if not isinstance(val, str):
-                raise ValueError(f"Field '{key}' must be string, got {type(val).__name__}")
-            if "enum" in spec and val not in spec["enum"]:
-                raise ValueError(f"Field '{key}' value '{val}' not in {spec['enum']}")
-        elif t == "boolean":
-            if not isinstance(val, bool):
-                raise ValueError(f"Field '{key}' must be boolean, got {type(val).__name__}")
-        elif t == "array":
-            if not isinstance(val, list):
-                raise ValueError(f"Field '{key}' must be array, got {type(val).__name__}")
-            item_t = (spec.get("items") or {}).get("type")
-            if item_t == "string" and not all(isinstance(x, str) for x in val):
-                raise ValueError(f"Field '{key}' must contain only strings")
-    if expected_axis is not None and obj.get("axis") != expected_axis:
-        raise ValueError(f"Review axis mismatch: expected '{expected_axis}', got '{obj.get('axis')}'")
-    return obj
-
-
-def _harness_events(stdout: str) -> Iterator[dict[str, Any]]:
-    for line in stdout.split("\n"):
-        if line.lstrip().startswith("{"):
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError as exc:
-                if re.search(r'"type"\s*:', line):
-                    raise ValueError("Malformed harness protocol event") from exc
-                continue
-            if isinstance(event, dict):
-                yield event
-
-
-def parse_codex_ndjson(stdout: str) -> str:
-    text = ""
-    completed = False
-    for event in _harness_events(stdout):
-        kind = event.get("type")
-        if kind in ("turn.failed", "error"):
-            raise RuntimeError("Codex reported an unsuccessful turn")
-        if kind == "turn.started":
-            text, completed = "", False
-        elif kind == "item.completed":
-            item = event.get("item")
-            if isinstance(item, dict) and item.get("type") == "agent_message":
-                msg_text = item.get("text", "")
-                text = msg_text if isinstance(msg_text, str) else ""
-        elif kind == "turn.completed":
-            completed = True
-    if not text or not completed:
-        raise ValueError("Codex produced no completed final assistant message")
-    return text
-
-
-def parse_opencode_ndjson(stdout: str) -> str:
-    current: list[str] = []
-    last_id = ""
-    finished = False
-    for event in _harness_events(stdout):
-        kind = event.get("type")
-        raw_part = event.get("part")
-        part = raw_part if isinstance(raw_part, dict) else {}
-        msg_id = str(part.get("messageID") or event.get("messageID") or "")
-        if kind == "error":
-            raise RuntimeError("OpenCode reported an error event")
-        if kind == "step_start" or (msg_id and last_id and msg_id != last_id):
-            current.clear()
-            finished = False
-        if msg_id:
-            last_id = msg_id
-        if kind == "text":
-            text = part.get("text", event.get("text"))
-            if isinstance(text, str):
-                current.append(text)
-        elif kind == "step_finish":
-            finished = part.get("reason") == "stop"
-    if not finished or not any(text.strip() for text in current):
-        raise ValueError("OpenCode produced no completed final assistant message")
-    return "\n".join(current)
-
-
-def parse_pi_ndjson(stdout: str) -> str:
-    final = None
-    for event in _harness_events(stdout):
-        kind = event.get("type")
-        if kind == "error":
-            raise RuntimeError("Pi reported an error event")
-        msg = event.get("message")
-        if kind in ("agent_start", "turn_start") or event.get("willRetry"):
-            final = None
-        elif kind in ("message_start", "message_update", "message_end") and isinstance(msg, dict) and msg.get("role") == "assistant":
-            final = msg if kind == "message_end" else None
-        elif kind == "agent_end":
-            msgs = event.get("messages")
-            final = next((m for m in reversed(msgs if isinstance(msgs, list) else [])
-                          if isinstance(m, dict) and m.get("role") == "assistant"), None)
-    if final and final.get("stopReason") in (None, "stop"):
-        content = final.get("content")
-        if isinstance(content, list):
-            content = "\n".join(item["text"] for item in content if isinstance(item, dict)
-                                and item.get("type") == "text" and isinstance(item.get("text"), str))
-        if isinstance(content, str) and content.strip():
-            return content
-    raise ValueError("Pi produced no completed final assistant message")
-
-
-_TRACE_WRITE_LOCK = threading.Lock()
-
-
-def append_session_trace(run_dir: Path, entry: dict[str, Any], trace_sink: list[dict[str, Any]] | None) -> None:
-    """Persist every session trace immediately to run_dir/sessions.jsonl so timeouts/crashes never lose traces."""
-    entry = redact_data({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), **entry})
-    with _TRACE_WRITE_LOCK:
-        trace_file = run_dir / "sessions.jsonl"
-        trace_file.parent.mkdir(parents=True, exist_ok=True)
-        with trace_file.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            fh.flush()
-        if trace_sink is not None and entry.get("event") == "end":
-            trace_sink.append(entry)
-
-
-@contextlib.contextmanager
-def _pi_session_archive(path: Path, session_id: str, worktree: Path) -> Iterator[str]:
-    """Let Pi append native session entries in memory and retain a redacted replay."""
-    header = {"type": "session", "version": 3, "id": session_id, "cwd": str(worktree),
-              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    with os.fdopen(os.memfd_create("agent-dispatch-pi"), "w+", encoding="utf-8") as session:
-        session.write(json.dumps(header) + "\n")
-        session.flush()
-        try:
-            yield f"/proc/{os.getpid()}/fd/{session.fileno()}"
-        finally:
-            try:
-                session.seek(0)
-                entries = []
-                for line in session:
-                    if not line.endswith("\n") or not line.strip():
-                        continue
-                    try:
-                        parsed = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    entries.append(safe_json(parsed, ensure_ascii=False))
-                if entries:
-                    atomic_write_text(path, "\n".join(entries) + "\n")
-            except Exception as exc:
-                log(f"Warning: failed persisting redacted Pi session archive {path}: {exc}")
-
-
-def invoke_harness(
-    spec: HarnessSpec,
-    prompt_text: str,
-    *,
-    worktree: Path,
-    run_dir: Path,
-    schema: dict[str, Any],
-    schema_file: Path,
-    prompt_file: Path,
-    out_file: Path,
-    read_only: bool,
-    expected_axis: str | None = None,
-    session_label: str = "",
-    trace_sink: list[dict[str, Any]] | None = None,
-    attach_files: list[Path] | None = None,
-    timeout: int = 1800,
-) -> dict[str, Any]:
-    schema_file.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(schema_file, json.dumps(schema, indent=2))
-    prompt_text = redact_secrets(prompt_text)
-    atomic_write_text(prompt_file, prompt_text)
-    if out_file.exists():
-        out_file.unlink()
-
-    role_name = session_label or out_file.stem
-    stdout_log = run_dir / f"{out_file.stem}.stdout.log"
-    stderr_log = run_dir / f"{out_file.stem}.stderr.log"
-
-    pi_session_dir = run_dir / "pi-sessions"
-    pi_session_id = str(uuid.uuid4()) if spec.harness == "pi" else ""
-    pi_archive = pi_session_dir / f"{pi_session_id}.jsonl"
-
-    append_session_trace(
-        run_dir,
-        {
-            "event": "start",
-            "role": role_name,
-            "harness": spec.harness,
-            "model": spec.label,
-            "read_only": read_only,
-            **({"session_id": pi_session_id} if pi_session_id else {}),
-            "stdout_log": str(stdout_log),
-            "stderr_log": str(stderr_log),
-        },
-        trace_sink=None,
-    )
-
-    trace_end: dict[str, Any] = {
-        "event": "end",
-        "role": role_name,
-        "harness": spec.harness,
-        "model": spec.label,
-        "read_only": read_only,
-        "status": "error",
-        **(
-            {"session_id": pi_session_id, "resume_cmd": shlex.join(["pi", "--session", str(pi_archive)])}
-            if pi_session_id
-            else {}
-        ),
-        "stdout_log": str(stdout_log),
-        "stderr_log": str(stderr_log),
-        "output_file": str(out_file),
-    }
-
-    try:
-        executable = find_harness_binary(spec.harness) or spec.harness
-        if spec.harness == "codex":
-            sandbox = "read-only" if read_only else "danger-full-access"
-            wt_escaped = str(worktree).replace('"', '\\"')
-            cmd = [
-                executable,
-                "exec",
-                "-C",
-                str(worktree),
-                "-m",
-                spec.model,
-                "-c",
-                f'model_reasoning_effort="{spec.effort}"',
-                "-c",
-                'approval_policy="never"',
-                "-c",
-                f'projects."{wt_escaped}".trust_level="trusted"',
-                "-c",
-                "mcp_servers.linear.enabled=false",
-                "--sandbox",
-                sandbox,
-                "--output-schema",
-                str(schema_file),
-                "--json",
-                "-",
-            ]
-            res = run_cmd(
-                cmd,
-                cwd=worktree,
-                stdin_text=prompt_text,
-                timeout=timeout,
-                env_role="codex",
-                cap_output=False, output_limit=HARNESS_OUTPUT_LIMIT,
-                stdout_path=stdout_log,
-                stderr_path=stderr_log,
-            )
-            sid_m = re.search(r'(?:\bsession id:\s*|"thread_id"\s*:\s*")([0-9a-fA-F-]+)', res.stdout + "\n" + res.stderr)
-            sid = sid_m.group(1) if sid_m else ""
-            trace_end.update(
-                {
-                    "returncode": res.returncode,
-                    "session_id": sid,
-                    "resume_cmd": f"codex resume {sid}" if sid else "codex agents",
-                }
-            )
-            if res.returncode != 0:
-                raise RuntimeError(f"codex exec exited {res.returncode}: {redact_secrets(res.stderr)[-2000:]}")
-            result = json.loads(parse_codex_ndjson(res.stdout))
-            validated = redact_data(validate_schema(result, schema, expected_axis=expected_axis))
-            atomic_write_text(out_file, json.dumps(validated, indent=2, ensure_ascii=False))
-            trace_end["status"] = "ok"
-            return validated
-
-        if spec.harness == "agy":
-            short_prompt = (
-                f"Read and execute all instructions in {prompt_file} (read-only reference). "
-                f"Do NOT modify {prompt_file}. Return ONLY valid JSON matching the required schema."
-            )
-            cmd = [
-                executable,
-                "--model",
-                spec.model,
-                "--add-dir",
-                str(run_dir),
-                "--output-format",
-                "json",
-                "--json-schema",
-                str(schema_file),
-            ]
-            if read_only:
-                # Keep slash expansion enabled ONLY so --mode plan actually takes effect (prompt has no leading /cmd)
-                cmd += ["--mode", "plan"]
-            else:
-                cmd += ["--dangerously-skip-permissions", "--disable-slash-commands"]
-            cmd.append(f"--print={short_prompt}")
-
-            res = run_cmd(
-                cmd,
-                cwd=worktree,
-                timeout=timeout,
-                env_role="child",
-                cap_output=False, output_limit=HARNESS_OUTPUT_LIMIT,
-                stdout_path=stdout_log,
-                stderr_path=stderr_log,
-            )
-            # Extract conversation_id BEFORE checking returncode so failed runs remain traceable!
-            wrapper: dict[str, Any] = {}
-            try:
-                wrapper = extract_json_object(res.stdout)
-            except Exception:
-                cid_m = re.search(r'"conversation_id"\s*:\s*"([0-9a-fA-F-]+)"', res.stdout + "\n" + res.stderr)
-                if cid_m:
-                    wrapper = {"conversation_id": cid_m.group(1)}
-            cid = str(wrapper.get("conversation_id", ""))
-            if not re.fullmatch(r"[A-Za-z0-9-]+", cid):
-                cid = ""
-            trace_end.update(
-                {
-                    "returncode": res.returncode,
-                    "conversation_id": cid,
-                    "conversation_link": f"conversation://{cid}" if cid else "",
-                    "resume_cmd": f"agy --conversation {cid}" if cid else "",
-                    "duration_seconds": wrapper.get("duration_seconds"),
-                    "usage": wrapper.get("usage"),
-                }
-            )
-            if res.returncode != 0:
-                raise RuntimeError(
-                    f"agy exited {res.returncode}: {redact_secrets(res.stderr)[-2000:]}\n{redact_secrets(res.stdout)[-1000:]}"
-                )
-            if wrapper.get("status") not in (None, "SUCCESS"):
-                raise RuntimeError(f"agy returned non-SUCCESS status: {wrapper.get('status')}")
-            result = wrapper.get("structured_output")
-            if not isinstance(result, dict):
-                result = extract_json_object(str(wrapper.get("response", "")))
-            validated = redact_data(validate_schema(result, schema, expected_axis=expected_axis))
-            atomic_write_text(out_file, json.dumps(validated, indent=2, ensure_ascii=False))
-            trace_end["status"] = "ok"
-            return validated
-
-        if spec.harness == "opencode":
-            files_to_attach: list[Path] = [prompt_file]
-            seen_attach: set[Path] = {prompt_file.resolve()}
-            for extra in attach_files or []:
-                if extra and extra.is_file():
-                    resolved_extra = extra.resolve()
-                    if resolved_extra not in seen_attach:
-                        seen_attach.add(resolved_extra)
-                        files_to_attach.append(extra)
-            ref_clause = " and the attached reference files" if len(files_to_attach) > 1 else ""
-            short_prompt = (
-                f"Read and execute all instructions in the attached prompt file ({prompt_file.name}){ref_clause}. "
-                f"End your final message with ONLY a valid JSON object matching:\n{json.dumps(schema)}"
-            )
-            cmd = [
-                executable,
-                "run",
-                "-m",
-                spec.model,
-                "--variant",
-                spec.effort,
-                "--dir",
-                str(worktree),
-                "--format",
-                "json",
-                "--title",
-                role_name,
-            ]
-            if read_only:
-                cmd += ["--agent", "plan"]
-            else:
-                cmd += ["--auto"]
-            for af in files_to_attach:
-                cmd += ["-f", str(af)]
-            # `--` terminates yargs `-f [array]` so the positional message is never consumed as a filename
-            cmd += ["--", short_prompt]
-            res = run_cmd(
-                cmd,
-                cwd=worktree,
-                timeout=timeout,
-                env_role="child",
-                cap_output=False, output_limit=HARNESS_OUTPUT_LIMIT,
-                stdout_path=stdout_log,
-                stderr_path=stderr_log,
-            )
-            sid_m = re.search(r'"sessionID"\s*:\s*"([A-Za-z0-9_-]+)"', res.stdout)
-            sid = sid_m.group(1) if sid_m else ""
-            trace_end.update(
-                {
-                    "returncode": res.returncode,
-                    "session_id": sid,
-                    "resume_cmd": f"opencode -s {sid}" if sid else "opencode session list",
-                }
-            )
-            if res.returncode != 0:
-                raise RuntimeError(f"opencode run exited {res.returncode}: {redact_secrets(res.stderr)[-2000:]}")
-            text = parse_opencode_ndjson(res.stdout)
-            validated = redact_data(validate_schema(extract_json_object(text), schema, expected_axis=expected_axis))
-            atomic_write_text(out_file, json.dumps(validated, indent=2, ensure_ascii=False))
-            trace_end["status"] = "ok"
-            return validated
-
-        if spec.harness == "pi":
-            pi_session_dir.mkdir(parents=True, exist_ok=True)
-            short_prompt = (
-                f"Read and execute all instructions in {prompt_file}. "
-                f"End your final message with ONLY a valid JSON object matching:\n{json.dumps(schema)}"
-            )
-            cmd = [
-                executable,
-                "-p",
-                "--offline",
-                "--mode",
-                "json",
-                "--name",
-                role_name,
-                "--session-dir",
-                str(pi_session_dir),
-                "--model",
-                f"{spec.model}:{spec.effort}",
-            ]
-            if read_only:
-                cmd += ["--tools", "read,grep,find,ls"]
-            with _pi_session_archive(pi_archive, pi_session_id, worktree) as session_file:
-                cmd += ["--session", session_file, short_prompt]
-                res = run_cmd(
-                    cmd, cwd=worktree, timeout=timeout, env_role="child", cap_output=False, output_limit=HARNESS_OUTPUT_LIMIT,
-                    stdout_path=stdout_log, stderr_path=stderr_log,
-                )
-            trace_end["returncode"] = res.returncode
-            if res.returncode != 0:
-                raise RuntimeError(f"pi exited {res.returncode}: {redact_secrets(res.stderr)[-2000:]}")
-            text = parse_pi_ndjson(res.stdout)
-            validated = redact_data(validate_schema(extract_json_object(text), schema, expected_axis=expected_axis))
-            atomic_write_text(out_file, json.dumps(validated, indent=2, ensure_ascii=False))
-            trace_end["status"] = "ok"
-            return validated
-
-        raise ValueError(f"Unknown harness: {spec.harness}")
-    except subprocess.TimeoutExpired:
-        trace_end["status"] = "timeout"
-        raise
-    finally:
-        # Best-effort capture of partial session ID from streamed logs on crash/timeout
-        if trace_end["status"] != "ok" and not trace_end.get("conversation_id") and not trace_end.get("session_id"):
-            patterns = {
-                "codex": r'(?:\bsession id:\s*|"thread_id"\s*:\s*")([0-9a-fA-F-]+)',
-                "agy": r'"conversation_id"\s*:\s*"([0-9a-fA-F-]+)"',
-                "opencode": r'"sessionID"\s*:\s*"([A-Za-z0-9_-]+)"',
-            }
-            pattern = patterns.get(spec.harness)
-            for path in (stderr_log, stdout_log):
-                if not pattern or not path.is_file():
-                    continue
-                with path.open(encoding="utf-8", errors="replace") as log_file:
-                    match = next((m for line in log_file if (m := re.search(pattern, line))), None)
-                if match:
-                    session_id = match.group(1)
-                    if spec.harness == "agy":
-                        trace_end.update(conversation_id=session_id, conversation_link=f"conversation://{session_id}",
-                                         resume_cmd=f"agy --conversation {session_id}")
-                    else:
-                        command = "codex resume" if spec.harness == "codex" else "opencode -s"
-                        trace_end.update(session_id=session_id, resume_cmd=f"{command} {session_id}")
-                    break
-        append_session_trace(run_dir, trace_end, trace_sink)
-
 
 # ---------------------------------------------------------------------------
 # Prompt Builders & Two-Axis Review
@@ -3839,50 +2927,6 @@ def cmd_review(args: argparse.Namespace) -> int:
     return 0 if res["passed"] else 1
 
 
-def _read_worktree_lock_owner(repo_root: Path, rkey: str, wt: Path) -> tuple[str, str, dict[str, Any], str]:
-    """
-    Resolve (issue_uuid, expected_branch, latest_ckpt_dict, error_reason) from owner.json (authoritative, written inside repo lock)
-    and latest.json. Never crashes on corrupt JSON.
-    """
-    expected_repo_id = canonical_repo_identity(repo_root)
-    expected_branch = f"feat/{wt.name.lower()}"
-    owner_f = wt / ".dispatch" / "owner.json"
-    if wt.is_symlink() or owner_f.parent.is_symlink() or owner_f.is_symlink():
-        return "", "", {}, "symlink_in_owner_path"
-
-    records = []
-    checkpoint = {}
-    for path, kind in (
-        (owner_f, "owner"),
-        (_cache_root() / "runs" / rkey / wt.name / "latest.json", "checkpoint"),
-        (_cache_root() / "runs" / rkey / wt.name / "latest-local.json", "local_checkpoint"),
-    ):
-        if not path.exists():
-            continue
-        try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return "", "", {}, f"corrupt_{kind}_json"
-        if not isinstance(record, dict) or not record.get("issue_uuid"):
-            return "", "", {}, f"missing_{kind}_metadata"
-        if record.get("repo_identity") != expected_repo_id or record.get("issue") != wt.name:
-            return "", "", {}, f"{kind}_ownership_mismatch"
-        if record.get("branch") != expected_branch:
-            return "", "", {}, f"{kind} branch ownership mismatch"
-        if kind != "owner" and Path(record.get("worktree") or "").absolute() != wt.absolute():
-            return "", "", {}, f"{kind}_worktree_mismatch"
-        records.append(record)
-        if kind == "checkpoint" or (kind == "local_checkpoint" and not checkpoint):
-            checkpoint = record
-
-    if not records:
-        return "", "", {}, "missing_lock_owner_metadata"
-    uuid = records[0]["issue_uuid"]
-    if any(r["issue_uuid"] != uuid for r in records):
-        return "", "", checkpoint, "owner_checkpoint_uuid_mismatch"
-    return uuid, expected_branch, checkpoint, ""
-
-
 def cmd_status(args: argparse.Namespace) -> int:
     repo_root = get_repo_root(args.repo)
     rkey = repo_cache_key(repo_root)
@@ -3898,7 +2942,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         for p in sorted(wt_root.iterdir()):
             if not p.is_dir() or p.name.startswith(".baseline-"):
                 continue
-            issue_uuid, _, ckpt, owner_err = _read_worktree_lock_owner(repo_root, rkey, p)
+            issue_uuid, _, ckpt, owner_err = read_worktree_lock_owner(repo_root, rkey, p)
             if issue_uuid:
                 locked_bool = is_locked(ticket_lock_path(repo_root, issue_uuid))
                 lock_state = "locked" if locked_bool else "unlocked"
@@ -4084,7 +3128,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                     except (OSError, RuntimeError, ValueError) as exc:
                         skipped.append(f"{wt.name} ({redact_secrets(str(exc))})")
                     continue
-                issue_uuid, owner_branch, _, owner_err = _read_worktree_lock_owner(repo_root, rkey, wt)
+                issue_uuid, owner_branch, _, owner_err = read_worktree_lock_owner(repo_root, rkey, wt)
                 if not issue_uuid or not owner_branch:
                     skipped.append(f"{wt.name} ({owner_err or 'missing_lock_owner_metadata'}; refusing unsafe delete)")
                     continue

@@ -9,13 +9,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agent_dispatch import config, process
-from tests.helpers import IsolatedDispatchCase, WORKFLOW_ROOT
+from agent_dispatch import config, git_ops, harness, process
+from tests.helpers import IsolatedDispatchCase, WORKFLOW_ROOT, _git, _write_exec
 
 PEM_BEGIN = "-----BEGIN " + "PRIVATE KEY-----"
 PEM_END = "-----END " + "PRIVATE KEY-----"
@@ -271,6 +272,476 @@ sys.exit(1)
                     cwd=WORKFLOW_ROOT, capture_output=True, text=True, timeout=6,
                 )
                 self.assertEqual(child.returncode, 0, child.stderr)
+
+
+class TestGitOps(IsolatedDispatchCase):
+    def test_worktree_owner_and_repository_lock_identity(self) -> None:
+        repo = self.sandbox / "repo"
+        repo.mkdir()
+        _git(repo, "init", "-b", "main")
+        _git(repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+             "commit", "--allow-empty", "-m", "base")
+
+        worktree, branch, base = git_ops.prepare_worktree(repo, "TST-1", "main", issue_uuid="issue-1")
+        self.assertEqual(branch, "feat/tst-1")
+        self.assertEqual(base, _git(repo, "rev-parse", "HEAD"))
+        self.assertEqual(git_ops.canonical_repo_identity(repo), git_ops.canonical_repo_identity(worktree))
+        self.assertEqual(git_ops.ticket_lock_path(repo, "issue-1"), git_ops.ticket_lock_path(worktree, "issue-1"))
+        repo_key = git_ops.repo_cache_key(repo)
+        self.assertEqual(worktree, self.sandbox / "cache" / "worktrees" / repo_key / "TST-1")
+        self.assertEqual(git_ops.read_worktree_lock_owner(repo, repo_key, worktree), ("issue-1", branch, {}, ""))
+        self.assertEqual(git_ops.prepare_worktree(repo, "TST-1", "main", issue_uuid="issue-1"),
+                         (worktree, branch, base))
+        with self.assertRaisesRegex(RuntimeError, "Worktree ownership mismatch"):
+            git_ops.prepare_worktree(repo, "TST-1", "main", issue_uuid="other-issue")
+
+
+    def test_parse_github_remote_urls(self) -> None:
+        # 5. GitHub URL parser handles SSH-over-443 & trailing .git/
+        self.assertEqual(
+            git_ops.parse_github_owner_repo_url("ssh://git@ssh.github.com:443/K1ndredzzz/agent-workflow.git/"),
+            "K1ndredzzz/agent-workflow",
+        )
+        self.assertEqual(
+            git_ops.parse_github_owner_repo_url("https://github.com/K1ndredzzz/agent-workflow.git/"),
+            "K1ndredzzz/agent-workflow",
+        )
+        self.assertIsNone(git_ops.parse_github_owner_repo_url("git@github-work:org/repo.git"))
+
+    def test_dirty_docs_allows_behind_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bare = Path(td) / "origin.git"
+            repo = Path(td) / "demo"
+            _git(Path(td), "init", "--bare", "-b", "main", str(bare))
+            _git(Path(td), "clone", str(bare), str(repo))
+            _git(repo, "config", "user.email", "t@example.com")
+            _git(repo, "config", "user.name", "T")
+            (repo / "GLOSSARY.md").write_text("# Glossary\n", encoding="utf-8")
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-m", "init")
+            _git(repo, "push", "-u", "origin", "main")
+
+            # Simulate docs PR merged on origin/main while local main is behind -> MUST NOT flag dirty docs!
+            other = Path(td) / "other"
+            _git(Path(td), "clone", str(bare), str(other))
+            _git(other, "config", "user.email", "t@example.com")
+            _git(other, "config", "user.name", "T")
+            (other / "GLOSSARY.md").write_text("# Glossary v2\n", encoding="utf-8")
+            _git(other, "add", "GLOSSARY.md")
+            _git(other, "commit", "-m", "docs PR")
+            _git(other, "push", "origin", "main")
+            _git(repo, "fetch", "origin", "main")
+            self.assertEqual(git_ops.check_dirty_docs_in_main_repo(repo, "main"), [])
+
+
+class TestHarness(IsolatedDispatchCase):
+    def write_harness(self, name: str, source: str) -> None:
+        _write_exec(self.sandbox / name, f"#!{sys.executable}\n{source}")
+        self.enterContext(mock.patch.dict(os.environ, {"PATH": f"{self.sandbox}{os.pathsep}{os.environ['PATH']}"}))
+
+    def test_harness_model_policy_rejects_unlisted_names_and_tiers(self) -> None:
+        for spec in ("agy:opus", "agy:claude-sonnet", "agy:gemini-3", "agy:neon@bogus",
+                     "codex:6.1-sol", "opencode:sub2api/custom", "pi:other/gpt-6.2-astra"):
+            with self.subTest(spec=spec), self.assertRaises(ValueError):
+                harness.parse_harness_spec(spec)
+        for name in ("codex", "opencode", "pi"):
+            for model in ("gpt-6.2-sol", "gpt-6.2-astra"):
+                self.assertTrue(harness.parse_harness_spec(f"{name}:{model}").model.endswith(model))
+        for model in ("neon", "carbon", "argon", "hydrogen"):
+            self.assertTrue(harness.parse_harness_spec(f"agy:{model}").model.startswith("gemini-4-"))
+
+
+    def test_nested_authorization_headers_are_redacted_in_structured_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            token = "syntheticopaque"
+            event = {"request": {"AUTHORIZATION": "Bearer " + token,
+                                 "Proxy-Authorization": "Basic " + token},
+                     "description": "Support bearer authentication"}
+            log = folder / "log"
+            with contextlib.ExitStack() as stack:
+                writer = process.RedactedLog(log, stack)
+                writer.write((json.dumps(event) + "\n").encode())
+            harness.append_session_trace(folder, event, None)
+            for path in (log, folder / "sessions.jsonl"):
+                saved = json.loads(path.read_text())
+                self.assertNotIn(token, json.dumps(saved))
+                self.assertEqual(saved["description"], event["description"])
+
+    def test_codex_rejects_malformed_final_assistant_after_valid_verdict(self) -> None:
+        for bad_text in (None, {"verdict": "pass"}, ["text"]):
+            with self.subTest(bad_text=bad_text):
+                items = [{"type": "item.completed", "item": {"type": "agent_message", "text": val}}
+                         for val in ('{"verdict":"pass"}', bad_text)]
+                with self.assertRaises(ValueError):
+                    harness.parse_codex_ndjson("\n".join(map(json.dumps, [*items, {"type": "turn.completed"}])))
+
+    def test_ndjson_incomplete_final_turn_cannot_reuse_prior_verdict(self) -> None:
+        text = '{"verdict":"pass"}'
+        previous = {"role": "assistant", "content": text, "stopReason": "stop"}
+        failed = {"role": "assistant", "content": [], "stopReason": "error"}
+        for final in ({"type": "message_update", "message": previous},
+                      {"type": "message_end", "message": failed},
+                      {"type": "agent_end", "messages": [previous, failed]}):
+            with self.subTest(event=final["type"]), self.assertRaises(ValueError):
+                harness.parse_pi_ndjson("\n".join(map(json.dumps, [{"type": "message_end", "message": previous}, final])))
+        oc = [{"type": "text", "part": {"text": text}}, {"type": "step_finish", "part": {"reason": "stop"}},
+              {"type": "step_start"}, {"type": "step_finish", "part": {"reason": "length"}}]
+        with self.assertRaises(ValueError):
+            harness.parse_opencode_ndjson("\n".join(map(json.dumps, oc)))
+        cx = [{"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+              {"type": "turn.completed"}, {"type": "turn.started"}]
+        with self.assertRaises(ValueError):
+            harness.parse_codex_ndjson("\n".join(map(json.dumps, cx)))
+
+    def test_harness_aliases_and_heterogeneous_reviewer(self) -> None:
+        w_codex = harness.parse_harness_spec("codex:sol@xhigh")
+        self.assertEqual(w_codex.label, "codex:gpt-6.2-sol@xhigh")
+        self.assertEqual(harness.default_reviewer_for(w_codex).label, "agy:gemini-4-neon-xhigh")
+
+        w_agy = harness.parse_harness_spec("agy:neon@high")
+        self.assertEqual(w_agy.model, "gemini-4-neon-high")
+        self.assertEqual(w_agy.effort, "")
+        self.assertEqual(harness.default_reviewer_for(w_agy).label, "codex:gpt-6.2-sol@xhigh")
+
+        w_oc = harness.parse_harness_spec("opencode:astra")
+        self.assertEqual(w_oc.model, "sub2api/gpt-6.2-astra")
+        self.assertEqual(harness.default_reviewer_for(w_oc).label, "agy:gemini-4-neon-xhigh")
+
+        w_pi = harness.parse_harness_spec("pi:sol@high")
+        self.assertEqual(w_pi.model, "sub2api/gpt-6.2-sol")
+        self.assertEqual(w_pi.effort, "high")
+
+    def test_final_array_and_corrupt_protocol_event_cannot_approve_a_review(self) -> None:
+        verdict = {"axis": "standards", "verdict": "pass", "hard_findings": [], "suggestions": [],
+                   "test_integrity_violation": False, "summary": "ok"}
+        for output in (json.dumps([verdict]), json.dumps(verdict) + "\nFinal: []"):
+            stream = [{"type": "text", "part": {"text": output}}, {"type": "step_finish", "part": {"reason": "stop"}}]
+            final_text = harness.parse_opencode_ndjson("\n".join(map(json.dumps, stream)))
+            with self.assertRaises(ValueError):
+                harness.validate_schema(harness.extract_json_object(final_text), config.REVIEW_SCHEMA)
+        interim = {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(verdict)}}
+        stream = "\n".join([json.dumps(interim), '{"type":"item.completed","item":', '{"type":"turn.completed"}'])
+        with self.assertRaises(ValueError):
+            harness.parse_codex_ndjson(stream)
+
+    def test_truncated_final_object_cannot_reuse_draft_or_nested_verdict(self) -> None:
+        draft = '{"verdict":"pass"}'
+        for tail in ('{"verdict":"fail"', '{"details":{"verdict":"pass"}', '{', '{"summary":"unfinished'):
+            with self.subTest(tail=tail):
+                for response in (draft + "\nFinal answer:\n" + tail, "```json\n" + draft + "\n```\n" + tail):
+                    with self.assertRaises(ValueError):
+                        harness.extract_json_object(response)
+        self.assertEqual(harness.extract_json_object('draft {"bad": } final {"verdict":"fail"} done'),
+                         {"verdict": "fail"})
+
+    def test_extract_json_raw_decode_with_trailing_logs(self) -> None:
+        raw = 'noise {"a": 1}\nfinal: {"status": "completed", "summary": "ok"} trailing log line\n'
+        self.assertEqual(harness.extract_json_object(raw), {"status": "completed", "summary": "ok"})
+
+    def test_pi_ndjson_ignores_user_schema_and_takes_last_assistant(self) -> None:
+        events = [
+            json.dumps({"type": "message_end", "message": {"role": "user", "content": json.dumps(config.WORKER_SCHEMA)}}),
+            json.dumps({"type": "message_end", "message": {"role": "toolResult", "content": '{"noise": true}'}}),
+            json.dumps({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": '{"status":"completed","summary":"done","tests_run":["pytest"],"discovered_issues":[],"blockers":""}'}]}}),
+        ]
+        txt = harness.parse_pi_ndjson("\n".join(events))
+        obj = harness.validate_schema(harness.extract_json_object(txt), config.WORKER_SCHEMA)
+        self.assertEqual(obj["summary"], "done")
+
+    def test_schema_validator_rejects_missing_and_wrong_axis(self) -> None:
+        with self.assertRaises(ValueError):
+            harness.validate_schema({"axis": "standards", "verdict": "pass"}, config.REVIEW_SCHEMA, expected_axis="standards")
+        valid_std = {
+            "axis": "standards",
+            "verdict": "pass",
+            "hard_findings": [],
+            "suggestions": [],
+            "test_integrity_violation": False,
+            "summary": "Clean.",
+        }
+        with self.assertRaises(ValueError):
+            harness.validate_schema(valid_std, config.REVIEW_SCHEMA, expected_axis="spec")
+        self.assertEqual(harness.validate_schema(valid_std, config.REVIEW_SCHEMA, expected_axis="standards")["verdict"], "pass")
+
+    def test_oversized_harness_output_stops_and_keeps_session_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = root / "codex"
+            fake.write_text("#!/bin/sh\nprintf '%s\\n' '\"session id: 11111111-2222-3333-4444\"' >&2\n"
+                            "exec head -c 262144 /dev/zero\n")
+            fake.chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": str(root) + os.pathsep + os.defpath}), \
+                    mock.patch.object(config, "HARNESS_OUTPUT_LIMIT", 32768):
+                with self.assertRaisesRegex(RuntimeError, "output limit"):
+                    harness.invoke_harness(harness.parse_harness_spec("codex:sol"), "review", worktree=root, run_dir=root,
+                                      schema=config.REVIEW_SCHEMA, schema_file=root / "schema", prompt_file=root / "prompt",
+                                      out_file=root / "result", read_only=True)
+            end = json.loads((root / "sessions.jsonl").read_text().splitlines()[-1])
+            self.assertEqual(end["status"], "error")
+            self.assertEqual(end["session_id"], "11111111-2222-3333-4444")
+            self.assertFalse((root / "result").exists())
+
+    def test_removed_agy_aliases(self) -> None:
+        # 1. Opus/Claude aliases completely removed from agy harness
+        self.assertNotIn("opus", config.HARNESS_ALIASES["agy"])
+        self.assertNotIn("sonnet", config.HARNESS_ALIASES["agy"])
+        self.assertEqual(harness.parse_harness_spec("agy:neon").vendor, "google")
+
+    def test_opencode_final_verdict_overrides_draft(self) -> None:
+        # 2. OpenCode NDJSON: earlier fenced `pass` MUST NEVER override trailing bare `fail`!
+        oc_stream = "\n".join(
+            [
+                json.dumps({"type": "step_start", "sessionID": "ses_1"}),
+                json.dumps(
+                    {
+                        "type": "text",
+                        "sessionID": "ses_1",
+                        "part": {
+                            "messageID": "m1",
+                            "text": 'Draft check:\n```json\n{"axis":"standards","verdict":"pass","hard_findings":[],"suggestions":[],"test_integrity_violation":false,"summary":"looks ok"}\n```',
+                        },
+                    }
+                ),
+                json.dumps({"type": "step_start", "sessionID": "ses_1"}),
+                json.dumps(
+                    {
+                        "type": "text",
+                        "sessionID": "ses_1",
+                        "part": {
+                            "messageID": "m2",
+                            "text": 'Final verdict:\n{"axis":"standards","verdict":"fail","hard_findings":["Null deref"],"suggestions":[],"test_integrity_violation":false,"summary":"Found bug"}',
+                        },
+                    }
+                ),
+                json.dumps({"type": "step_finish", "part": {"reason": "stop"}}),
+            ]
+        )
+        parsed_txt = harness.parse_opencode_ndjson(oc_stream)
+        verdict_obj = harness.validate_schema(harness.extract_json_object(parsed_txt), config.REVIEW_SCHEMA, expected_axis="standards")
+        self.assertEqual(verdict_obj["verdict"], "fail")
+        # Also verify extract_json_object alone when BOTH fenced pass and trailing bare fail are in the same message!
+        same_msg = (
+            '```json\n{"axis":"spec","verdict":"pass","hard_findings":[],"suggestions":[],"test_integrity_violation":false,"summary":"early"}\n```\n'
+            'Actually failed:\n{"axis":"spec","verdict":"fail","hard_findings":["Missing AC"],"suggestions":[],"test_integrity_violation":false,"summary":"final"}'
+        )
+        self.assertEqual(harness.extract_json_object(same_msg)["verdict"], "fail")
+
+
+    def test_review_prompt_result_and_trace_are_redacted(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            secret = "lin_api_" + "syntheticvalue123456"
+            output = {"status": "completed", "summary": secret, "tests_run": [], "discovered_issues": [], "blockers": ""}
+            events = [{"type": "thread.started", "thread_id": "aaaa-bbbb"},
+                      {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(output)}},
+                      {"type": "turn.completed"}]
+            self.write_harness("codex", f"""import json, sys
+from pathlib import Path
+Path("argv.json").write_text(json.dumps(sys.argv))
+Path("stdin.txt").write_text(sys.stdin.read())
+print({chr(10).join(map(json.dumps, events))!r})
+""")
+            result = harness.invoke_harness(harness.parse_harness_spec("codex"), secret, worktree=d, run_dir=d,
+                                            schema=config.WORKER_SCHEMA, schema_file=d / "schema", prompt_file=d / "prompt",
+                                            out_file=d / "result", read_only=False, session_label=secret)
+            self.assertEqual(result["summary"], "<REDACTED_SECRET>")
+            self.assertNotIn(secret, (d / "stdin.txt").read_text())
+            cmd = json.loads((d / "argv.json").read_text())
+            self.assertIn("--json", cmd)
+            self.assertNotIn("-o", cmd)
+            for path in (d / "prompt", d / "result", d / "sessions.jsonl"):
+                self.assertNotIn(secret, path.read_text())
+
+    def test_opencode_attaches_files_before_double_dash_and_captures_session(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            wt = d / "wt"
+            run_dir = d / "run"
+            wt.mkdir()
+            run_dir.mkdir()
+            extra_diff = run_dir / "diff-r1.patch"
+            extra_diff.write_text("diff --git a/a.py b/a.py\n+x = 1\n", encoding="utf-8")
+            ndjson = "\n".join(
+                [
+                    json.dumps({"type": "step_start", "sessionID": "ses_unit_12345"}),
+                    json.dumps(
+                        {
+                            "type": "text",
+                            "sessionID": "ses_unit_12345",
+                            "part": {
+                                "text": json.dumps(
+                                    {
+                                        "axis": "standards",
+                                        "verdict": "pass",
+                                        "hard_findings": [],
+                                        "suggestions": [],
+                                        "test_integrity_violation": False,
+                                        "summary": "Clean diff.",
+                                    }
+                                )
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "step_finish", "part": {"reason": "stop"}}),
+                ]
+            )
+            self.write_harness("opencode", f"""import json, sys
+from pathlib import Path
+with Path("commands.jsonl").open("a") as output:
+    output.write(json.dumps(sys.argv) + "\\n")
+print({ndjson!r})
+""")
+
+            traces: list[dict[str, Any]] = []
+            res = harness.invoke_harness(
+                harness.parse_harness_spec("opencode:sol@low"),
+                "Review diff",
+                worktree=wt,
+                run_dir=run_dir,
+                schema=config.REVIEW_SCHEMA,
+                schema_file=run_dir / "s.json",
+                prompt_file=run_dir / "p.md",
+                out_file=run_dir / "o.json",
+                read_only=True,
+                expected_axis="standards",
+                session_label="review-standards-r1",
+                trace_sink=traces,
+                attach_files=[extra_diff, extra_diff],
+            )
+            captured_cmds = [json.loads(line) for line in (wt / "commands.jsonl").read_text().splitlines()]
+            self.assertEqual(res["verdict"], "pass")
+            self.assertEqual(len(captured_cmds), 1)
+            cmd = captured_cmds[0]
+            self.assertIn("--agent", cmd)
+            self.assertEqual(cmd[cmd.index("--agent") + 1], "plan")
+            # Deduplicated -f flags precede `--` and the positional message
+            dd_idx = cmd.index("--")
+            f_vals = [cmd[i + 1] for i, tok in enumerate(cmd[:dd_idx]) if tok == "-f"]
+            self.assertEqual(f_vals, [str(run_dir / "p.md"), str(extra_diff)])
+            self.assertEqual(dd_idx, len(cmd) - 2)
+            self.assertEqual(traces[0]["session_id"], "ses_unit_12345")
+            self.assertEqual(traces[0]["resume_cmd"], "opencode -s ses_unit_12345")
+
+    def test_pi_timeout_preserves_session_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            # 2. Pi timeout MUST preserve session_id in sessions.jsonl!
+            run_dir = d / "pi-run"
+            run_dir.mkdir()
+            traces: list[dict[str, Any]] = []
+            self.write_harness("pi", "import time\ntime.sleep(10)\n")
+            with self.assertRaises(subprocess.TimeoutExpired):
+                harness.invoke_harness(
+                    harness.parse_harness_spec("pi:sol@low"),
+                    "check",
+                    worktree=d,
+                    run_dir=run_dir,
+                    schema=config.REVIEW_SCHEMA,
+                    schema_file=run_dir / "s.json",
+                    prompt_file=run_dir / "p.md",
+                    out_file=run_dir / "o.json",
+                    read_only=True,
+                    expected_axis="standards",
+                    session_label="pi-timeout-test",
+                    trace_sink=traces,
+                    timeout=0.2,
+                )
+            self.assertEqual(len(traces), 1)
+            self.assertEqual(traces[0]["status"], "timeout")
+            self.assertTrue(traces[0].get("session_id"), "Pi timeout MUST keep generated session_id!")
+
+    def test_agy_worker_disables_slash_commands_without_plan_mode(self) -> None:
+        repo = self.sandbox
+        run_dir = self.sandbox / "run"
+        # agy worker mode MUST pass --disable-slash-commands and NOT --mode plan!
+        out = {
+            "conversation_id": "11111111-1111-1111-1111-111111111111",
+            "status": "SUCCESS",
+            "structured_output": {"status": "completed", "summary": "ok", "tests_run": [], "discovered_issues": [], "blockers": ""},
+        }
+        self.write_harness("agy", f"""import json, sys
+from pathlib import Path
+Path("agy-argv.json").write_text(json.dumps(sys.argv))
+print({json.dumps(out)!r})
+""")
+        harness.invoke_harness(
+            harness.parse_harness_spec("agy:carbon"),
+            "work",
+            worktree=repo,
+            run_dir=run_dir,
+            schema=config.WORKER_SCHEMA,
+            schema_file=run_dir / "ws.json",
+            prompt_file=run_dir / "wp.md",
+            out_file=run_dir / "wo.json",
+            read_only=False,
+            session_label="agy-worker-test",
+        )
+        cmd = json.loads((repo / "agy-argv.json").read_text())
+        self.assertIn("--disable-slash-commands", cmd)
+        self.assertNotIn("plan", cmd)
+
+    def test_codex_tolerates_non_protocol_diagnostic_lines(self) -> None:
+        # Stray non-JSON line starting with '{' must not break NDJSON parsing
+        verdict = json.dumps({"status": "completed"})
+        codex_out = "\n".join([
+            "{non-json diagnostic header",
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": verdict}}),
+            json.dumps({"type": "turn.completed"}),
+        ])
+        self.assertEqual(harness.parse_codex_ndjson(codex_out), verdict)
+
+    def test_pi_session_replay_preserves_native_entries_and_redacts_on_interrupt(self) -> None:
+        secret = "lin_api_" + "syntheticpioutput12345"
+        entry = {"type": "message", "id": "a1", "parentId": None, "message": {"content": secret}}
+        session_dir = self.sandbox / "pi-sessions"
+        data = json.dumps(entry) + "\n" + '{"type":'
+        self.write_harness("pi", f"""import os, signal, sys, time
+from pathlib import Path
+native = Path(sys.argv[sys.argv.index("--session") + 1])
+assert os.readlink(native).startswith("/memfd:")
+with native.open("a") as session:
+    session.write({data!r})
+assert not list(Path({str(session_dir)!r}).iterdir())
+os.kill(os.getppid(), signal.SIGINT)
+time.sleep(10)
+""")
+        previous_handler = signal.signal(signal.SIGINT, lambda signum, frame: process.request_shutdown(signum))
+        self.addCleanup(signal.signal, signal.SIGINT, previous_handler)
+        self.addCleanup(process.reset_shutdown)
+        with self.assertRaises(KeyboardInterrupt):
+            harness.invoke_harness(
+                harness.parse_harness_spec("pi"), "check", worktree=self.sandbox, run_dir=self.sandbox,
+                schema=config.REVIEW_SCHEMA, schema_file=self.sandbox / "schema", prompt_file=self.sandbox / "prompt",
+                out_file=self.sandbox / "result", read_only=True, timeout=5,
+            )
+        archive, = session_dir.glob("*.jsonl")
+        header, message = map(json.loads, archive.read_text().splitlines())
+        self.assertEqual(header["version"], 3)
+        self.assertEqual(message["id"], "a1")
+        self.assertEqual(message["message"]["content"], "<REDACTED_SECRET>")
+
+    def test_pi_replay_skips_malformed_lines_without_masking_failure(self) -> None:
+        valid_entry = {"type": "message", "id": "m1", "message": {"content": "ok"}}
+        data = "\n{malformed json line\n" + json.dumps(valid_entry) + "\n"
+        self.write_harness("pi", f"""import sys
+from pathlib import Path
+native = Path(sys.argv[sys.argv.index("--session") + 1])
+with native.open("a") as session:
+    session.write({data!r})
+sys.exit("outer harness failure")
+""")
+        with self.assertRaisesRegex(RuntimeError, "outer harness failure"):
+            harness.invoke_harness(
+                harness.parse_harness_spec("pi"), "check", worktree=self.sandbox, run_dir=self.sandbox,
+                schema=config.REVIEW_SCHEMA, schema_file=self.sandbox / "schema", prompt_file=self.sandbox / "prompt",
+                out_file=self.sandbox / "result", read_only=True, timeout=5,
+            )
+        archive, = (self.sandbox / "pi-sessions").glob("*.jsonl")
+        lines = [json.loads(line) for line in archive.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[1]["id"], "m1")
 
 
 if __name__ == "__main__":
