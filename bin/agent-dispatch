@@ -442,6 +442,7 @@ _AUTH_HEADER_VALUE = re.compile(
     rf""""({_AUTH_HEADER_SCHEMES}[ \t]+)((?:\\.|[^"\\\r\n])*)"?"""
     rf"""|'({_AUTH_HEADER_SCHEMES}[ \t]+)((?:\\.|[^'\\\r\n])*)'?"""
     rf"""|({_AUTH_HEADER_SCHEMES}[ \t]+)({_AUTH_PARAM_LIST_UNQUOTED}|\$\{{\{{[^}}\r\n]+\}}\}}|\{{\{{[^}}\r\n]+\}}\}}|\$\{{[^}}\s\r\n]+\}}|[^\s"',;}}\]]+)"""
+    rf"""|(?P<alias>\*[^\s"',;{{}}\[\]]+)"""
     rf""")""",
     re.I,
 )
@@ -466,20 +467,6 @@ _API_KEY_HEADER_VALUE = re.compile(
 )
 _API_KEY_PLACEHOLDER = re.compile(
     r"^(?:<[^>\s]+>|\$\{\{[^}]+\}\}|\{\{[^}]+\}\}|\$\{[^}\s]+\}|\$[A-Z_][A-Z0-9_]*)$"
-)
-_YAML_ALIAS = re.compile(r"\*[\w-]+")
-_YAML_ANCHOR = re.compile(r"(?:^|[\s\[{,])(&[\w-]+)(?=[ \t\r\n,\]}]|$)", re.M)
-_YAML_DOC_BOUNDARY = re.compile(r"^(?:---|\.\.\.)(?=[ \t\r\n]|$)", re.M)
-_YAML_ANCHOR_PREFIX = re.compile(
-    r"^(?:"
-    r"[ \t]*(?:-[ \t]+)*"
-    r"(?:(?:(?:[^#\"':\r\n]|:(?![ \t\r\n]))+|\"(?:\\.|[^\"\\\r\n])*\"|'(?:''|[^'\r\n])*')?:[ \t]+)?"
-    r"|[ \t]*(?:-[ \t]+)*\?[ \t]+"
-    r"|---[ \t]+"
-    r")$"
-)
-_YAML_ANCHOR_FLOW_PREFIX = re.compile(
-    r"(?:[\[{,][ \t]*|:[ \t]+|(?:^|[\s\[{,:?-])![^\s,[\]{}]*[ \t]+)$"
 )
 _API_KEY_BENIGN_WORDS = frozenset({
     "string", "str", "number", "boolean", "bool", "object", "any", "unknown",
@@ -526,91 +513,21 @@ def _redact_basic(m: re.Match[str]) -> str:
     return m.group(1) + m.group(2) + _REDACTED
 
 
-def _yaml_prefix_state(prefix: str) -> tuple[bool, bool]:
-    quote = ""
-    escaped = False
-    for i, ch in enumerate(prefix):
-        if quote == '"':
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                quote = ""
-        elif quote == "'":
-            if escaped:
-                escaped = False
-            elif ch == "'":
-                if i + 1 < len(prefix) and prefix[i + 1] == "'":
-                    escaped = True
-                else:
-                    quote = ""
-        elif ch in "\"'":
-            quote = ch
-        elif ch == "#" and (i == 0 or prefix[i - 1] in " \t"):
-            return True, False
-    return False, bool(quote)
-
-
-def _yaml_alias_binding(m: re.Match[str], value: str) -> tuple[tuple[int, ...], bool, int] | None:
-    if not _YAML_ALIAS.fullmatch(value):
-        return None
-    start = m.string.rfind("\n", 0, m.start()) + 1
-    if m.string[start:start + 1] not in (" ", "\t"):
-        return None
-    doc_start = 0
-    for boundary in _YAML_DOC_BOUNDARY.finditer(m.string, 0, start):
-        doc_start = boundary.start() if boundary.group(0) == "---" else boundary.end()
-    anchor = "&" + value[1:]
-    positions: list[int] = []
-    all_placeholders = True
-    before = start
-    while (pos := m.string.rfind(anchor, doc_start, before)) >= 0:
-        before = pos
-        if (pos and m.string[pos - 1] not in " \t\r\n[{,") or m.string[pos + len(anchor)] not in " \t\r\n,]}":
-            continue
-        line = m.string.rfind("\n", 0, pos) + 1
-        prefix = m.string[line:pos]
-        has_comment, unclosed_quote = _yaml_prefix_state(prefix)
-        if has_comment or unclosed_quote:
-            continue
-        strict_prefix = bool(_YAML_ANCHOR_PREFIX.fullmatch(prefix))
-        if not strict_prefix and not _YAML_ANCHOR_FLOW_PREFIX.search(prefix):
-            continue
-        positions.append(pos)
-        if not strict_prefix:
-            all_placeholders = False
-            continue
-        end = m.string.index("\n", pos, start)
-        target = m.string[pos + len(anchor):end].strip()
-        target = re.split(r"[ \t]+#", target, maxsplit=1)[0]
-        if len(target) >= 2 and target[0] == target[-1] and target[0] in "\"'":
-            target = target[1:-1]
-        if not _API_KEY_PLACEHOLDER.fullmatch(target):
-            all_placeholders = False
-    if not positions:
-        return None
-    return tuple(positions), all_placeholders, doc_start
-
-
-def _yaml_alias_to_placeholder(m: re.Match[str], value: str) -> bool:
-    binding = _yaml_alias_binding(m, value)
-    return bool(binding and binding[1])
-
-
 def _redact_api_key_header(m: re.Match[str]) -> str:
     quoted = m[2] if m[2] is not None else m[3]
     val = quoted if quoted is not None else (m[4] or "")
     stripped = val.strip()
+    if quoted is None and stripped.startswith("*"):
+        return m[1] + _REDACTED
     if len(stripped) < 8 or stripped.lower() in _API_KEY_BENIGN_WORDS or _API_KEY_PLACEHOLDER.fullmatch(stripped):
         return m.group(0)
     if quoted is None:
-        if _API_KEY_CODE_EXPR.fullmatch(stripped) or _yaml_alias_to_placeholder(m, stripped):
+        if _API_KEY_CODE_EXPR.fullmatch(stripped):
             return m[0]
         line_start = m.string.rfind("\n", 0, m.start()) + 1
         prefix = m.string[line_start:m.start()]
-        # A dictionary assigned in source can refer to a variable. YAML flow mappings
-        # can use the same quoted key with a literal bare scalar.
+        # Source dictionaries can refer to variables. YAML flow mappings can use
+        # the same quoted key with a literal bare scalar.
         if stripped.isidentifier() and m[1].rstrip().endswith(('":', "':")):
             assignment, brace, _ = prefix.partition("{")
             if brace and assignment.rstrip().endswith("="):
@@ -660,7 +577,6 @@ def _redact_raw_credential_field(m: re.Match[str]) -> str:
         or value[0] in ("'", '"')
         or _API_KEY_PLACEHOLDER.fullmatch(value)
         or _is_benign_auth_param_list(value)
-        or _yaml_alias_to_placeholder(m, value)
         or value.lower() in _API_KEY_BENIGN_WORDS
         or any(ch.isspace() for ch in value)
     ):
@@ -669,6 +585,8 @@ def _redact_raw_credential_field(m: re.Match[str]) -> str:
 
 
 def _redact_auth_header(m: re.Match[str]) -> str:
+    if m["alias"]:
+        return m[1] + _REDACTED
     if m[2] is not None:
         quote, scheme, raw_val = '"', m[2], m[3] or ""
         unescaped = raw_val.replace('\\"', '"').strip()
@@ -681,14 +599,12 @@ def _redact_auth_header(m: re.Match[str]) -> str:
 
     if not unescaped:
         return m[0]
-    if not quote and _yaml_alias_to_placeholder(m, unescaped):
-        return m[0]
     if _is_benign_auth_param_list(unescaped):
         return m[0]
     if not _AUTH_PARAM_LIST_QUOTED.fullmatch(unescaped):
         if any(ch.isspace() for ch in unescaped):
             return m[0]
-        if _is_benign_auth_token(unescaped):
+        if _is_benign_auth_token(unescaped) and (quote or not unescaped.startswith("*")):
             return m[0]
         if not quote and _PLAIN_ALPHA_WORD.fullmatch(unescaped) and re.match(r"[ \t]+[A-Za-z]", m.string[m.end():]):
             return m[0]
@@ -697,18 +613,26 @@ def _redact_auth_header(m: re.Match[str]) -> str:
     return m[1] + scheme + _REDACTED
 
 
-def redact_secrets(text: str) -> str:
-    out = _PEM_BLOCK.sub(_REDACTED, str(text))
-    out = _RAW_CREDENTIAL_FIELD.sub(_redact_raw_credential_field, out)
+def _redact_heuristic_credentials(text: str) -> str:
+    out = _RAW_CREDENTIAL_FIELD.sub(_redact_raw_credential_field, text)
     out = _AUTH_HEADER_VALUE.sub(_redact_auth_header, out)
     out = _API_KEY_HEADER_VALUE.sub(_redact_api_key_header, out)
     out = _BEARER_VALUE.sub(_redact_bearer, out)
-    out = _BASIC_VALUE.sub(_redact_basic, out)
+    return _BASIC_VALUE.sub(_redact_basic, out)
+
+
+def _live_credential_values() -> Iterator[str]:
+    for name, value in os.environ.items():
+        if _CREDENTIAL_ENV.search(name) and len(value) >= 8:
+            yield value
+
+
+def redact_secrets(text: str) -> str:
+    out = _redact_heuristic_credentials(_PEM_BLOCK.sub(_REDACTED, str(text)))
     for pat in SECRET_VALUE_PATTERNS:
         out = pat.sub(_REDACTED, out)
-    for name, value in os.environ.items():
-        if _CREDENTIAL_ENV.search(name) and len(value) >= 8 and value in out:
-            out = out.replace(value, _REDACTED)
+    for value in _live_credential_values():
+        out = out.replace(value, _REDACTED)
     return out
 
 
@@ -755,7 +679,22 @@ def sha256_text(text: str) -> str:
 
 
 def scan_text_for_secrets(text: str, field_name: str) -> list[str]:
-    if redact_secrets(text or "") != (text or ""):
+    return _scan_text_for_secrets(text, field_name, allow_marker=True)
+
+
+def _scan_text_for_secrets(text: str, field_name: str, *, allow_marker: bool) -> list[str]:
+    text = text or ""
+    # These rules inspect the original text, including marked lines and comments.
+    if (
+        _PEM_START.search(text)
+        or any(pattern.search(text) for pattern in SECRET_VALUE_PATTERNS)
+        or any(value in text for value in _live_credential_values())
+    ):
+        return [f"Potential secret token in {redact_secrets(field_name)}"]
+    marker = "# secret-scan:allow"
+    if allow_marker and marker in text:
+        text = "\n".join("" if marker in line else line for line in text.split("\n"))
+    if _redact_heuristic_credentials(text) != text:
         return [f"Potential secret token in {redact_secrets(field_name)}"]
     return []
 
@@ -2723,20 +2662,16 @@ def _is_secret_filename(path: str) -> bool:
     return any(pat.search(path) for pat in SECRET_FILENAME_PATTERNS)
 
 
-def _patch_lines(patch: str, prefix: str) -> Iterator[str]:
-    # Git headers are outside hunks. A source line may itself begin with '++' or '--'.
+def _added_patch_lines(patch: str) -> Iterator[str]:
+    # Git headers are outside hunks. A source line may itself begin with '++'.
     in_hunk = False
     for line in patch.split("\n"):
         if line.startswith("diff --git "):
             in_hunk = False
         elif line.startswith("@@ "):
             in_hunk = True
-        elif in_hunk and line.startswith(prefix):
+        elif in_hunk and line.startswith("+"):
             yield line[1:]
-
-
-def _added_patch_lines(patch: str) -> Iterator[str]:
-    return _patch_lines(patch, "+")
 
 
 def _git_text_views(data: bytes) -> Iterator[str]:
@@ -2744,7 +2679,7 @@ def _git_text_views(data: bytes) -> Iterator[str]:
     if not re.search(rb"(?:[ -~]\x00){3}|(?:\x00[ -~]){3}", data):
         return
     # Git splits at the LF byte, including inside UTF-16 code units. Try each initial
-    # alignment and carry it across the physical lines so related YAML lines agree.
+    # alignment and carry it across the physical lines.
     lines = data.split(b"\n")
     for encoding in ("utf-16-le", "utf-16-be"):
         for offset in (0, 1):
@@ -2759,100 +2694,6 @@ def _git_text_views(data: bytes) -> Iterator[str]:
 def _scan_git_bytes(data: bytes, field: str) -> list[str]:
     for text in _git_text_views(data):
         hits = scan_text_for_secrets(text, field)
-        if hits:
-            return hits
-    return []
-
-
-def _has_yaml_alias_or_anchor(data: bytes) -> bool:
-    for view in _git_text_views(data):
-        if _YAML_ANCHOR.search(view):
-            return True
-        if any(m[4] and _YAML_ALIAS.fullmatch(m[4]) for m in _API_KEY_HEADER_VALUE.finditer(view)):
-            return True
-        if any(
-            _YAML_ALIAS.fullmatch(re.sub(r"[ \t]+#.*$", "", m[2].strip()).strip())
-            for m in _RAW_CREDENTIAL_FIELD.finditer(view)
-        ):
-            return True
-    return False
-
-
-def _scan_contextual_additions(hunk: str) -> list[str]:
-    # A full-context diff contains the exact preimage and postimage for this file revision.
-    post_rows: list[str] = []
-    pre_rows: list[tuple[str, int]] = []
-    for line in hunk.split("\n")[1:]:
-        if line.startswith(" "):
-            pre_rows.append((line, len(post_rows)))
-            post_rows.append(line)
-        elif line.startswith("+"):
-            post_rows.append(line)
-        elif line.startswith("-"):
-            pre_rows.append((line, len(post_rows)))
-    if not post_rows:
-        return []
-    added = [i for i, row in enumerate(post_rows) if row.startswith("+")]
-    post_image = "\n".join(row[1:] for row in post_rows).encode("latin-1")
-    pre_image = "\n".join(row[1:] for row, _ in pre_rows).encode("latin-1")
-
-    deleted_anchors: dict[str, list[int]] = {}
-    if b"&" in pre_image:
-        for pre_text in _git_text_views(pre_image):
-            for line, (row, post_idx) in zip(pre_text.split("\n"), pre_rows):
-                if row.startswith("-") and "&" in line:
-                    for m in _YAML_ANCHOR.finditer(line):
-                        has_comment, unclosed_quote = _yaml_prefix_state(line[:m.start(1)])
-                        if not has_comment and not unclosed_quote:
-                            deleted_anchors.setdefault(m.group(1), []).append(post_idx)
-
-    for text in _git_text_views(post_image):
-        edited_anchors: set[int] = set()
-        line_starts: list[int] = []
-        offset = 0
-        for line, row in zip(text.split("\n"), post_rows):
-            line_starts.append(offset)
-            if row.startswith("+") and "&" in line:
-                for m in _YAML_ANCHOR.finditer(line):
-                    has_comment, unclosed_quote = _yaml_prefix_state(line[:m.start(1)])
-                    if not has_comment and not unclosed_quote:
-                        edited_anchors.add(offset + m.start(1))
-            offset += len(line) + 1
-        line_starts.append(offset)
-        unsafe_binding = False
-
-        def resolve_alias(m: re.Match[str], raw_val: str, keep: str) -> str:
-            nonlocal unsafe_binding
-            val = re.sub(r"[ \t]+#.*$", "", raw_val.strip()).strip()
-            binding = _yaml_alias_binding(m, val)
-            if binding:
-                positions, placeholder, doc_start = binding
-                if placeholder:
-                    # Preserve exact character offsets across passes while keeping trailing text scannable.
-                    return " " * len(m[1]) + keep
-                anchor = "&" + val[1:]
-                if any(p in edited_anchors for p in positions) or any(
-                    doc_start <= line_starts[idx] <= m.start()
-                    for idx in deleted_anchors.get(anchor, ())
-                ):
-                    unsafe_binding = True
-            return m[0]
-
-        resolved = _RAW_CREDENTIAL_FIELD.sub(
-            lambda m: resolve_alias(m, m[2], m[2]), text
-        )
-        resolved = _API_KEY_HEADER_VALUE.sub(
-            lambda m: resolve_alias(m, m[4], m[4]) if m[4] else m[0], resolved
-        )
-        if unsafe_binding:
-            return ["Potential secret token in added file content"]
-        lines = resolved.split("\n")
-        changed = [lines[i] for i in added]
-        # Check unresolved aliases in isolation so concatenation cannot discard a rebinding.
-        for line in changed:
-            if "*" in line and (hits := scan_text_for_secrets(line, "added file content")):
-                return hits
-        hits = scan_text_for_secrets("\n".join(changed), "added file content")
         if hits:
             return hits
     return []
@@ -2886,42 +2727,19 @@ def _scan_git_changes_for_secrets(
     ).stdout
     findings: set[str] = set()
     for path in set(paths.split("\0")) - {""}:
-        findings.update(scan_text_for_secrets(path, "changed file name"))
+        findings.update(_scan_text_for_secrets(path, "changed file name", allow_marker=False))
         if _is_secret_filename(path):
             findings.add(f"Potential secret file: {redact_secrets(path)}")
 
     # --text scans content even when Git would hide the patch because of NUL or attributes.
-    def read_patch(*options: str) -> str:
-        return run_cmd(
-            git_cmd(*command, *flags, "--full-index", "-p", "--text", *options, attr_source=effective_attr),
-            cwd=worktree, check=True, env_role="orchestrator", cap_output=False,
-            stdout_encoding="latin-1", ignore_shutdown=ignore_shutdown,
-        ).stdout
-
-    pending = set()
-    for block in ("\n" + read_patch("-U0")).split("\ndiff --git ")[1:]:
-        header = block.partition("\n@@ ")[0]
-        added = "\n".join(_patch_lines(block, "+")).encode("latin-1")
-        deleted = "\n".join(_patch_lines(block, "-")).encode("latin-1")
-        deleted_file = header.splitlines()[-1] == "+++ /dev/null" if header else False
-        if not deleted_file and (
-            ((b"*" in added or b"&" in added) and _has_yaml_alias_or_anchor(added))
-            or (b"&" in deleted and any(_YAML_ANCHOR.search(view) for view in _git_text_views(deleted)))
-        ):
-            pending.add(header)
-        else:
-            findings.update(_scan_git_bytes(added, "added file content"))
-
-    if pending:
-        # Bind the second read to the same file and blob IDs as the zero-context diff.
-        contextual = read_patch("-U2147483647", "-G", "[*&]")
-        for block in ("\n" + contextual).split("\ndiff --git ")[1:]:
-            header, _, hunk = block.partition("\n@@ ")
-            if header in pending:
-                findings.update(_scan_contextual_additions(hunk))
-                pending.remove(header)
-        if pending:
-            raise RuntimeError("Git change disappeared while resolving a YAML alias. Retry the scan.")
+    patch = run_cmd(
+        git_cmd(*command, *flags, "-p", "--text", "-U0", attr_source=effective_attr),
+        cwd=worktree, check=True, env_role="orchestrator", cap_output=False,
+        stdout_encoding="latin-1", ignore_shutdown=ignore_shutdown,
+    ).stdout
+    for block in ("\n" + patch).split("\ndiff --git ")[1:]:
+        added = "\n".join(_added_patch_lines(block)).encode("latin-1")
+        findings.update(_scan_git_bytes(added, "added file content"))
     return sorted(findings)
 
 
@@ -2931,7 +2749,7 @@ def scan_range_for_secrets(worktree: Path, base_sha: str, candidate_sha: str) ->
         git_cmd("log", "--pretty=format:%B%n", revision_range), cwd=worktree,
         check=True, env_role="orchestrator", cap_output=False,
     ).stdout
-    return scan_text_for_secrets(messages, "commit message") + _scan_git_changes_for_secrets(
+    return _scan_text_for_secrets(messages, "commit message", allow_marker=False) + _scan_git_changes_for_secrets(
         worktree, ["log", "-m", "--format=", revision_range], attr_source=base_sha
     )
 
@@ -2958,7 +2776,7 @@ def _scan_before_git_write(
     for name in filter(None, untracked.split("\0")):
         if name in exclude_paths:
             continue
-        findings.extend(scan_text_for_secrets(name, "untracked file name"))
+        findings.extend(_scan_text_for_secrets(name, "untracked file name", allow_marker=False))
         if _is_secret_filename(name):
             findings.append(f"Potential secret file: {redact_secrets(name)}")
             continue
@@ -2972,7 +2790,7 @@ def _scan_before_git_write(
             if _is_secret_filename(content):
                 findings.append(f"Potential secret symlink target: {redact_secrets(name)}")
                 continue
-            findings.extend(scan_text_for_secrets(content, "untracked symlink target"))
+            findings.extend(_scan_text_for_secrets(content, "untracked symlink target", allow_marker=False))
         elif path.is_file():
             try:
                 findings.extend(_scan_git_bytes(path.read_bytes(), "untracked file content"))
@@ -3010,7 +2828,7 @@ def orchestrator_commit(
     """Stage & commit changes safely (hooks/fsmonitor disabled; scans commit msg + staged diff). Returns (head_sha, violations)."""
     ensure_dispatch_excluded(worktree)
     commit_msg = f"{identifier}: {title} (attempt {attempt})"
-    msg_secret_hits = scan_text_for_secrets(commit_msg, "ticket title / commit message")
+    msg_secret_hits = _scan_text_for_secrets(commit_msg, "ticket title / commit message", allow_marker=False)
     if msg_secret_hits:
         head = run_cmd(git_cmd("rev-parse", "HEAD"), cwd=worktree, check=True, env_role="orchestrator").stdout.strip()
         return head, msg_secret_hits
@@ -4084,7 +3902,7 @@ def reconcile_publish(
     _require_publish_ownership(live_pre, state)
 
     pr_title = f"{issue['identifier']}: {issue['title']}"
-    title_secrets = scan_text_for_secrets(pr_title, "PR title")
+    title_secrets = _scan_text_for_secrets(pr_title, "PR title", allow_marker=False)
     if title_secrets:
         raise RuntimeError("Refusing to publish PR with secret in title: " + "; ".join(title_secrets))
 
@@ -4474,7 +4292,7 @@ def execute_ticket(
             return early_ret
 
         # Early metadata secret scan BEFORE writing brief or calling ANY LLM harness!
-        early_title_hits = scan_text_for_secrets(str(issue.get("title") or ""), "ticket title")
+        early_title_hits = _scan_text_for_secrets(str(issue.get("title") or ""), "ticket title", allow_marker=False)
         if early_title_hits:
             return {
                 "issue": issue["identifier"],
@@ -4544,7 +4362,7 @@ def execute_ticket(
         early_ret2 = _validate_claim_eligibility(issue)
         if early_ret2 is not None:
             return early_ret2
-        early_title_hits2 = scan_text_for_secrets(str(issue.get("title") or ""), "ticket title")
+        early_title_hits2 = _scan_text_for_secrets(str(issue.get("title") or ""), "ticket title", allow_marker=False)
         if early_title_hits2:
             return {
                 "issue": issue["identifier"],
