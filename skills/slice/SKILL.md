@@ -19,7 +19,7 @@ Use current conversation context, or if given a Linear issue ID (e.g., `K1N-10`)
 - Each slice cuts a narrow, **end-to-end verifiable** path across all required layers (schema -> logic -> API/UI -> seam test), targeting roughly **1 public seam, 1–3 modules, and <= ~400 lines of diff** so a fresh headless worker finishes reliably.
 - **Wide refactor exception**: sequence mechanical repo-wide refactors as **expand -> migrate batches -> contract** so checks stay green at every slice.
 - Declare **blocking edges** (`Blocked by`) only for genuine technical gates.
-- Declare **`Touches`** (module/resource-level, e.g., `migrations`, `src/routes`, `package.json`, `auth`) so `/dispatch` knows which parallel slices share hot files.
+- Declare **`Touches`** (module/resource-level, e.g., `migrations`, `src/routes`, `package.json`, `auth`) so `/dispatch` knows which parallel slices share hot files. Before marking slices parallel, audit shared composition roots (e.g., app entrypoints, DI containers, root build files) for hidden overlap, and explicitly list tempting adjacent modules in each brief's **`## Out of Scope`** to prevent scope creep.
 
 ### 3. Confirm breakdown (1 round)
 Present a compact table: **# | Title | Blocked by | Touches | Deliverable**. Wait for user confirmation before publishing.

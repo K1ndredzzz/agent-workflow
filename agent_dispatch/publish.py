@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,16 @@ from .config import TRUSTED_PR_AUTHOR_ASSOCIATIONS
 from .git_ops import canonical_repo_identity, check_remote_base, classify_origin_remote, get_remote_branch_sha
 from .harness import HarnessSpec
 from .linear import LinearClient
-from .process import atomic_write_text, check_shutdown, git_cmd, interruptible_sleep, log, run_cmd, sha256_text
+from .process import (
+    atomic_write_text,
+    check_shutdown,
+    git_cmd,
+    interruptible_sleep,
+    is_shutdown_requested,
+    log,
+    run_cmd,
+    sha256_text,
+)
 from .review import format_review_markdown
 from .secrets import redact_secrets, safe_json, scan_text_for_secrets
 
@@ -288,6 +298,52 @@ def _push_reviewed_branch(
             raise RuntimeError("Remote SHA mismatch after push.")
 
 
+def _create_draft_pr_with_retry(
+    repo_root: Path,
+    run_dir: Path,
+    latest_file: Path,
+    state: dict[str, Any],
+    gh_repo: str | None,
+    pr_title: str,
+) -> None:
+    branch = state["branch"]
+    base_branch = state["base_branch"]
+    state["pr_create_attempted"] = True
+    save_checkpoint(run_dir, latest_file, state)
+    body_file = run_dir / "pr-body.md"
+    atomic_write_text(body_file, redact_secrets(state["pr_body"]))
+    cmd = ["gh", "pr", "create", "--draft", "--base", base_branch, "--head", branch,
+           "--title", pr_title, "--body-file", str(body_file)]
+    if gh_repo:
+        cmd += ["--repo", gh_repo]
+    attempts = max(1, int(os.environ.get("AGENT_DISPATCH_PR_CREATE_ATTEMPTS", "3")))
+    pause = float(os.environ.get("AGENT_DISPATCH_PR_CREATE_RETRY_SLEEP", "2.0"))
+    for attempt_i in range(attempts):
+        check_shutdown()
+        try:
+            created = run_cmd(cmd, cwd=repo_root, check=True, env_role="orchestrator")
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            if attempt_i + 1 >= attempts or is_shutdown_requested():
+                raise
+            log(f"gh pr create failed transiently (attempt {attempt_i + 1}/{attempts}: {redact_secrets(str(exc))[:200]}); retrying...")
+            if pause > 0:
+                interruptible_sleep(pause)
+            check_shutdown()
+            # A transient 5xx/timeout may have created the PR server-side; verify idempotently before retrying.
+            existing = fetch_open_pr_for_branch(repo_root, gh_repo, branch)
+            if existing:
+                validate_open_draft_pr(existing, base_branch=base_branch, context="PR create retry check")
+                state["pr_number"] = existing["number"]
+                save_checkpoint(run_dir, latest_file, state)
+                return
+            continue
+        number = re.search(r"/pull/(\d+)/?$", created.stdout.strip())
+        if number:
+            state["pr_number"] = int(number.group(1))
+            save_checkpoint(run_dir, latest_file, state)
+        return
+
+
 def _reconcile_draft_pr(
     repo_root: Path,
     run_dir: Path,
@@ -301,19 +357,7 @@ def _reconcile_draft_pr(
     base_branch = state["base_branch"]
     candidate_sha = state["candidate_sha"]
     if not existing:
-        state["pr_create_attempted"] = True
-        save_checkpoint(run_dir, latest_file, state)
-        body_file = run_dir / "pr-body.md"
-        atomic_write_text(body_file, redact_secrets(state["pr_body"]))
-        cmd = ["gh", "pr", "create", "--draft", "--base", base_branch, "--head", branch,
-               "--title", pr_title, "--body-file", str(body_file)]
-        if gh_repo:
-            cmd += ["--repo", gh_repo]
-        created = run_cmd(cmd, cwd=repo_root, check=True, env_role="orchestrator")
-        number = re.search(r"/pull/(\d+)/?$", created.stdout.strip())
-        if number:
-            state["pr_number"] = int(number.group(1))
-            save_checkpoint(run_dir, latest_file, state)
+        _create_draft_pr_with_retry(repo_root, run_dir, latest_file, state, gh_repo, pr_title)
 
     attempts = max(1, int(os.environ.get("AGENT_DISPATCH_PR_POLL_ATTEMPTS", "5")))
     pause = float(os.environ.get("AGENT_DISPATCH_PR_POLL_SLEEP", "2.0"))

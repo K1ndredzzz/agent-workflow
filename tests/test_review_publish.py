@@ -316,6 +316,51 @@ Path("venv_cacert.pem").write_text("tampered")
                     None, None, root / "std", {}, 1, setup_files=setup_files,
                 )
 
+    def test_spec_review_prompt_includes_touches_scope_telemetry_from_ticket_description_only(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "repo"
+            repo.mkdir()
+            _git(repo, "init", "-b", "main")
+            _git(repo, "config", "user.name", "Test")
+            _git(repo, "config", "user.email", "test@example.invalid")
+            (repo / "src").mkdir()
+            (repo / "src" / "allowed.py").write_text("a = 1\n", encoding="utf-8")
+            (repo / "src" / "creep.py").write_text("b = 1\n", encoding="utf-8")
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-m", "base")
+            base = _git(repo, "rev-parse", "HEAD")
+
+            (repo / "src" / "allowed.py").write_text("a = 2\n", encoding="utf-8")
+            (repo / "src" / "creep.py").write_text("b = 2\n", encoding="utf-8")
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-m", "edit allowed and creep")
+            cand = _git(repo, "rev-parse", "HEAD")
+
+            brief_path = root / "brief.md"
+            brief_path.write_text(
+                "<!-- BEGIN LINEAR DATA -->\n\n"
+                "## Ticket Description (Authoritative Acceptance Scope)\n"
+                "## Goal\nUpdate allowed only.\n\n"
+                "## Touches\n- `src/allowed.py`\n\n"
+                "## Parent Spec (TST-1: Parent) — Context ONLY (NOT acceptance criteria for this slice)\n"
+                "## Touches\n- `src/creep.py`\n\n"
+                "<!-- END LINEAR DATA -->\n",
+                encoding="utf-8",
+            )
+            brief_sha = process.sha256_file(brief_path)
+            run_dir = root / "run"
+            self._install_reviewer()
+            res = review.run_two_axis_review(
+                harness.parse_harness_spec("agy:neon"), repo, run_dir, base, cand,
+                brief_path, brief_sha, root / "std", {}, 1,
+            )
+            self.assertTrue(res["passed"])
+            spec_prompt = (run_dir / "prompt-spec-r1.md").read_text(encoding="utf-8")
+            self.assertIn("## Scope Telemetry (Informational", spec_prompt)
+            self.assertIn("Modified files outside declared `## Touches` (1/2): `src/creep.py`", spec_prompt)
+            self.assertNotIn("outside declared `## Touches` (1/2): `src/allowed.py`", spec_prompt)
+
 
 class TestPublish(IsolatedDispatchCase):
     def setUp(self) -> None:
@@ -488,6 +533,113 @@ print(responses[command])
                         publish.reconcile_publish(client, iss, repo, run_dir, latest_f, st2)
                 self.assertEqual(st2["stage"], "pushed")
                 self.assertTrue(st2["pushed"])
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+    def test_reconcile_publish_retries_transient_pr_create_and_avoids_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            bare = d / "origin.git"
+            repo = d / "repo"
+            _git(d, "init", "--bare", "-b", "main", str(bare))
+            _git(d, "clone", str(bare), str(repo))
+            _git(repo, "config", "user.email", "t@example.com")
+            _git(repo, "config", "user.name", "T")
+            (repo / "a.txt").write_text("v1\n", encoding="utf-8")
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-m", "init")
+            _git(repo, "push", "-u", "origin", "main")
+            _git(repo, "checkout", "-b", "feat/tst-retry")
+            (repo / "a.txt").write_text("v2\n", encoding="utf-8")
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-m", "feat")
+            cand_sha = _git(repo, "rev-parse", "HEAD")
+
+            draft_pr = {
+                "state": "OPEN", "number": 42, "url": "https://github.com/t/r/pull/42", "isDraft": True,
+                "baseRefName": "main", "headRefOid": cand_sha,
+                "isCrossRepository": False, "headRefName": "feat/tst-retry",
+            }
+            calls_log = d / "gh-calls.log"
+
+            def _install_flaky_gh(*, created_on_first_failure: bool) -> None:
+                calls_log.unlink(missing_ok=True)
+                _write_exec(
+                    self.fake_bin / "gh",
+                    f"""#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+log_file = Path({str(calls_log)!r})
+cmd = tuple(sys.argv[1:3])
+prev = log_file.read_text().splitlines() if log_file.exists() else []
+with log_file.open("a", encoding="utf-8") as fh:
+    fh.write(" ".join(cmd) + "\\n")
+create_count = sum(1 for line in prev if line == "pr create")
+if cmd == ("pr", "create"):
+    if create_count == 0:
+        print("GraphQL: Something went wrong while executing your query.", file=sys.stderr)
+        sys.exit(1)
+    print("https://github.com/t/r/pull/42")
+elif cmd == ("pr", "list"):
+    if create_count >= 2 or ({created_on_first_failure!r} and create_count >= 1):
+        print(json.dumps([{draft_pr!r}]))
+    else:
+        print("[]")
+""",
+                )
+
+            ls_state = FakeLinearState(project_name="repo")
+            srv, url = start_fake_linear(ls_state)
+            try:
+                client = linear.LinearClient("fake-linear", url=url)
+                base_state = {
+                    "run_id": "r-retry",
+                    "publish_destination": process.sha256_text(str(bare)),
+                    "branch": "feat/tst-retry",
+                    "base_branch": "main",
+                    "base_sha": _git(repo, "rev-parse", "main"),
+                    "candidate_sha": cand_sha,
+                    "pr_body": "body",
+                    "worker": "codex:sol",
+                    "reviewer": "agy:neon",
+                    "attempt": 1,
+                    "max_attempts": 3,
+                    "worker_summary": "ok",
+                    "review": {"standards": {"verdict": "pass", "summary": "ok"}, "spec": {"verdict": "pass", "summary": "ok"}},
+                    "stage": "verified_and_reviewed",
+                }
+                env = {
+                    "AGENT_DISPATCH_FORCE_GH": "1",
+                    "AGENT_DISPATCH_CACHE_ROOT": str(d / "cache"),
+                    "AGENT_DISPATCH_PR_CREATE_ATTEMPTS": "3",
+                    "AGENT_DISPATCH_PR_CREATE_RETRY_SLEEP": "0",
+                    "AGENT_DISPATCH_PR_POLL_ATTEMPTS": "2",
+                    "AGENT_DISPATCH_PR_POLL_SLEEP": "0",
+                }
+                # Case 1: first gh pr create returns GraphQL 500 without creating PR -> retries and succeeds on try 2.
+                iss1 = ls_state.add_issue("TST-R1", "Transient 500", "desc", state_name="In Progress", labels=["agent-ready"])
+                _install_flaky_gh(created_on_first_failure=False)
+                run_dir1 = d / "run1"
+                run_dir1.mkdir()
+                with mock.patch.dict(os.environ, env):
+                    res1 = publish.reconcile_publish(client, iss1, repo, run_dir1, d / "latest1.json", dict(base_state))
+                self.assertEqual(res1["stage"], "completed")
+                self.assertEqual(res1["pr_number"], 42)
+                self.assertEqual(calls_log.read_text().splitlines().count("pr create"), 2)
+
+                # Case 2: first gh pr create returns 500 AFTER creating PR server-side -> idempotent check finds PR, no 2nd create!
+                iss2 = ls_state.add_issue("TST-R2", "Created before 500", "desc", state_name="In Progress", labels=["agent-ready"])
+                _install_flaky_gh(created_on_first_failure=True)
+                run_dir2 = d / "run2"
+                run_dir2.mkdir()
+                with mock.patch.dict(os.environ, env):
+                    res2 = publish.reconcile_publish(client, iss2, repo, run_dir2, d / "latest2.json", dict(base_state))
+                self.assertEqual(res2["stage"], "completed")
+                self.assertEqual(res2["pr_number"], 42)
+                self.assertEqual(calls_log.read_text().splitlines().count("pr create"), 1)
             finally:
                 srv.shutdown()
                 srv.server_close()
