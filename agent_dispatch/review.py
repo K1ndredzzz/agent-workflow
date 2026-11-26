@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .brief import assert_sha256_intact
+from .brief import assert_sha256_intact, parse_touches, touches_overlap
 from .config import PRELOADED_REFS, PROTECTED_BASENAMES, PROTECTED_EXACT_FILES, REVIEW_SCHEMA
 from .gates import file_identity, scan_range_for_secrets, untracked_files
 from .harness import HarnessSpec, invoke_harness
@@ -138,6 +138,95 @@ def _assert_review_artifacts_intact(artifact_hashes: dict[Path, str]) -> None:
         assert_sha256_intact(path, digest, path.name)
 
 
+def _extract_ticket_description_for_touches(brief_text: str) -> str:
+    """Slice rendered issue snapshot to Ticket Description so Parent Spec/comments cannot pollute Touches."""
+    lines = brief_text.splitlines()
+    start = 0
+    for idx, line in enumerate(lines):
+        if line.strip().startswith("## Ticket Description"):
+            start = idx + 1
+            break
+    out: list[str] = []
+    fence = ""
+    for line in lines[start:]:
+        stripped = line.strip()
+        if fence:
+            out.append(line)
+            if stripped.startswith(fence[0] * len(fence)) and set(stripped) == {fence[0]}:
+                fence = ""
+            continue
+        if stripped.startswith(("```", "~~~")):
+            fence = stripped[:3]
+            out.append(line)
+            continue
+        if (
+            stripped.startswith("## Parent Spec (")
+            or stripped == "## Recent Human Comments"
+            or stripped == "<!-- END LINEAR DATA -->"
+        ):
+            break
+        out.append(line)
+    return "\n".join(out)
+
+
+def _format_touches_scope_signal(
+    worktree: Path,
+    base_sha: str,
+    candidate_sha: str,
+    auth_brief_path: Path | None,
+) -> list[str]:
+    if auth_brief_path is None or not auth_brief_path.is_file():
+        return []
+    raw_names = run_cmd(
+        git_cmd(
+            "diff", "--no-renames", "--no-ext-diff", "--no-textconv", "-z", "--name-only",
+            f"{base_sha}..{candidate_sha}", attr_source=base_sha,
+        ),
+        cwd=worktree,
+        check=True,
+        env_role="orchestrator",
+        cap_output=False,
+    ).stdout
+    changed_files = [p for p in raw_names.split("\x00") if p]
+    shortstat = run_cmd(
+        git_cmd(
+            "diff", "--no-renames", "--no-ext-diff", "--no-textconv", "--shortstat",
+            f"{base_sha}..{candidate_sha}", attr_source=base_sha,
+        ),
+        cwd=worktree,
+        check=True,
+        env_role="orchestrator",
+    ).stdout.strip()
+    brief_text = auth_brief_path.read_text(encoding="utf-8", errors="replace")
+    touches = parse_touches(_extract_ticket_description_for_touches(brief_text))
+    lines = [
+        "## Scope Telemetry (Informational — verify against Ticket Brief)",
+        f"- Diff summary: {shortstat or f'{len(changed_files)} files changed'}",
+    ]
+    if not touches:
+        lines.append("- Declared `## Touches`: (none or unscoped)")
+        return lines
+    outside = [
+        path for path in changed_files
+        if not touches_overlap({path.replace("\\", "/").lstrip("/").lower()}, touches)
+    ]
+    lines.append(f"- Declared `## Touches` ({len(touches)}): {', '.join(f'`{t}`' for t in sorted(touches))}")
+    if outside:
+        shown = outside[:20]
+        more = f" (+{len(outside) - len(shown)} more)" if len(outside) > len(shown) else ""
+        lines.append(
+            f"- Modified files outside declared `## Touches` ({len(outside)}/{len(changed_files)}): "
+            + ", ".join(f"`{p}`" for p in shown)
+            + more
+            + " (informational: verify whether each file is strictly required by this slice or represents scope creep)"
+        )
+    else:
+        lines.append(
+            f"- Modified files outside declared `## Touches`: none ({len(changed_files)}/{len(changed_files)} within declared touches)"
+        )
+    return lines
+
+
 def _build_review_prompts(
     worktree: Path,
     base_sha: str,
@@ -182,6 +271,7 @@ def _build_review_prompts(
         std_lines += ["", "## Prior Round Findings (verify resolution first)", *[f"- {x}" for x in prior_std]]
     std_lines += ["", 'Set `axis` to `"standards"`. Return ONLY valid JSON matching the schema.']
 
+    scope_telemetry = _format_touches_scope_signal(worktree, base_sha, candidate_sha, auth_brief_path)
     spec_lines = [
         "READ-ONLY CODE REVIEW — AXIS: SPEC & INTEGRITY.",
         "Do NOT create, edit, delete, or commit any files, do NOT run tests that write files, and do NOT spawn subagents.",
@@ -190,6 +280,7 @@ def _build_review_prompts(
         f"Commits:\n{commits or '(none)'}",
         f"Diff stat:\n{diff_stat or '(empty)'}",
         f"Immutable authoritative Ticket Brief path: `{auth_brief_path}` (read ONLY this path, not any file inside `.dispatch/`).",
+        *(["", *scope_telemetry] if scope_telemetry else []),
         "",
         spec_rubric.strip(),
     ]
